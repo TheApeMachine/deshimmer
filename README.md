@@ -21,6 +21,38 @@ AI music generation systems like Suno AI often produce narrow-band, flickering a
 pip install -r requirements.txt
 ```
 
+## 🧪 Interactive UI (recommended for experimentation)
+
+There’s a small Gradio frontend for `master.py` so you can tweak knobs, A/B listen, and see spectrograms update.
+
+### Install UI deps
+
+```bash
+pip install -r requirements-ui.txt
+```
+
+### Run
+
+```bash
+python ui_gradio.py
+```
+
+If you’re using the included venv, run:
+
+```bash
+./venv/bin/python -m pip install -r requirements-ui.txt
+./venv/bin/python ui_gradio.py
+```
+
+In the UI:
+- Load an input file
+- Pick a short **preview region** (fast iteration)
+- Adjust parameters (shimmer / denoise / de-resonator / mastering)
+- Listen to **input / output / diff (removed)** (looping preview) and inspect spectrograms
+- Use **Loop crossfade (ms)** to make the preview loop seam less obvious
+- Try the **Presets** dropdown (simple → complex) to quickly explore good starting points
+- Use **Render full & generate downloads** to download the fully processed WAV (no CLI required)
+
 ### Basic Usage
 
 ```bash

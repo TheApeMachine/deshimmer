@@ -1,0 +1,7 @@
+gradio>=4.0.0
+soundfile
+numpy
+scipy
+matplotlib
+pillow
+
