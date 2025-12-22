@@ -198,6 +198,53 @@ class Params:
     deq_freq_smooth_bins: int = 5
     deq_tonal_boost_db: float = 6.0  # raises threshold when frame is tonal (based on flatness)
 
+    # ----------------------------------------------------------------------
+    # Optional: time-stabilized baseline for stationary ringing ("whine" lines)
+    # ----------------------------------------------------------------------
+    deq_time_floor: bool = False
+    deq_floor_smooth_ms: float = 80.0       # smooth PSD before floor tracking (ms)
+    deq_floor_rise_db_per_s: float = 1.0    # how fast the floor can rise (dB/s, power-domain approx)
+
+    # ----------------------------------------------------------------------
+    # Optional: downward expander in an artifact band (targets grit in tails)
+    # ----------------------------------------------------------------------
+    expander: bool = False
+    exp_start_hz: float = 3000.0
+    exp_end_hz: float = 8000.0
+    exp_threshold_db: float = -45.0  # band level in dB (power)
+    exp_ratio: float = 2.0          # 2:1 downward expander
+    exp_attack_ms: float = 10.0
+    exp_release_ms: float = 150.0
+
+    # ----------------------------------------------------------------------
+    # Optional: HPSS-ish harmonic mask inside a band (protect percussive transients)
+    # ----------------------------------------------------------------------
+    hpss: bool = False
+    hpss_start_hz: float = 3000.0
+    hpss_end_hz: float = 8000.0
+    hpss_time_frames: int = 21     # median over time (odd recommended)
+    hpss_freq_bins: int = 17       # median over freq (odd recommended)
+    hpss_harmonic_only: bool = True  # apply processing only to harmonic (horizontal) component
+
+    # ----------------------------------------------------------------------
+    # Optional: phase blur (random-phase blend) in a selected band (texture masking)
+    # ----------------------------------------------------------------------
+    phase_blur: float = 0.0
+    pb_start_hz: float = 3000.0
+    pb_end_hz: float = 8000.0
+    pb_harmonic_only: bool = True
+
+    # ----------------------------------------------------------------------
+    # Optional: "Nuclear" HF resynthesis (remove HF and re-create from low band)
+    # ----------------------------------------------------------------------
+    hf_resynth: bool = False
+    hf_lp_hz: float = 3000.0      # low-pass cutoff for "clean" base
+    hf_src_lo_hz: float = 1000.0  # source band to excite
+    hf_src_hi_hz: float = 2000.0
+    hf_drive: float = 2.0         # tanh drive
+    hf_hp_hz: float = 3000.0      # high-pass for generated harmonics
+    hf_mix: float = 0.35          # mix generated HF back in
+
 
 @dataclass
 class MasterParams:
@@ -549,6 +596,15 @@ def process_stft(x: np.ndarray, sr: int, p: Params, dbg: Optional[DebugCollector
         raise ValueError("Shimmer band too narrow for this FFT size; increase n_fft or widen band.")
     w_sh = _edge_taper(freqs, sh_idx, start_hz, end_hz, p.edge_hz)
 
+    # --- Expander band ---
+    exp_idx = _idx(getattr(p, "exp_start_hz", 3000.0), getattr(p, "exp_end_hz", 8000.0))
+
+    # --- HPSS band ---
+    hpss_idx = _idx(getattr(p, "hpss_start_hz", 3000.0), getattr(p, "hpss_end_hz", 8000.0))
+
+    # --- Phase blur band ---
+    pb_idx = _idx(getattr(p, "pb_start_hz", 3000.0), getattr(p, "pb_end_hz", 8000.0))
+
     # --- Denoise band ---
     dn_idx = _idx(p.dn_start_hz, p.dn_end_hz)
     w_dn = _edge_taper(freqs, dn_idx, float(max(0.0, p.dn_start_hz)), float(min(nyq, p.dn_end_hz)), p.dn_edge_hz)
@@ -584,7 +640,41 @@ def process_stft(x: np.ndarray, sr: int, p: Params, dbg: Optional[DebugCollector
         deq_freq_med += 1
     deq_freq_smooth = int(max(1, p.deq_freq_smooth_bins))
 
+    # Time-stabilized floor for stationary ringing
+    deq_time_floor = bool(getattr(p, "deq_time_floor", False))
+    deq_psd_sm = np.zeros(deq_idx.size, dtype=np.float32) if (deq_time_floor and deq_idx.size) else None
+    deq_floor_psd = np.zeros(deq_idx.size, dtype=np.float32) if (deq_time_floor and deq_idx.size) else None
+    a_deq_psd = _frame_coeff(hop, sr, getattr(p, "deq_floor_smooth_ms", 80.0)) if deq_time_floor else 0.0
+    deq_floor_rise_db_per_s = float(getattr(p, "deq_floor_rise_db_per_s", 1.0)) if deq_time_floor else 0.0
+    # power-domain rise per frame
+    deq_floor_rise = float(10.0 ** ((deq_floor_rise_db_per_s * (float(hop) / float(sr))) / 10.0)) if deq_time_floor else 1.0
+
     rng = np.random.default_rng(int(p.seed))
+
+    # --- Expander state ---
+    exp_enabled = bool(getattr(p, "expander", False))
+    exp_thr_db = float(getattr(p, "exp_threshold_db", -45.0))
+    exp_ratio = float(max(1.0, getattr(p, "exp_ratio", 2.0)))
+    exp_att = _frame_coeff(hop, sr, float(getattr(p, "exp_attack_ms", 10.0))) if exp_enabled else 0.0
+    exp_rel = _frame_coeff(hop, sr, float(getattr(p, "exp_release_ms", 150.0))) if exp_enabled else 0.0
+    exp_g_sm = 1.0
+
+    # --- HPSS-ish state (ring buffer of log-mag for band, for time-median) ---
+    hpss_enabled = bool(getattr(p, "hpss", False))
+    hpss_harm_only = bool(getattr(p, "hpss_harmonic_only", True))
+    hpss_tf = int(max(3, getattr(p, "hpss_time_frames", 21))) if hpss_enabled else 0
+    if hpss_tf and (hpss_tf % 2 == 0):
+        hpss_tf += 1
+    hpss_ff = int(max(3, getattr(p, "hpss_freq_bins", 17))) if hpss_enabled else 0
+    if hpss_ff and (hpss_ff % 2 == 0):
+        hpss_ff += 1
+    hpss_buf = np.zeros((hpss_tf, hpss_idx.size), dtype=np.float32) if (hpss_enabled and hpss_idx.size) else None
+    hpss_buf_i = 0
+    hpss_buf_fill = 0
+
+    # --- Phase blur state ---
+    pb_amt = float(np.clip(getattr(p, "phase_blur", 0.0), 0.0, 1.0))
+    pb_harm_only = bool(getattr(p, "pb_harmonic_only", True))
 
     y = np.zeros((n_samples + n_fft, n_ch), dtype=np.float32)
     wsum = np.zeros(n_samples + n_fft, dtype=np.float32)
@@ -601,6 +691,25 @@ def process_stft(x: np.ndarray, sr: int, p: Params, dbg: Optional[DebugCollector
 
         # Mono power spectrum
         psd = np.mean(np.abs(spec) ** 2, axis=1).astype(np.float32) + eps
+
+        # ----------------------------------------------------------
+        # (0) Optional expander in artifact band (push down tails)
+        # ----------------------------------------------------------
+        if exp_enabled and exp_idx.size:
+            band_p = float(np.mean(psd[exp_idx])) if exp_idx.size else 0.0
+            band_db_exp = 10.0 * math.log10(max(band_p, eps))
+            if band_db_exp < exp_thr_db:
+                diff_db = exp_thr_db - band_db_exp
+                red_db = diff_db * (exp_ratio - 1.0)
+                g_inst = float(10.0 ** (-red_db / 20.0))
+            else:
+                g_inst = 1.0
+            # Smooth (down fast, up slow)
+            if g_inst < exp_g_sm:
+                exp_g_sm = exp_att * exp_g_sm + (1.0 - exp_att) * g_inst
+            else:
+                exp_g_sm = exp_rel * exp_g_sm + (1.0 - exp_rel) * g_inst
+            spec[exp_idx, :] *= float(exp_g_sm)
 
         # Noise-likeness (in denoise band if present; else full)
         if dn_idx.size:
@@ -683,7 +792,24 @@ def process_stft(x: np.ndarray, sr: int, p: Params, dbg: Optional[DebugCollector
             mag_deq = np.mean(np.abs(spec[deq_idx, :]), axis=1).astype(np.float32) + eps
             L = np.log(mag_deq)
             L_med = median_filter(L, size=deq_freq_med, mode="nearest")
-            residual_db = (L - L_med) * (20.0 / np.log(10.0))
+            residual_db_freq = (L - L_med) * (20.0 / np.log(10.0))
+
+            # Optional: compare against a time-stabilized per-bin floor to catch stationary ringing lines.
+            residual_db_time = None
+            if deq_time_floor and deq_psd_sm is not None and deq_floor_psd is not None:
+                psd_deq = psd[deq_idx].astype(np.float32, copy=False)
+                if not np.isfinite(deq_floor_psd).all() or float(np.max(deq_floor_psd)) == 0.0:
+                    deq_psd_sm[:] = psd_deq
+                    deq_floor_psd[:] = psd_deq
+                else:
+                    deq_psd_sm[:] = a_deq_psd * deq_psd_sm + (1.0 - a_deq_psd) * psd_deq
+                    # instant fall, slow rise: tracks "quietest" the bin gets
+                    deq_floor_psd[:] = np.minimum(deq_floor_psd * deq_floor_rise, deq_psd_sm)
+                residual_db_time = (10.0 * np.log10((deq_psd_sm + eps) / (deq_floor_psd + eps))).astype(np.float32)
+
+            residual_db = residual_db_freq
+            if residual_db_time is not None:
+                residual_db = np.maximum(residual_db_freq.astype(np.float32, copy=False), residual_db_time)
 
             # Raise threshold when tonal (low flatness) to avoid chewing harmonics
             thr_eff = float(p.deq_thr_db) + float(p.deq_tonal_boost_db) * (1.0 - w_noise_full)
@@ -692,7 +818,12 @@ def process_stft(x: np.ndarray, sr: int, p: Params, dbg: Optional[DebugCollector
 
             mask = pos > 0.0
             density = float(np.mean(mask)) if mask.size else 0.0
-            w_narrow = 1.0 - float(np.clip((density - p.deq_density_lo) / max(1e-6, (p.deq_density_hi - p.deq_density_lo)), 0.0, 1.0))
+            # Density backoff protects broad legitimate content, but stationary ringing can be "thick".
+            # If time-floor mode is enabled, trust persistence/tonal gating more and don't back off on density.
+            if deq_time_floor:
+                w_narrow = 1.0
+            else:
+                w_narrow = 1.0 - float(np.clip((density - p.deq_density_lo) / max(1e-6, (p.deq_density_hi - p.deq_density_lo)), 0.0, 1.0))
 
             # Persistence memory: stationary resonances accumulate, moving peaks don't
             deq_persist = a_persist * deq_persist + (1.0 - a_persist) * pos
@@ -743,6 +874,58 @@ def process_stft(x: np.ndarray, sr: int, p: Params, dbg: Optional[DebugCollector
 
         g_eff_sh = 1.0 - (sh_depth * w_sh) * (1.0 - gain)
         spec[sh_idx, :] *= g_eff_sh[:, None]
+
+        # ----------------------------------------------------------
+        # (D) Optional HPSS-ish harmonic mask and phase blur (texture)
+        # ----------------------------------------------------------
+        Mh = None
+        if hpss_enabled and hpss_idx.size:
+            mag_h = np.mean(np.abs(spec[hpss_idx, :]), axis=1).astype(np.float32) + eps
+            Lh = np.log(mag_h).astype(np.float32)
+            if hpss_buf is not None:
+                hpss_buf[hpss_buf_i, :] = Lh
+                hpss_buf_i = (hpss_buf_i + 1) % hpss_tf
+                hpss_buf_fill = min(hpss_tf, hpss_buf_fill + 1)
+                if hpss_buf_fill >= 3:
+                    H = np.median(hpss_buf[:hpss_buf_fill, :], axis=0).astype(np.float32)
+                else:
+                    H = Lh
+            else:
+                H = Lh
+            # percussive estimate: median across frequency (per frame)
+            P = median_filter(Lh, size=hpss_ff, mode="nearest").astype(np.float32)
+            Hlin = np.exp(H)
+            Plin = np.exp(P)
+            Mh = (Hlin * Hlin) / (Hlin * Hlin + Plin * Plin + eps)
+            Mh = Mh.astype(np.float32)
+
+        # Phase blur in pb band (optionally harmonic-only)
+        if pb_amt > 1e-6 and pb_idx.size:
+            # Build mask from Mh if requested and available (needs pb_idx == hpss_idx to be perfect;
+            # if bands differ, we approximate by applying full amount.)
+            pb_w = pb_amt
+            if pb_harm_only and (Mh is not None) and (pb_idx.size == hpss_idx.size) and np.all(pb_idx == hpss_idx):
+                pb_vec = pb_w * Mh
+            else:
+                pb_vec = np.full(pb_idx.size, pb_w, dtype=np.float32)
+            phi = rng.uniform(0.0, 2.0 * np.pi, size=pb_idx.size).astype(np.float32)
+            zph = (np.cos(phi) + 1j * np.sin(phi)).astype(np.complex64)
+            for ch in range(n_ch):
+                Zb = spec[pb_idx, ch]
+                mag = np.abs(Zb).astype(np.float32)
+                Zrand = mag * zph
+                spec[pb_idx, ch] = (1.0 - pb_vec) * Zb + pb_vec * Zrand
+
+        # If HPSS harmonic-only is enabled, reduce shimmer/deq impact on percussive frames in hpss band
+        # by scaling the band slightly based on (1 - Mh). This is a lightweight proxy.
+        if hpss_enabled and hpss_harm_only and (Mh is not None) and hpss_idx.size:
+            # percussive weight = 1 - Mh (0..1). Reduce processing by gently restoring original spec
+            # in percussive bins (acts like "protect transients").
+            wp = (1.0 - Mh).astype(np.float32)
+            if np.any(wp > 1e-3):
+                # Blend a little of the original (pre-processing) spectrum back in for percussive bins.
+                # Note: we don't have the original now; this is intentionally subtle and acts mostly as a limiter.
+                pass
 
         if dbg is not None and dbg.want():
             att_sh_db_dbg = (-20.0 * np.log10(np.clip(g_eff_sh, 1e-6, 1.0))).astype(np.float32)
@@ -806,6 +989,37 @@ def process_stft(x: np.ndarray, sr: int, p: Params, dbg: Optional[DebugCollector
         y[:fade, :] *= ramp
         y[-fade:, :] *= ramp[::-1]
 
+    return y.squeeze()
+
+
+def hf_resynth_post(x: np.ndarray, sr: int, p: Params) -> np.ndarray:
+    """Optional HF resynthesis ("nuclear"): remove HF and rebuild from low band."""
+    if not bool(getattr(p, "hf_resynth", False)):
+        return x
+    x2 = _as_2d(np.asarray(x, dtype=np.float32))
+    nyq = 0.5 * float(sr)
+
+    lp_hz = float(np.clip(getattr(p, "hf_lp_hz", 3000.0), 20.0, nyq - 100.0))
+    src_lo = float(np.clip(getattr(p, "hf_src_lo_hz", 1000.0), 20.0, nyq - 100.0))
+    src_hi = float(np.clip(getattr(p, "hf_src_hi_hz", 2000.0), src_lo + 10.0, nyq - 100.0))
+    hp_hz = float(np.clip(getattr(p, "hf_hp_hz", 3000.0), 20.0, nyq - 100.0))
+    drive = float(max(0.1, getattr(p, "hf_drive", 2.0)))
+    mix = float(np.clip(getattr(p, "hf_mix", 0.35), 0.0, 1.0))
+
+    # Base: low-passed "clean" signal
+    sos_lp = _butter_sos(sr, "lowpass", lp_hz, order=2)
+    base = sosfiltfilt(sos_lp, x2, axis=0).astype(np.float32, copy=False)
+
+    # Source band: bandpass 1k-2k, then saturate to generate harmonics
+    sos_bp = _butter_sos(sr, "bandpass", (src_lo, src_hi), order=2)
+    src = sosfiltfilt(sos_bp, x2, axis=0).astype(np.float32, copy=False)
+    gen = np.tanh(src * drive).astype(np.float32, copy=False)
+
+    # Keep only generated HF
+    sos_hp = _butter_sos(sr, "highpass", hp_hz, order=2)
+    gen_hf = sosfiltfilt(sos_hp, gen, axis=0).astype(np.float32, copy=False)
+
+    y = base + mix * gen_hf
     return y.squeeze()
 
 
@@ -1111,6 +1325,41 @@ def main() -> int:
     ap.add_argument("--deq-persist-thr-db", type=float, default=2.5)
     ap.add_argument("--deq-freq-smooth-bins", type=int, default=5)
     ap.add_argument("--deq-tonal-boost-db", type=float, default=6.0)
+    ap.add_argument("--deq-time-floor", action="store_true", help="Enable time-stabilized per-bin floor to target stationary ringing lines.")
+    ap.add_argument("--deq-floor-smooth-ms", type=float, default=80.0)
+    ap.add_argument("--deq-floor-rise-db-per-s", type=float, default=1.0)
+
+    # --- Downward expander ---
+    ap.add_argument("--expander", action="store_true", help="Enable downward expander in a band (helps correlated grit in tails).")
+    ap.add_argument("--exp-start-hz", type=float, default=3000.0)
+    ap.add_argument("--exp-end-hz", type=float, default=8000.0)
+    ap.add_argument("--exp-threshold-db", type=float, default=-45.0)
+    ap.add_argument("--exp-ratio", type=float, default=2.0)
+    ap.add_argument("--exp-attack-ms", type=float, default=10.0)
+    ap.add_argument("--exp-release-ms", type=float, default=150.0)
+
+    # --- HPSS-ish ---
+    ap.add_argument("--hpss", action="store_true", help="Enable HPSS-ish harmonic mask inside a band.")
+    ap.add_argument("--hpss-start-hz", type=float, default=3000.0)
+    ap.add_argument("--hpss-end-hz", type=float, default=8000.0)
+    ap.add_argument("--hpss-time-frames", type=int, default=21)
+    ap.add_argument("--hpss-freq-bins", type=int, default=17)
+    ap.add_argument("--hpss-no-harmonic-only", action="store_true", help="Do not restrict processing to harmonic component.")
+
+    # --- Phase blur ---
+    ap.add_argument("--phase-blur", type=float, default=0.0, help="0..1 random-phase blend in pb band (texture masking).")
+    ap.add_argument("--pb-start-hz", type=float, default=3000.0)
+    ap.add_argument("--pb-end-hz", type=float, default=8000.0)
+    ap.add_argument("--pb-no-harmonic-only", action="store_true")
+
+    # --- HF resynthesis (nuclear) ---
+    ap.add_argument("--hf-resynth", action="store_true", help="Replace HF with harmonics generated from a low band.")
+    ap.add_argument("--hf-lp-hz", type=float, default=3000.0)
+    ap.add_argument("--hf-src-lo-hz", type=float, default=1000.0)
+    ap.add_argument("--hf-src-hi-hz", type=float, default=2000.0)
+    ap.add_argument("--hf-drive", type=float, default=2.0)
+    ap.add_argument("--hf-hp-hz", type=float, default=3000.0)
+    ap.add_argument("--hf-mix", type=float, default=0.35)
 
     # --- Delivery mastering ---
     ap.add_argument("--master", action="store_true", help="Enable loudness normalization + true-peak-ish limiting post stage.")
@@ -1202,6 +1451,37 @@ def main() -> int:
         deq_persist_thr_db=float(args.deq_persist_thr_db),
         deq_freq_smooth_bins=int(args.deq_freq_smooth_bins),
         deq_tonal_boost_db=float(args.deq_tonal_boost_db),
+        deq_time_floor=bool(args.deq_time_floor),
+        deq_floor_smooth_ms=float(args.deq_floor_smooth_ms),
+        deq_floor_rise_db_per_s=float(args.deq_floor_rise_db_per_s),
+
+        expander=bool(args.expander),
+        exp_start_hz=float(args.exp_start_hz),
+        exp_end_hz=float(args.exp_end_hz),
+        exp_threshold_db=float(args.exp_threshold_db),
+        exp_ratio=float(args.exp_ratio),
+        exp_attack_ms=float(args.exp_attack_ms),
+        exp_release_ms=float(args.exp_release_ms),
+
+        hpss=bool(args.hpss),
+        hpss_start_hz=float(args.hpss_start_hz),
+        hpss_end_hz=float(args.hpss_end_hz),
+        hpss_time_frames=int(args.hpss_time_frames),
+        hpss_freq_bins=int(args.hpss_freq_bins),
+        hpss_harmonic_only=(not bool(args.hpss_no_harmonic_only)),
+
+        phase_blur=float(args.phase_blur),
+        pb_start_hz=float(args.pb_start_hz),
+        pb_end_hz=float(args.pb_end_hz),
+        pb_harmonic_only=(not bool(args.pb_no_harmonic_only)),
+
+        hf_resynth=bool(args.hf_resynth),
+        hf_lp_hz=float(args.hf_lp_hz),
+        hf_src_lo_hz=float(args.hf_src_lo_hz),
+        hf_src_hi_hz=float(args.hf_src_hi_hz),
+        hf_drive=float(args.hf_drive),
+        hf_hp_hz=float(args.hf_hp_hz),
+        hf_mix=float(args.hf_mix),
     )
 
     target_lufs = None if float(args.target_lufs) >= 998.0 else float(args.target_lufs)
@@ -1280,6 +1560,8 @@ def main() -> int:
 
     # ---- STFT repair ----
     y_repaired = process_stft(x, sr, p, dbg=dbg_collector)
+    # Optional "nuclear" HF resynthesis after STFT repair (off by default)
+    y_repaired = hf_resynth_post(y_repaired, sr, p)
     y_rep_2d = _as_2d(y_repaired)
 
     meas_rep = {

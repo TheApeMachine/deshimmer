@@ -6,3 +6,4 @@ probe_*/
 ui_downloads/
 Demon3_debug/
 .venv/
+.DS_Store
