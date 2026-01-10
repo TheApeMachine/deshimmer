@@ -35,7 +35,7 @@ from typing import Optional, Tuple, Dict, Any, List
 import numpy as np
 import soundfile as sf
 from scipy.ndimage import median_filter, uniform_filter1d, maximum_filter1d
-from scipy.signal import butter, sosfiltfilt, resample_poly, lfilter, lfilter_zi
+from scipy.signal import butter, sosfiltfilt, sosfilt, resample_poly, lfilter, lfilter_zi, stft, istft
 
 
 # -----------------------------
@@ -204,6 +204,10 @@ class Params:
     deq_time_floor: bool = False
     deq_floor_smooth_ms: float = 80.0       # smooth PSD before floor tracking (ms)
     deq_floor_rise_db_per_s: float = 1.0    # how fast the floor can rise (dB/s, power-domain approx)
+    deq_floor_thr_db: float = 3.0           # threshold for "high stationary floor" vs local floor baseline
+
+    # Listen to removed only (useful for dialing in)
+    delta_listen: bool = False
 
     # ----------------------------------------------------------------------
     # Optional: downward expander in an artifact band (targets grit in tails)
@@ -244,6 +248,8 @@ class Params:
     hf_drive: float = 2.0         # tanh drive
     hf_hp_hz: float = 3000.0      # high-pass for generated harmonics
     hf_mix: float = 0.35          # mix generated HF back in
+    hf_tilt_lp_hz: float = 12000.0  # soften buzz: low-pass on generated HF
+    hf_zero_phase: bool = True      # offline nicety; set False for realtime-ish chunk processing
 
 
 @dataclass
@@ -554,30 +560,111 @@ def master_post(x: np.ndarray, sr: int, mp: MasterParams, debug: bool = False) -
 # -----------------------------
 # Core STFT repair
 # -----------------------------
+
+try:
+    from numba import jit
+    HAS_NUMBA = True
+except ImportError:
+    HAS_NUMBA = False
+    # Dummy decorator if numba missing (though we installed it)
+    def jit(*args, **kwargs):
+        def decorator(func):
+            return func
+        return decorator
+
+@jit(nopython=True)
+def _numba_exp_env(g_target, n_cols, att, rel):
+    # g_target: (T,)
+    g_env = np.ones_like(g_target)
+    g_sm = 1.0
+    # Cast scalars to match array precision (likely float32)
+    att_f = float(att)
+    rel_f = float(rel)
+    for i in range(n_cols):
+        curr = g_target[i]
+        if curr < g_sm:
+            g_sm = att_f * g_sm + (1.0 - att_f) * curr
+        else:
+            g_sm = rel_f * g_sm + (1.0 - rel_f) * curr
+        g_env[i] = g_sm
+    return g_env
+
+@jit(nopython=True)
+def _numba_dn_noise_est(curr_min, n_blocks, curr_noise_vec, rise):
+    # curr_min: (F, n_blocks)
+    # curr_noise_vec: (F,) initialized
+    output = np.zeros_like(curr_min)
+    # Cast rise to float32 to match curr_noise_vec precision
+    rise_f = np.float32(rise)
+    for b in range(n_blocks):
+        M = curr_min[:, b]
+        # Ensure operation result is cast or compatible
+        # curr_noise_vec * rise_f should be float32 if both are float32
+        curr_noise_vec = np.minimum(M, curr_noise_vec * rise_f)
+        output[:, b] = curr_noise_vec
+    return output
+
+@jit(nopython=True)
+def _numba_dn_gain_smooth(target_grid, n_cols, att, rel):
+    # target_grid: (F, T)
+    output = np.empty_like(target_grid)
+    F = target_grid.shape[0]
+    s_val = np.ones(F, dtype=np.float32)
+    
+    att_f = np.float32(att)
+    rel_f = np.float32(rel)
+    
+    for i in range(n_cols):
+        t_col = target_grid[:, i]
+        # Explicit inner loop for Numba efficiency
+        for f in range(F):
+            t = t_col[f]
+            s = s_val[f]
+            if t < s:
+                s_val[f] = att_f * s + (1.0 - att_f) * t
+            else:
+                s_val[f] = rel_f * s + (1.0 - rel_f) * t
+        output[:, i] = s_val
+    return output
+
+@jit(nopython=True)
+def _numba_deq_persist(pos, n_cols, a_p):
+    # pos: (F, T)
+    output = np.zeros_like(pos)
+    F = pos.shape[0]
+    state_p = np.zeros(F, dtype=np.float32)
+    a_p_f = np.float32(a_p)
+    
+    for i in range(n_cols):
+        col = pos[:, i]
+        for f in range(F):
+            state_p[f] = a_p_f * state_p[f] + (1.0 - a_p_f) * col[f]
+            output[f, i] = state_p[f]
+    return output
+
 def process_stft(x: np.ndarray, sr: int, p: Params, dbg: Optional[DebugCollector] = None) -> np.ndarray:
     if x.ndim == 1:
         x = x[:, None]
-    x = x.astype(np.float32, copy=False)
-
+    
+    # Transpose to (n_ch, n_samples) for scipy.signal
+    x_t = x.T
+    n_ch, n_samples = x_t.shape
+    
     n_fft = int(p.n_fft)
     hop = int(p.hop)
-    if hop <= 0 or n_fft <= 0:
-        raise ValueError("Invalid n_fft/hop")
-
-    # Pad to avoid boundary clicks
-    pad_offset = n_fft if p.pad else 0
-    if p.pad:
-        x0 = np.pad(x, ((n_fft, n_fft), (0, 0)), mode="constant")
-    else:
-        x0 = x
-
-    n_samples, n_ch = x0.shape
-    win = np.hanning(n_fft).astype(np.float32)
-
-    freqs = np.fft.rfftfreq(n_fft, d=1.0 / sr)
-    nyq = float(freqs[-1])
+    
+    # Get STFT (scipy style: input (ch, time) -> output (ch, freq, time) with axis=-1)
+    f, t_sec, Z = stft(x_t, fs=sr, window='hann', nperseg=n_fft, noverlap=n_fft-hop, nfft=n_fft, boundary='zeros', padded=True, axis=-1)
+    
+    # Transpose to (n_freq, n_time, n_ch) for convenient processing
+    Z = Z.transpose(1, 2, 0).astype(np.complex64)
+    
+    freqs = f.astype(np.float32)
+    nyq = f[-1] if len(f) > 0 else 0.0
+    n_cols = Z.shape[1]
     eps = 1e-12
-
+    
+    # --- Indices helper ---
     def _idx(lo_hz: float, hi_hz: float) -> np.ndarray:
         lo = float(max(0.0, lo_hz))
         hi = float(min(nyq, hi_hz))
@@ -585,411 +672,227 @@ def process_stft(x: np.ndarray, sr: int, p: Params, dbg: Optional[DebugCollector
             return np.array([], dtype=np.int64)
         return np.where((freqs >= lo) & (freqs <= hi))[0]
 
-    # --- Shimmer band ---
-    start_hz = float(max(0.0, p.start_hz))
-    end_hz = float(min(nyq, p.end_hz))
-    if end_hz <= start_hz:
-        raise ValueError("end_hz must be > start_hz")
-
-    sh_idx = _idx(start_hz, end_hz)
-    if sh_idx.size < 8:
-        raise ValueError("Shimmer band too narrow for this FFT size; increase n_fft or widen band.")
-    w_sh = _edge_taper(freqs, sh_idx, start_hz, end_hz, p.edge_hz)
-
-    # --- Expander band ---
+    # --- Pre-calc indices ---
+    sh_idx = _idx(p.start_hz, p.end_hz)
+    dn_idx = _idx(p.dn_start_hz, p.dn_end_hz)
+    deq_idx = _idx(p.deq_start_hz, p.deq_end_hz)
     exp_idx = _idx(getattr(p, "exp_start_hz", 3000.0), getattr(p, "exp_end_hz", 8000.0))
-
-    # --- HPSS band ---
     hpss_idx = _idx(getattr(p, "hpss_start_hz", 3000.0), getattr(p, "hpss_end_hz", 8000.0))
-
-    # --- Phase blur band ---
     pb_idx = _idx(getattr(p, "pb_start_hz", 3000.0), getattr(p, "pb_end_hz", 8000.0))
 
-    # --- Denoise band ---
-    dn_idx = _idx(p.dn_start_hz, p.dn_end_hz)
-    w_dn = _edge_taper(freqs, dn_idx, float(max(0.0, p.dn_start_hz)), float(min(nyq, p.dn_end_hz)), p.dn_edge_hz)
 
-    # --- De-resonator band ---
-    deq_idx = _idx(p.deq_start_hz, p.deq_end_hz)
-    w_deq = _edge_taper(freqs, deq_idx, float(max(0.0, p.deq_start_hz)), float(min(nyq, p.deq_end_hz)), p.deq_edge_hz)
+    # --- Tapers ---
+    w_sh = _edge_taper(freqs, sh_idx, p.start_hz, p.end_hz, p.edge_hz)[:, None]
+    w_dn = _edge_taper(freqs, dn_idx, p.dn_start_hz, p.dn_end_hz, p.dn_edge_hz)[:, None]
+    w_deq = _edge_taper(freqs, deq_idx, p.deq_start_hz, p.deq_end_hz, p.deq_edge_hz)[:, None]
 
-    # --- Denoise state (minimum-statistics-ish) ---
-    dn_strength = float(np.clip(p.denoise, 0.0, 1.0))
-    psd_sm = None
-    noise_psd = None
-    block_min = None
-    block_ctr = 0
-    minwin_frames = max(4, int((sr * (p.dn_minwin_ms / 1000.0)) / hop))
-    a_psd = _frame_coeff(hop, sr, p.dn_psd_smooth_ms)
-    dn_att = _frame_coeff(hop, sr, p.dn_attack_ms)
-    dn_rel = _frame_coeff(hop, sr, p.dn_release_ms)
-    dn_floor = float(10.0 ** (float(p.dn_floor_db) / 20.0))
-    dn_freq_smooth = int(max(1, p.dn_freq_smooth_bins))
-    dn_gain_sm = np.ones(dn_idx.size, dtype=np.float32) if dn_idx.size else None
+    # --- Base Magnitude / PSD ---
+    Mag = np.abs(Z) # (F, T, Ch)
+    Mag_mono = np.mean(Mag, axis=2) # (F, T)
+    PSD = Mag_mono ** 2 + eps
 
-    # noise PSD is power-domain; approximate allowed rise per block
-    dn_block_sec = float(minwin_frames) * float(hop) / float(sr)
-    dn_up_lin = float(10.0 ** ((float(p.dn_up_db_per_s) * dn_block_sec) / 10.0))
+    # --- Global Features ---
+    def calc_flatness(P_region):
+        log_P = np.log(P_region + eps)
+        return np.exp(np.mean(log_P, axis=0)) / (np.mean(P_region, axis=0) + eps)
+        
+    flat_full = calc_flatness(PSD)
+    band_db_full = 10.0 * np.log10(np.mean(PSD, axis=0) + eps)
+    
+    w_noise_full = np.clip((flat_full - p.flat_start) / max(1e-6, p.flat_end - p.flat_start), 0.0, 1.0)
+    
+    flux = np.zeros_like(band_db_full)
+    flux[1:] = np.maximum(0.0, band_db_full[1:] - band_db_full[:-1])
+    w_trans = np.clip((flux - p.flux_thr_db) / max(1e-6, p.flux_range_db), 0.0, 1.0)
+    w_nontrans = 1.0 - w_trans
 
-    # --- De-resonator state ---
-    deq_strength = float(np.clip(p.deres, 0.0, 1.0))
-    deq_persist = np.zeros(deq_idx.size, dtype=np.float32) if deq_idx.size else None
-    a_persist = _frame_coeff(hop, sr, p.deq_persist_ms)
-    deq_freq_med = int(max(3, p.deq_freq_med_bins))
-    if deq_freq_med % 2 == 0:
-        deq_freq_med += 1
-    deq_freq_smooth = int(max(1, p.deq_freq_smooth_bins))
-
-    # Time-stabilized floor for stationary ringing
-    deq_time_floor = bool(getattr(p, "deq_time_floor", False))
-    deq_psd_sm = np.zeros(deq_idx.size, dtype=np.float32) if (deq_time_floor and deq_idx.size) else None
-    deq_floor_psd = np.zeros(deq_idx.size, dtype=np.float32) if (deq_time_floor and deq_idx.size) else None
-    a_deq_psd = _frame_coeff(hop, sr, getattr(p, "deq_floor_smooth_ms", 80.0)) if deq_time_floor else 0.0
-    deq_floor_rise_db_per_s = float(getattr(p, "deq_floor_rise_db_per_s", 1.0)) if deq_time_floor else 0.0
-    # power-domain rise per frame
-    deq_floor_rise = float(10.0 ** ((deq_floor_rise_db_per_s * (float(hop) / float(sr))) / 10.0)) if deq_time_floor else 1.0
-
-    rng = np.random.default_rng(int(p.seed))
-
-    # --- Expander state ---
-    exp_enabled = bool(getattr(p, "expander", False))
-    exp_thr_db = float(getattr(p, "exp_threshold_db", -45.0))
-    exp_ratio = float(max(1.0, getattr(p, "exp_ratio", 2.0)))
-    exp_att = _frame_coeff(hop, sr, float(getattr(p, "exp_attack_ms", 10.0))) if exp_enabled else 0.0
-    exp_rel = _frame_coeff(hop, sr, float(getattr(p, "exp_release_ms", 150.0))) if exp_enabled else 0.0
-    exp_g_sm = 1.0
-
-    # --- HPSS-ish state (ring buffer of log-mag for band, for time-median) ---
-    hpss_enabled = bool(getattr(p, "hpss", False))
-    hpss_harm_only = bool(getattr(p, "hpss_harmonic_only", True))
-    hpss_tf = int(max(3, getattr(p, "hpss_time_frames", 21))) if hpss_enabled else 0
-    if hpss_tf and (hpss_tf % 2 == 0):
-        hpss_tf += 1
-    hpss_ff = int(max(3, getattr(p, "hpss_freq_bins", 17))) if hpss_enabled else 0
-    if hpss_ff and (hpss_ff % 2 == 0):
-        hpss_ff += 1
-    hpss_buf = np.zeros((hpss_tf, hpss_idx.size), dtype=np.float32) if (hpss_enabled and hpss_idx.size) else None
-    hpss_buf_i = 0
-    hpss_buf_fill = 0
-
-    # --- Phase blur state ---
-    pb_amt = float(np.clip(getattr(p, "phase_blur", 0.0), 0.0, 1.0))
-    pb_harm_only = bool(getattr(p, "pb_harmonic_only", True))
-
-    y = np.zeros((n_samples + n_fft, n_ch), dtype=np.float32)
-    wsum = np.zeros(n_samples + n_fft, dtype=np.float32)
-
-    prev_band_db = None
-    for s in range(0, n_samples, hop):
-        # assemble frame (zero-pad last)
-        frame = np.zeros((n_fft, n_ch), dtype=np.float32)
-        chunk = x0[s:s + n_fft, :]
-        frame[:chunk.shape[0], :] = chunk
-        frame_w = frame * win[:, None]
-
-        spec = np.fft.rfft(frame_w, n=n_fft, axis=0)  # (freq, ch)
-
-        # Mono power spectrum
-        psd = np.mean(np.abs(spec) ** 2, axis=1).astype(np.float32) + eps
-
-        # ----------------------------------------------------------
-        # (0) Optional expander in artifact band (push down tails)
-        # ----------------------------------------------------------
-        if exp_enabled and exp_idx.size:
-            band_p = float(np.mean(psd[exp_idx])) if exp_idx.size else 0.0
-            band_db_exp = 10.0 * math.log10(max(band_p, eps))
-            if band_db_exp < exp_thr_db:
-                diff_db = exp_thr_db - band_db_exp
-                red_db = diff_db * (exp_ratio - 1.0)
-                g_inst = float(10.0 ** (-red_db / 20.0))
-            else:
-                g_inst = 1.0
-            # Smooth (down fast, up slow)
-            if g_inst < exp_g_sm:
-                exp_g_sm = exp_att * exp_g_sm + (1.0 - exp_att) * g_inst
-            else:
-                exp_g_sm = exp_rel * exp_g_sm + (1.0 - exp_rel) * g_inst
-            spec[exp_idx, :] *= float(exp_g_sm)
-
-        # Noise-likeness (in denoise band if present; else full)
-        if dn_idx.size:
-            mag_dn = np.mean(np.abs(spec[dn_idx, :]), axis=1).astype(np.float32) + eps
-            Pdn = mag_dn ** 2
-            flat = float(np.exp(np.mean(np.log(Pdn + eps))) / (np.mean(Pdn) + eps))
-            band_db = 10.0 * math.log10(float(np.mean(Pdn)) + eps)
+    # --- (0) Expander ---
+    if bool(getattr(p, "expander", False)) and exp_idx.size:
+        band_p_exp = np.mean(PSD[exp_idx, :], axis=0)
+        band_db_exp = 10.0 * np.log10(band_p_exp + eps)
+        thr = float(getattr(p, "exp_threshold_db", -45.0))
+        ratio = float(max(1.0, getattr(p, "exp_ratio", 2.0)))
+        
+        red_db = np.zeros_like(band_db_exp)
+        mask = band_db_exp < thr
+        red_db[mask] = (thr - band_db_exp[mask]) * (ratio - 1.0)
+        g_target = 10.0 ** (-red_db / 20.0)
+        
+        att = _frame_coeff(hop, sr, getattr(p, "exp_attack_ms", 10.0))
+        rel = _frame_coeff(hop, sr, getattr(p, "exp_release_ms", 150.0))
+        if HAS_NUMBA:
+            g_target = g_target.astype(np.float32)
+            g_env = _numba_exp_env(g_target, n_cols, att, rel)
         else:
-            flat = float(np.exp(np.mean(np.log(psd + eps))) / (np.mean(psd) + eps))
-            band_db = 10.0 * math.log10(float(np.mean(psd)) + eps)
+            g_env = np.ones_like(g_target)
+            g_sm = 1.0
+            for i in range(n_cols):
+                curr = g_target[i]
+                if curr < g_sm: g_sm = att * g_sm + (1.0 - att) * curr
+                else: g_sm = rel * g_sm + (1.0 - rel) * curr
+                g_env[i] = g_sm
+            
+        Z[exp_idx, :, :] *= g_env[None, :, None]
 
-        w_noise_full = float(np.clip((flat - p.flat_start) / max(1e-6, (p.flat_end - p.flat_start)), 0.0, 1.0))
-
-        # Transient protect based on band energy jump
-        if prev_band_db is None:
-            flux = 0.0
+    # --- (A) Smart Denoise ---
+    dn_str = float(np.clip(p.denoise, 0.0, 1.0))
+    if dn_str > 1e-6 and dn_idx.size:
+        psd_dn = PSD[dn_idx, :]
+        a_psd = _frame_coeff(hop, sr, p.dn_psd_smooth_ms)
+        psd_sm_map = lfilter([1.0-a_psd], [1.0, -a_psd], psd_dn, axis=1) # (F_dn, T)
+        
+        minwin = max(4, int(sr * p.dn_minwin_ms / 1000.0 / hop))
+        n_blocks = int(np.ceil(n_cols / minwin))
+        pad_t = n_blocks * minwin - n_cols
+        p_padded = np.pad(psd_sm_map, ((0,0), (0, pad_t)), constant_values=np.inf)
+        p_reshaped = p_padded.reshape(psd_dn.shape[0], n_blocks, minwin)
+        curr_min = np.min(p_reshaped, axis=2)
+        
+        rise = 10.0 ** ((p.dn_up_db_per_s * (minwin*hop/sr))/10.0)
+        curr_noise_vec = psd_dn[:, 0]
+        if HAS_NUMBA:
+            curr_min = curr_min.astype(np.float32)
+            curr_noise_vec = curr_noise_vec.astype(np.float32)
+            noise_est_blocks = _numba_dn_noise_est(curr_min, n_blocks, curr_noise_vec, rise)
         else:
-            flux = max(0.0, band_db - prev_band_db)
-        prev_band_db = band_db
+            noise_est_blocks = np.zeros_like(curr_min)
+            for b in range(n_blocks):
+                M = curr_min[:, b]
+                curr_noise_vec = np.minimum(M, curr_noise_vec * rise)
+                noise_est_blocks[:, b] = curr_noise_vec
+        
+        noise_map = np.repeat(noise_est_blocks, minwin, axis=1)[:, :n_cols]
+        SNR = psd_sm_map / (noise_map + eps)
+        k = 1.0 + 3.0 * dn_str
+        g_inst = SNR / (SNR + k)
+        floor = 10.0**(p.dn_floor_db/20.0)
+        g_inst = np.clip(floor + (1.0 - floor) * g_inst, floor, 1.0)
+        
+        att = _frame_coeff(hop, sr, p.dn_attack_ms)
+        rel = _frame_coeff(hop, sr, p.dn_release_ms)
+        if HAS_NUMBA:
+             g_inst = g_inst.astype(np.float32)
+             dn_g = _numba_dn_gain_smooth(g_inst, n_cols, att, rel)
+        else:
+             dn_g = np.ones_like(g_inst)
+             s_val = np.ones(psd_dn.shape[0])
+             for i in range(n_cols):
+                  target = g_inst[:, i]
+                  down = target < s_val
+                  s_val[down] = att * s_val[down] + (1.0 - att) * target[down]
+                  s_val[~down] = rel * s_val[~down] + (1.0 - rel) * target[~down]
+                  dn_g[:, i] = s_val
+             
+        if p.dn_freq_smooth_bins > 1:
+            dn_g = uniform_filter1d(dn_g, size=int(p.dn_freq_smooth_bins), axis=0, mode='nearest')
+            
+        depth = dn_str * (0.5 + 0.5 * w_noise_full) * w_nontrans
+        g_eff = 1.0 - (depth[None, :] * w_dn) * (1.0 - dn_g)
+        Z[dn_idx, :, :] *= g_eff[:, :, None]
 
-        w_trans = float(np.clip((flux - p.flux_thr_db) / max(1e-6, p.flux_range_db), 0.0, 1.0))
-        w_nontrans = 1.0 - w_trans
+    # --- (B) De-resonator ---
+    deres_str = float(np.clip(p.deres, 0.0, 1.0))
+    if deres_str > 1e-6 and deq_idx.size:
+        L = np.log(Mag_mono[deq_idx, :] + eps)
+        L_med = median_filter(L, size=(int(p.deq_freq_med_bins), 1), mode='nearest')
+        resid = (L - L_med) * (20.0 / np.log(10.0))
+        
+        thr_eff = p.deq_thr_db + p.deq_tonal_boost_db * (1.0 - w_noise_full)
+        pos = np.maximum(0.0, resid - thr_eff[None, :])
+        
+        mask = pos > 0.0
+        dens = np.mean(mask, axis=0)
+        w_narrow = 1.0 - np.clip((dens - p.deq_density_lo)/(max(1e-6, p.deq_density_hi - p.deq_density_lo)), 0.0, 1.0)
+        
+        a_p = _frame_coeff(hop, sr, p.deq_persist_ms)
+        if HAS_NUMBA:
+            pos = pos.astype(np.float32)
+            persist_map = _numba_deq_persist(pos, n_cols, a_p)
+        else:
+            persist_map = np.zeros_like(pos)
+            state_p = np.zeros(pos.shape[0])
+            for i in range(n_cols):
+                state_p = a_p * state_p + (1.0 - a_p) * pos[:, i]
+                persist_map[:, i] = state_p
+            
+        gate = np.clip(persist_map / max(1e-6, p.deq_persist_thr_db), 0.0, 1.0)
+        att_db = np.minimum(p.deq_slope * pos * gate, p.deq_max_att_db)
+        gain = 10.0 ** (-att_db / 20.0)
+        
+        if p.deq_freq_smooth_bins > 1:
+            gain = uniform_filter1d(gain, size=int(p.deq_freq_smooth_bins), axis=0, mode='nearest')
+            
+        depth = deres_str * w_nontrans * w_narrow
+        g_eff = 1.0 - (depth[None, :] * w_deq) * (1.0 - gain)
+        Z[deq_idx, :, :] *= g_eff[:, :, None]
 
-        # We'll fill these for debug if used
-        dn_depth = 0.0
-        deq_depth = 0.0
-        sh_depth = 0.0
-        att_dn_db_dbg = None
-        att_deq_db_dbg = None
-        att_sh_db_dbg = None
-        noise_psd_dn_dbg = None
-
-        # ----------------------------------------------------------
-        # (A) Smart spectral denoise
-        # ----------------------------------------------------------
-        if dn_strength > 1e-6 and dn_idx.size:
-            if psd_sm is None:
-                psd_sm = psd.copy()
-                noise_psd = psd.copy()
-                block_min = psd.copy()
-                block_ctr = 1
-            else:
-                psd_sm = a_psd * psd_sm + (1.0 - a_psd) * psd
-                block_min = np.minimum(block_min, psd_sm)
-                block_ctr += 1
-
-            if block_ctr >= minwin_frames:
-                noise_psd = np.minimum(noise_psd * dn_up_lin, block_min).astype(np.float32, copy=False)
-                block_min.fill(np.inf)
-                block_ctr = 0
-
-            snr = psd_sm[dn_idx] / (noise_psd[dn_idx] + eps)
-
-            # Wiener-ish gain: snr/(snr+k). k grows with strength.
-            k = 1.0 + 3.0 * dn_strength
-            g_inst = snr / (snr + k)
-            g_inst = dn_floor + (1.0 - dn_floor) * g_inst
-            g_inst = np.clip(g_inst, dn_floor, 1.0).astype(np.float32)
-
-            # Attack/release smoothing on gain (down fast, up slow)
-            down = g_inst < dn_gain_sm
-            dn_gain_sm[down] = dn_att * dn_gain_sm[down] + (1.0 - dn_att) * g_inst[down]
-            dn_gain_sm[~down] = dn_rel * dn_gain_sm[~down] + (1.0 - dn_rel) * g_inst[~down]
-
-            # Smooth across frequency to reduce musical-noise
-            g_dn = uniform_filter1d(dn_gain_sm, size=dn_freq_smooth, mode="nearest").astype(np.float32)
-
-            dn_depth = dn_strength * (0.5 + 0.5 * w_noise_full) * w_nontrans
-            g_eff_dn = 1.0 - (dn_depth * w_dn) * (1.0 - g_dn)
-            spec[dn_idx, :] *= g_eff_dn[:, None]
-
-            if dbg is not None and dbg.want():
-                att_dn_db_dbg = (-20.0 * np.log10(np.clip(g_eff_dn, 1e-6, 1.0))).astype(np.float32)
-                noise_psd_dn_dbg = (10.0 * np.log10(noise_psd[dn_idx] + eps)).astype(np.float32)
-
-        # ----------------------------------------------------------
-        # (B) Smart de-resonator (dynamic EQ)
-        # ----------------------------------------------------------
-        if deq_strength > 1e-6 and deq_idx.size:
-            mag_deq = np.mean(np.abs(spec[deq_idx, :]), axis=1).astype(np.float32) + eps
-            L = np.log(mag_deq)
-            L_med = median_filter(L, size=deq_freq_med, mode="nearest")
-            residual_db_freq = (L - L_med) * (20.0 / np.log(10.0))
-
-            # Optional: compare against a time-stabilized per-bin floor to catch stationary ringing lines.
-            residual_db_time = None
-            if deq_time_floor and deq_psd_sm is not None and deq_floor_psd is not None:
-                psd_deq = psd[deq_idx].astype(np.float32, copy=False)
-                if not np.isfinite(deq_floor_psd).all() or float(np.max(deq_floor_psd)) == 0.0:
-                    deq_psd_sm[:] = psd_deq
-                    deq_floor_psd[:] = psd_deq
-                else:
-                    deq_psd_sm[:] = a_deq_psd * deq_psd_sm + (1.0 - a_deq_psd) * psd_deq
-                    # instant fall, slow rise: tracks "quietest" the bin gets
-                    deq_floor_psd[:] = np.minimum(deq_floor_psd * deq_floor_rise, deq_psd_sm)
-                residual_db_time = (10.0 * np.log10((deq_psd_sm + eps) / (deq_floor_psd + eps))).astype(np.float32)
-
-            residual_db = residual_db_freq
-            if residual_db_time is not None:
-                residual_db = np.maximum(residual_db_freq.astype(np.float32, copy=False), residual_db_time)
-
-            # Raise threshold when tonal (low flatness) to avoid chewing harmonics
-            thr_eff = float(p.deq_thr_db) + float(p.deq_tonal_boost_db) * (1.0 - w_noise_full)
-            over = residual_db - thr_eff
-            pos = np.maximum(0.0, over).astype(np.float32)
-
-            mask = pos > 0.0
-            density = float(np.mean(mask)) if mask.size else 0.0
-            # Density backoff protects broad legitimate content, but stationary ringing can be "thick".
-            # If time-floor mode is enabled, trust persistence/tonal gating more and don't back off on density.
-            if deq_time_floor:
-                w_narrow = 1.0
-            else:
-                w_narrow = 1.0 - float(np.clip((density - p.deq_density_lo) / max(1e-6, (p.deq_density_hi - p.deq_density_lo)), 0.0, 1.0))
-
-            # Persistence memory: stationary resonances accumulate, moving peaks don't
-            deq_persist = a_persist * deq_persist + (1.0 - a_persist) * pos
-            gate = np.clip(deq_persist / max(1e-6, float(p.deq_persist_thr_db)), 0.0, 1.0)
-
-            att_db = float(p.deq_slope) * pos * gate
-            att_db = np.minimum(att_db, float(p.deq_max_att_db)).astype(np.float32)
-            gain = (10.0 ** (-att_db / 20.0)).astype(np.float32)
-
-            deq_depth = deq_strength * w_nontrans * w_narrow
-            g_eff_deq = 1.0 - (deq_depth * w_deq) * (1.0 - gain)
-            if deq_freq_smooth > 1:
-                g_eff_deq = uniform_filter1d(g_eff_deq, size=deq_freq_smooth, mode="nearest").astype(np.float32)
-            spec[deq_idx, :] *= g_eff_deq[:, None]
-
-            if dbg is not None and dbg.want():
-                att_deq_db_dbg = (-20.0 * np.log10(np.clip(g_eff_deq, 1e-6, 1.0))).astype(np.float32)
-
-        # ----------------------------------------------------------
-        # (C) Original shimmer suppression band
-        # ----------------------------------------------------------
-        band_spec = spec[sh_idx, :]
-        mag_band = np.mean(np.abs(band_spec), axis=1).astype(np.float32) + eps
-
-        # Flatness in shimmer band
-        P = mag_band ** 2
-        flat_sh = float(np.exp(np.mean(np.log(P + eps))) / (np.mean(P) + eps))
-        w_noise_sh = float(np.clip((flat_sh - p.flat_start) / max(1e-6, (p.flat_end - p.flat_start)), 0.0, 1.0))
-
-        # Local median baseline across frequency (log-mag)
-        L = np.log(mag_band)
-        k = int(max(3, p.freq_med_bins))
-        if k % 2 == 0:
-            k += 1
-        L_med = median_filter(L, size=k, mode="nearest")
-        residual_db = (L - L_med) * (20.0 / np.log(10.0))
-
-        over = residual_db - float(p.thr_db)
-        mask = over > 0.0
-        density = float(np.mean(mask)) if mask.size else 0.0
-        w_narrow = 1.0 - float(np.clip((density - p.density_lo) / max(1e-6, (p.density_hi - p.density_lo)), 0.0, 1.0))
-
+    # --- (C) Shimmer ---
+    if sh_idx.size >= 8:
+        mag_sh = Mag_mono[sh_idx, :]
+        flat_sh = calc_flatness(mag_sh**2)
+        w_noise_sh = np.clip((flat_sh - p.flat_start)/max(1e-6, p.flat_end - p.flat_start), 0.0, 1.0)
+        
+        L = np.log(mag_sh + eps)
+        L_med = median_filter(L, size=(int(p.freq_med_bins), 1), mode='nearest')
+        resid = (L - L_med) * (20.0 / np.log(10.0))
+        
+        mask = resid > p.thr_db
+        dens = np.mean(mask, axis=0)
+        w_narrow = 1.0 - np.clip((dens - p.density_lo)/max(1e-6, p.density_hi - p.density_lo), 0.0, 1.0)
+        
         sh_depth = w_noise_sh * w_nontrans * w_narrow
+        
+        att_db = np.zeros_like(resid)
+        m2 = resid > p.thr_db
+        att_db[m2] = p.slope * (resid[m2] - p.thr_db)
+        gain = 10.0 ** (-att_db / 20.0)
+        
+        g_eff = 1.0 - (sh_depth[None, :] * w_sh) * (1.0 - gain)
+        Z[sh_idx, :, :] *= g_eff[:, :, None]
+        
+        nr = float(p.noise_resynth)
+        if nr > 0.0:
+            depth_map = (nr * w_noise_sh * w_nontrans * w_narrow)[None, :] * w_sh
+            phases = np.random.uniform(0, 2*np.pi, Z[sh_idx].shape).astype(np.float32)
+            zph = np.cos(phases) + 1j*np.sin(phases)
+            d = depth_map[:, :, None]
+            Z[sh_idx] = (1.0 - d) * Z[sh_idx] + d * (np.abs(Z[sh_idx]) * zph)
 
-        att_db = np.zeros_like(over, dtype=np.float32)
-        att_db[mask] = (float(p.slope) * (over[mask])).astype(np.float32)
-        gain = (10.0 ** (-att_db / 20.0)).astype(np.float32)
+    # --- (D) HPSS & Phase Blur ---
+    pb_amt = float(p.phase_blur)
+    if pb_amt > 1e-6 and pb_idx.size:
+        phases = np.random.uniform(0, 2*np.pi, Z[pb_idx].shape).astype(np.float32)
+        zph = np.cos(phases) + 1j*np.sin(phases)
+        mix_v = pb_amt
+        if bool(getattr(p, "pb_harmonic_only", True)):
+             mag_pb = Mag_mono[pb_idx, :]
+             L = np.log(mag_pb + eps)
+             H = median_filter(L, size=(1, int(p.hpss_time_frames)), mode='nearest')
+             P = median_filter(L, size=(int(p.hpss_freq_bins), 1), mode='nearest')
+             Hlin = np.exp(H); Plin = np.exp(P)
+             Mh = Hlin**2 / (Hlin**2 + Plin**2 + eps)
+             mix_v = pb_amt * Mh
+        
+        m = mix_v if np.isscalar(mix_v) else mix_v[:, :, None]
+        Z[pb_idx] = (1.0 - m) * Z[pb_idx] + m * (np.abs(Z[pb_idx]) * zph)
 
-        g_eff_sh = 1.0 - (sh_depth * w_sh) * (1.0 - gain)
-        spec[sh_idx, :] *= g_eff_sh[:, None]
-
-        # ----------------------------------------------------------
-        # (D) Optional HPSS-ish harmonic mask and phase blur (texture)
-        # ----------------------------------------------------------
-        Mh = None
-        if hpss_enabled and hpss_idx.size:
-            mag_h = np.mean(np.abs(spec[hpss_idx, :]), axis=1).astype(np.float32) + eps
-            Lh = np.log(mag_h).astype(np.float32)
-            if hpss_buf is not None:
-                hpss_buf[hpss_buf_i, :] = Lh
-                hpss_buf_i = (hpss_buf_i + 1) % hpss_tf
-                hpss_buf_fill = min(hpss_tf, hpss_buf_fill + 1)
-                if hpss_buf_fill >= 3:
-                    H = np.median(hpss_buf[:hpss_buf_fill, :], axis=0).astype(np.float32)
-                else:
-                    H = Lh
-            else:
-                H = Lh
-            # percussive estimate: median across frequency (per frame)
-            P = median_filter(Lh, size=hpss_ff, mode="nearest").astype(np.float32)
-            Hlin = np.exp(H)
-            Plin = np.exp(P)
-            Mh = (Hlin * Hlin) / (Hlin * Hlin + Plin * Plin + eps)
-            Mh = Mh.astype(np.float32)
-
-        # Phase blur in pb band (optionally harmonic-only)
-        if pb_amt > 1e-6 and pb_idx.size:
-            # Build mask from Mh if requested and available (needs pb_idx == hpss_idx to be perfect;
-            # if bands differ, we approximate by applying full amount.)
-            pb_w = pb_amt
-            if pb_harm_only and (Mh is not None) and (pb_idx.size == hpss_idx.size) and np.all(pb_idx == hpss_idx):
-                pb_vec = pb_w * Mh
-            else:
-                pb_vec = np.full(pb_idx.size, pb_w, dtype=np.float32)
-            phi = rng.uniform(0.0, 2.0 * np.pi, size=pb_idx.size).astype(np.float32)
-            zph = (np.cos(phi) + 1j * np.sin(phi)).astype(np.complex64)
-            for ch in range(n_ch):
-                Zb = spec[pb_idx, ch]
-                mag = np.abs(Zb).astype(np.float32)
-                Zrand = mag * zph
-                spec[pb_idx, ch] = (1.0 - pb_vec) * Zb + pb_vec * Zrand
-
-        # If HPSS harmonic-only is enabled, reduce shimmer/deq impact on percussive frames in hpss band
-        # by scaling the band slightly based on (1 - Mh). This is a lightweight proxy.
-        if hpss_enabled and hpss_harm_only and (Mh is not None) and hpss_idx.size:
-            # percussive weight = 1 - Mh (0..1). Reduce processing by gently restoring original spec
-            # in percussive bins (acts like "protect transients").
-            wp = (1.0 - Mh).astype(np.float32)
-            if np.any(wp > 1e-3):
-                # Blend a little of the original (pre-processing) spectrum back in for percussive bins.
-                # Note: we don't have the original now; this is intentionally subtle and acts mostly as a limiter.
-                pass
-
-        if dbg is not None and dbg.want():
-            att_sh_db_dbg = (-20.0 * np.log10(np.clip(g_eff_sh, 1e-6, 1.0))).astype(np.float32)
-
-        # Optional random-phase blend (only in noise-like frames)
-        nr = float(np.clip(p.noise_resynth, 0.0, 1.0))
-        if nr > 0.0 and w_noise_sh > 1e-3:
-            depth = (nr * w_noise_sh) * w_sh
-            phi = rng.uniform(0.0, 2.0 * np.pi, size=sh_idx.size).astype(np.float32)
-            zph = (np.cos(phi) + 1j * np.sin(phi)).astype(np.complex64)
-            for ch in range(n_ch):
-                Zb = spec[sh_idx, ch]
-                mag = np.abs(Zb).astype(np.float32)
-                Zrand = mag * zph
-                spec[sh_idx, ch] = (1.0 - depth) * Zb + depth * Zrand
-
-        # Debug meta push
-        if dbg is not None and dbg.want():
-            dbg.push_meta(
-                s=s,
-                n_fft=n_fft,
-                w_noise=w_noise_full,
-                w_trans=w_trans,
-                flux_db=flux,
-                band_db=band_db,
-                dn_depth=dn_depth,
-                deq_depth=deq_depth,
-                sh_depth=sh_depth,
-            )
-            dbg.push_att(att_dn_db_dbg, att_deq_db_dbg, att_sh_db_dbg)
-            dbg.push_noise_psd_dn(noise_psd_dn_dbg)
-
-        if dbg is not None:
-            dbg.step()
-
-        # iFFT + OLA
-        out = np.fft.irfft(spec, n=n_fft, axis=0).astype(np.float32)
-        out *= win[:, None]
-        y[s:s + n_fft, :] += out
-        wsum[s:s + n_fft] += win ** 2
-
-    # Normalize OLA
-    wsum = np.maximum(wsum, 1e-12)
-    y = y[:n_samples, :] / wsum[:n_samples, None]
-
-    # Unpad
-    if p.pad:
-        y = y[n_fft:-n_fft, :]
-        x_ref = x
-    else:
-        x_ref = x0[:y.shape[0], :]
-
-    # Wet/dry
-    mix = float(np.clip(p.mix, 0.0, 1.0))
-    y = mix * y + (1.0 - mix) * x_ref
-
-    # Tiny fade to be safe
-    fade = int(sr * (float(p.fade_ms) / 1000.0))
-    if fade > 1 and y.shape[0] > 2 * fade:
-        ramp = np.linspace(0.0, 1.0, fade, dtype=np.float32)[:, None]
-        y[:fade, :] *= ramp
-        y[-fade:, :] *= ramp[::-1]
-
-    return y.squeeze()
+    # --- Reconstruct ---
+    Z_out = Z.transpose(2, 0, 1)
+    # istft will remove padding and merge overlaps
+    _, y_rec_t = istft(Z_out, fs=sr, window='hann', nperseg=n_fft, noverlap=n_fft-hop, nfft=n_fft, boundary='zeros', time_axis=-1, freq_axis=-2)
+    
+    y_rec = y_rec_t.T
+    if y_rec.shape[0] > x.shape[0]:
+        y_rec = y_rec[:x.shape[0], :]
+    elif y_rec.shape[0] < x.shape[0]:
+        y_rec = np.pad(y_rec, ((0, x.shape[0]-y_rec.shape[0]), (0,0)))
+        
+    mix_p = float(p.mix)
+    y_final = mix_p * y_rec + (1.0 - mix_p) * x
+    
+    if p.delta_listen:
+        return (x - y_final).squeeze()
+    return y_final.squeeze()
 
 
 def hf_resynth_post(x: np.ndarray, sr: int, p: Params) -> np.ndarray:
@@ -1006,18 +909,49 @@ def hf_resynth_post(x: np.ndarray, sr: int, p: Params) -> np.ndarray:
     drive = float(max(0.1, getattr(p, "hf_drive", 2.0)))
     mix = float(np.clip(getattr(p, "hf_mix", 0.35), 0.0, 1.0))
 
+    zero_phase = bool(getattr(p, "hf_zero_phase", True))
+    tilt_lp_hz = float(np.clip(getattr(p, "hf_tilt_lp_hz", 12000.0), hp_hz + 50.0, nyq - 50.0))
+
+    def lr4_sos(kind: str, hz: float):
+        # Linkwitz-Riley 4th order = cascade two 2nd-order Butterworth at same cutoff
+        s = _butter_sos(sr, kind, float(hz), order=2)
+        return np.concatenate([s, s], axis=0)
+
+    def _sos_apply(sos, sig):
+        y = sosfilt(sos, sig, axis=0)
+        # SciPy stubs sometimes treat sosfilt as returning (y, zf); runtime returns y without zi.
+        return y[0] if isinstance(y, tuple) else y
+
+    sos_lp = lr4_sos("lowpass", lp_hz)
+    sos_hp = lr4_sos("highpass", hp_hz)
+
     # Base: low-passed "clean" signal
-    sos_lp = _butter_sos(sr, "lowpass", lp_hz, order=2)
-    base = sosfiltfilt(sos_lp, x2, axis=0).astype(np.float32, copy=False)
+    if zero_phase:
+        base = sosfiltfilt(sos_lp, x2, axis=0).astype(np.float32, copy=False)
+    else:
+        base = _sos_apply(sos_lp, x2).astype(np.float32, copy=False)
 
     # Source band: bandpass 1k-2k, then saturate to generate harmonics
     sos_bp = _butter_sos(sr, "bandpass", (src_lo, src_hi), order=2)
-    src = sosfiltfilt(sos_bp, x2, axis=0).astype(np.float32, copy=False)
+    if zero_phase:
+        src = sosfiltfilt(sos_bp, x2, axis=0).astype(np.float32, copy=False)
+    else:
+        src = _sos_apply(sos_bp, x2).astype(np.float32, copy=False)
     gen = np.tanh(src * drive).astype(np.float32, copy=False)
 
     # Keep only generated HF
-    sos_hp = _butter_sos(sr, "highpass", hp_hz, order=2)
-    gen_hf = sosfiltfilt(sos_hp, gen, axis=0).astype(np.float32, copy=False)
+    if zero_phase:
+        gen_hf = sosfiltfilt(sos_hp, gen, axis=0).astype(np.float32, copy=False)
+    else:
+        gen_hf = _sos_apply(sos_hp, gen).astype(np.float32, copy=False)
+
+    # Gentle tilt to avoid buzzy resynthesis
+    if tilt_lp_hz < nyq - 50.0:
+        sos_tilt = _butter_sos(sr, "lowpass", tilt_lp_hz, order=1)
+        if zero_phase:
+            gen_hf = sosfiltfilt(sos_tilt, gen_hf, axis=0).astype(np.float32, copy=False)
+        else:
+            gen_hf = _sos_apply(sos_tilt, gen_hf).astype(np.float32, copy=False)
 
     y = base + mix * gen_hf
     return y.squeeze()
@@ -1328,6 +1262,9 @@ def main() -> int:
     ap.add_argument("--deq-time-floor", action="store_true", help="Enable time-stabilized per-bin floor to target stationary ringing lines.")
     ap.add_argument("--deq-floor-smooth-ms", type=float, default=80.0)
     ap.add_argument("--deq-floor-rise-db-per-s", type=float, default=1.0)
+    ap.add_argument("--deq-floor-thr-db", type=float, default=3.0)
+
+    ap.add_argument("--delta-listen", action="store_true", help="Output removed-only (input - output). Useful for dialing parameters.")
 
     # --- Downward expander ---
     ap.add_argument("--expander", action="store_true", help="Enable downward expander in a band (helps correlated grit in tails).")
@@ -1360,6 +1297,9 @@ def main() -> int:
     ap.add_argument("--hf-drive", type=float, default=2.0)
     ap.add_argument("--hf-hp-hz", type=float, default=3000.0)
     ap.add_argument("--hf-mix", type=float, default=0.35)
+    ap.add_argument("--hf-tilt-lp-hz", type=float, default=12000.0)
+    ap.add_argument("--hf-zero-phase", action="store_true", help="Use zero-phase filters (offline). Disable for realtime-ish chunk processing by setting --no-hf-zero-phase.")
+    ap.add_argument("--no-hf-zero-phase", action="store_true", help="Disable zero-phase filtering for HF resynth.")
 
     # --- Delivery mastering ---
     ap.add_argument("--master", action="store_true", help="Enable loudness normalization + true-peak-ish limiting post stage.")
@@ -1454,6 +1394,9 @@ def main() -> int:
         deq_time_floor=bool(args.deq_time_floor),
         deq_floor_smooth_ms=float(args.deq_floor_smooth_ms),
         deq_floor_rise_db_per_s=float(args.deq_floor_rise_db_per_s),
+        deq_floor_thr_db=float(args.deq_floor_thr_db),
+
+        delta_listen=bool(args.delta_listen),
 
         expander=bool(args.expander),
         exp_start_hz=float(args.exp_start_hz),
@@ -1482,6 +1425,8 @@ def main() -> int:
         hf_drive=float(args.hf_drive),
         hf_hp_hz=float(args.hf_hp_hz),
         hf_mix=float(args.hf_mix),
+        hf_tilt_lp_hz=float(args.hf_tilt_lp_hz),
+        hf_zero_phase=(not bool(args.no_hf_zero_phase)),
     )
 
     target_lufs = None if float(args.target_lufs) >= 998.0 else float(args.target_lufs)

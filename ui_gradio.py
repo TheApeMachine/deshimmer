@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa
 """
 Gradio UI for master.py
 
@@ -16,13 +17,22 @@ Run:
 
 from __future__ import annotations
 
+# pyright: reportAny=false
+# pyright: reportUnknownArgumentType=false
+# pyright: reportUnknownMemberType=false
+# pyright: reportUnknownVariableType=false
+# pyright: reportUnknownParameterType=false
+# pyright: reportMissingTypeStubs=false
+# pyright: reportPrivateUsage=false
+# pyright: reportUnusedCallResult=false
+
 import base64
 import io
 import math
 import os
 import time
 from dataclasses import asdict
-from typing import Any, Dict, Optional, Tuple
+from typing import Any
 
 import numpy as np
 import soundfile as sf
@@ -47,7 +57,7 @@ def _to_float_audio(x: np.ndarray) -> np.ndarray:
     return np.clip(x, -1.0, 1.0)
 
 
-def _slice_preview(x: np.ndarray, sr: int, t0: float, dur: float) -> Tuple[np.ndarray, int, int]:
+def _slice_preview(x: np.ndarray, sr: int, t0: float, dur: float) -> tuple[np.ndarray, int, int]:
     n = x.shape[0]
     t0 = float(max(0.0, t0))
     dur = float(max(0.05, dur))
@@ -71,12 +81,12 @@ def _spectrogram_png_bytes(x: np.ndarray, sr: int, n_fft: int, hop: int, max_fra
 
     fig = plt.figure()
     ax = fig.add_subplot(111)
-    extent = [
+    extent = (
         float(t[0]) if t.size else 0.0,
         float(t[-1]) if t.size else 0.0,
         float(f[0]) if f.size else 0.0,
         float(f[-1]) if f.size else 0.0,
-    ]
+    )
     im = ax.imshow(S, origin="lower", aspect="auto", extent=extent)
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Hz")
@@ -101,16 +111,127 @@ def _audio_to_wav_data_uri(x: np.ndarray, sr: int) -> str:
     return f"data:audio/wav;base64,{b64}"
 
 
-def _audio_player_html(title: str, wav_data_uri: str, *, autoplay: bool, loop: bool = True) -> str:
-    # We only autoplay the output preview; input/diff should not auto-start on rerender.
+def _audio_player_html(title: str, wav_data_uri: str, *, autoplay: bool, loop: bool = True, player_id: str = "") -> str:
+    """
+    Generate HTML for an audio player with a stable ID for position preservation.
+    Position saving/restoring is handled by the global _AUDIO_POSITION_SCRIPT.
+    """
     autoplay_attr = " autoplay" if autoplay else ""
     loop_attr = " loop" if loop else ""
+    id_attr = f' id="{player_id}"' if player_id else ""
+    
     return (
         f"<div style='display:flex;flex-direction:column;gap:6px'>"
         f"<div><b>{title}</b></div>"
-        f"<audio controls{autoplay_attr}{loop_attr} playsinline style='width:100%' src='{wav_data_uri}'></audio>"
+        f"<audio{id_attr} class='deshimmer-audio' controls{autoplay_attr}{loop_attr} playsinline style='width:100%' src='{wav_data_uri}'></audio>"
         f"</div>"
     )
+
+
+# Global JavaScript that persists and is injected once via gr.HTML at page load.
+# Uses MutationObserver to watch for audio element src changes and restore position.
+# Global JavaScript that persists and is injected once via gr.HTML at page load.
+# Uses MutationObserver to watch for audio element src changes and restore position.
+_AUDIO_POSITION_SCRIPT = """
+<script>
+(function() {
+    console.log('[Deshimmer] Robust audio script loaded');
+    
+    // State storage by INDEX (0=Input, 1=Output, 2=Diff)
+    // We use a global variable on window to survive some re-renders if the script wrapper stays
+    if (!window._deshimmerState) {
+        window._deshimmerState = {};
+    }
+    
+    function saveState(index, audio) {
+        window._deshimmerState[index] = {
+            time: audio.currentTime,
+            playing: !audio.paused,
+            src: audio.src,
+            timestamp: Date.now()
+        };
+        // Also save to session storage for page reloads
+        try {
+            sessionStorage.setItem('deshimmer_idx_' + index, JSON.stringify(window._deshimmerState[index]));
+        } catch(e) {}
+    }
+    
+    function loadState(index) {
+        // Try memory first, then session storage
+        if (window._deshimmerState[index]) return window._deshimmerState[index];
+        try {
+            var s = sessionStorage.getItem('deshimmer_idx_' + index);
+            if (s) return JSON.parse(s);
+        } catch(e) {}
+        return null;
+    }
+    
+    function setupPlayers() {
+        // Find ALL audio players with our class
+        setTimeout(() => {
+            console.log('[Deshimmer] Setting up players');
+            const players = document.querySelectorAll('.deshimmer-audio');
+            
+            players.forEach(function(audio, index) {
+                // Prevent double-setup
+                if (audio.getAttribute('data-setup') === 'true') return;
+                audio.setAttribute('data-setup', 'true');
+                
+                console.log('[Deshimmer] Found player index ' + index);
+                
+                var state = loadState(index);
+                
+                // If we have state, logic to restore it
+                if (state) {
+                    // If this is a FRESH load (new src), restore position
+                    // We check if src changed slightly or just assume if it's a re-render we want the old time
+                    // The safest is: if we have a saved time, and we are near 0, jump to saved time.
+                    
+                    var restore = function() {
+                        if (state.time > 0 && audio.duration > 0) {
+                            var newTime = state.time % audio.duration;
+                            if (Math.abs(audio.currentTime - newTime) > 0.5) {
+                                console.log('[Deshimmer] Restoring idx ' + index + ' to ' + newTime);
+                                audio.currentTime = newTime;
+                            }
+                        }
+                        if (state.playing) {
+                            var promise = audio.play();
+                            if (promise) promise.catch(e => console.log('Autoplay prevented:', e));
+                        }
+                    };
+
+                    // Try immediately if ready
+                    if (audio.readyState >= 1) restore();
+                    
+                    // And on metadata load
+                    audio.addEventListener('loadedmetadata', restore);
+                    
+                    // And on 'canplay' for good measure (covers some browser quirks)
+                    audio.addEventListener('canplay', function() {
+                        // Only restore if we haven't drifted far (prevents fighting user seeks)
+                        if (audio.currentTime < 0.5 && state.time > 0.5) restore();
+                    });
+                })
+            
+            // Listeners to save state
+            audio.addEventListener('timeupdate', function() {
+                saveState(index, audio);
+            });
+            audio.addEventListener('play', function() {
+                saveState(index, audio);
+            });
+            audio.addEventListener('pause', function() {
+                saveState(index, audio);
+            });
+        });
+    }
+
+    // Initial run
+    setupPlayers();
+})();
+</script>
+"""
 
 
 def _loop_crossfade_rotate(x: np.ndarray, sr: int, crossfade_ms: float) -> np.ndarray:
@@ -145,7 +266,7 @@ def _loop_crossfade_rotate(x: np.ndarray, sr: int, crossfade_ms: float) -> np.nd
     return y.astype(np.float32, copy=False)
 
 
-def _png_bytes_to_rgb(png_bytes: bytes) -> Optional[np.ndarray]:
+def _png_bytes_to_rgb(png_bytes: bytes) -> np.ndarray | None:
     if not png_bytes:
         return None
     try:
@@ -156,7 +277,7 @@ def _png_bytes_to_rgb(png_bytes: bytes) -> Optional[np.ndarray]:
     return np.asarray(im)
 
 
-def _render_metrics_md(info: Dict[str, Any]) -> str:
+def _render_metrics_md(info: dict[str, object]) -> str:
     def fmt(v: Any) -> str:
         if v is None:
             return "n/a"
@@ -164,9 +285,9 @@ def _render_metrics_md(info: Dict[str, Any]) -> str:
             return f"{float(v):.2f}"
         return str(v)
 
-    mi = info.get("measure_in", {})
-    mr = info.get("measure_after_repair", {})
-    mo = info.get("measure_out", {})
+    mi = info.get("measure_in", {})  # type: ignore[assignment]
+    mr = info.get("measure_after_repair", {})  # type: ignore[assignment]
+    mo = info.get("measure_out", {})  # type: ignore[assignment]
     lines = [
         "### Measurements",
         "",
@@ -202,6 +323,7 @@ def _build_params(
     flux_range_db: float,
     noise_resynth: float,
     mix: float,
+    delta_listen: bool,
     # denoise
     denoise: float,
     dn_start_hz: float,
@@ -294,6 +416,7 @@ def _build_params(
         flux_range_db=float(flux_range_db),
         noise_resynth=float(noise_resynth),
         mix=float(mix),
+        delta_listen=bool(delta_listen),
         # keep the preview clean; padding/fade helps boundary clicks
         pad=True,
         fade_ms=5.0,
@@ -383,11 +506,12 @@ def _build_params(
 
 
 def run_once(
-    audio_in: Tuple[int, np.ndarray],
+    audio_in: tuple[int, np.ndarray] | None,
     # preview
     preview_t0: float,
     preview_dur: float,
     loop_xfade_ms: float,
+    full_song_mode: bool,
     # main band
     start_hz: float,
     end_hz: float,
@@ -405,6 +529,7 @@ def run_once(
     flux_range_db: float,
     noise_resynth: float,
     mix: float,
+    delta_listen: bool,
     # denoise
     denoise: float,
     dn_start_hz: float,
@@ -479,16 +604,7 @@ def run_once(
     spec_hop: int,
     spec_max_frames: int,
     spec_max_hz: float,
-) -> Tuple[
-    Tuple[int, np.ndarray],
-    Tuple[int, np.ndarray],
-    Tuple[int, np.ndarray],
-    Optional[np.ndarray],
-    Optional[np.ndarray],
-    Optional[np.ndarray],
-    str,
-    Dict[str, Any],
-]:
+) -> tuple[str, str, str, np.ndarray | None, np.ndarray | None, np.ndarray | None, str, dict[str, object]]:
     if audio_in is None:
         raise ValueError("Please load an audio file first.")
 
@@ -496,7 +612,12 @@ def run_once(
     sr = int(sr)
     x = _to_float_audio(x)
 
-    x_seg, s0, s1 = _slice_preview(x, sr, preview_t0, preview_dur)
+    # In full song mode, process the entire song; otherwise just the preview slice
+    if full_song_mode:
+        x_seg = x
+        s0, s1 = 0, x.shape[0]
+    else:
+        x_seg, s0, s1 = _slice_preview(x, sr, preview_t0, preview_dur)
 
     p, mp, dp = _build_params(
         start_hz=start_hz,
@@ -515,6 +636,7 @@ def run_once(
         flux_range_db=flux_range_db,
         noise_resynth=noise_resynth,
         mix=mix,
+        delta_listen=delta_listen,
         denoise=denoise,
         dn_start_hz=dn_start_hz,
         dn_end_hz=dn_end_hz,
@@ -586,26 +708,57 @@ def run_once(
     y, info = process_audio(x_seg, sr, params=p, master_params=mp, debug_params=dp)
     y2 = _to_float_audio(y)
 
-    # Diff = what was removed
-    diff = (x_seg[: y2.shape[0], :] - y2).astype(np.float32)
+    # If delta_listen is enabled, master.py returns removed-only (input - processed).
+    if bool(delta_listen):
+        removed = y2
+        processed = _to_float_audio(x_seg[: removed.shape[0], :] - removed)
+        out_sig = removed
+        aux_sig = processed
+        if full_song_mode:
+            out_title = "Full song: removed-only"
+            aux_title = "Full song: processed"
+        else:
+            out_title = "Preview: removed-only (loop)"
+            aux_title = "Preview: processed (loop)"
+    else:
+        processed = y2
+        removed = (x_seg[: processed.shape[0], :] - processed).astype(np.float32)
+        out_sig = processed
+        aux_sig = removed
+        if full_song_mode:
+            out_title = "Full song: output"
+            aux_title = "Full song: diff / removed"
+        else:
+            out_title = "Preview: output (loop)"
+            aux_title = "Preview: diff / removed (loop)"
 
-    # Make loop seam smoother (rotate+crossfade) for playback
-    x_play = _loop_crossfade_rotate(x_seg, sr, loop_xfade_ms)
-    y_play = _loop_crossfade_rotate(y2, sr, loop_xfade_ms)
-    d_play = _loop_crossfade_rotate(diff, sr, loop_xfade_ms)
+    # Make loop seam smoother (rotate+crossfade) for playback - skip for full song mode
+    if full_song_mode:
+        # No crossfade for full song - just use the audio as-is
+        x_play = x_seg
+        out_play = out_sig
+        aux_play = aux_sig
+        in_title = "Full song: input"
+        do_loop = False
+    else:
+        x_play = _loop_crossfade_rotate(x_seg, sr, loop_xfade_ms)
+        out_play = _loop_crossfade_rotate(out_sig, sr, loop_xfade_ms)
+        aux_play = _loop_crossfade_rotate(aux_sig, sr, loop_xfade_ms)
+        in_title = "Preview: input (loop)"
+        do_loop = True
 
     # Spectrograms
     in_png = _spectrogram_png_bytes(x_seg, sr, n_fft=int(spec_n_fft), hop=int(spec_hop), max_frames=int(spec_max_frames), max_hz=float(spec_max_hz))
-    out_png = _spectrogram_png_bytes(y2, sr, n_fft=int(spec_n_fft), hop=int(spec_hop), max_frames=int(spec_max_frames), max_hz=float(spec_max_hz))
-    diff_png = _spectrogram_png_bytes(diff, sr, n_fft=int(spec_n_fft), hop=int(spec_hop), max_frames=int(spec_max_frames), max_hz=float(spec_max_hz))
+    out_png = _spectrogram_png_bytes(out_sig, sr, n_fft=int(spec_n_fft), hop=int(spec_hop), max_frames=int(spec_max_frames), max_hz=float(spec_max_hz))
+    diff_png = _spectrogram_png_bytes(aux_sig, sr, n_fft=int(spec_n_fft), hop=int(spec_hop), max_frames=int(spec_max_frames), max_hz=float(spec_max_hz))
 
     metrics_md = _render_metrics_md(info)
-    params_json = {"params": asdict(p), "master_params": asdict(mp)}
+    params_json: dict[str, object] = {"params": asdict(p), "master_params": asdict(mp)}
 
     return (
-        _audio_player_html("Preview: input (loop)", _audio_to_wav_data_uri(x_play, sr), autoplay=False, loop=True),
-        _audio_player_html("Preview: output (loop)", _audio_to_wav_data_uri(y_play, sr), autoplay=True, loop=True),
-        _audio_player_html("Preview: diff / removed (loop)", _audio_to_wav_data_uri(d_play, sr), autoplay=False, loop=True),
+        _audio_player_html(in_title, _audio_to_wav_data_uri(x_play, sr), autoplay=False, loop=do_loop, player_id="deshimmer_input"),
+        _audio_player_html(out_title, _audio_to_wav_data_uri(out_play, sr), autoplay=True, loop=do_loop, player_id="deshimmer_output"),
+        _audio_player_html(aux_title, _audio_to_wav_data_uri(aux_play, sr), autoplay=False, loop=do_loop, player_id="deshimmer_diff"),
         _png_bytes_to_rgb(in_png),
         _png_bytes_to_rgb(out_png),
         _png_bytes_to_rgb(diff_png),
@@ -615,7 +768,7 @@ def run_once(
 
 
 def render_full_to_files(
-    audio_in: Tuple[int, np.ndarray],
+    audio_in: tuple[int, np.ndarray] | None,
     # all settings (same as run_once, minus preview t0/dur)
     start_hz: float,
     end_hz: float,
@@ -633,6 +786,7 @@ def render_full_to_files(
     flux_range_db: float,
     noise_resynth: float,
     mix: float,
+    delta_listen: bool,
     denoise: float,
     dn_start_hz: float,
     dn_end_hz: float,
@@ -704,7 +858,7 @@ def render_full_to_files(
     spec_hop: int,
     spec_max_frames: int,
     spec_max_hz: float,
-) -> Tuple[str, str, str]:
+) -> tuple[str, str, str]:
     if audio_in is None:
         raise ValueError("Please load an audio file first.")
 
@@ -729,6 +883,7 @@ def render_full_to_files(
         flux_range_db=flux_range_db,
         noise_resynth=noise_resynth,
         mix=mix,
+        delta_listen=delta_listen,
         denoise=denoise,
         dn_start_hz=dn_start_hz,
         dn_end_hz=dn_end_hz,
@@ -799,7 +954,16 @@ def render_full_to_files(
 
     y, _ = process_audio(x, sr, params=p, master_params=mp, debug_params=dp)
     y2 = _to_float_audio(y)
-    diff = (x[: y2.shape[0], :] - y2).astype(np.float32)
+    if bool(delta_listen):
+        removed = y2
+        processed = _to_float_audio(x[: removed.shape[0], :] - removed)
+        out_audio = removed
+        diff_audio = processed
+    else:
+        processed = y2
+        removed = (x[: processed.shape[0], :] - processed).astype(np.float32)
+        out_audio = processed
+        diff_audio = removed
 
     outdir = os.path.join(os.path.dirname(__file__), "ui_downloads")
     os.makedirs(outdir, exist_ok=True)
@@ -808,8 +972,8 @@ def render_full_to_files(
     diff_path = os.path.join(outdir, f"diff-{stamp}.wav")
     params_path = os.path.join(outdir, f"params-{stamp}.json")
 
-    sf.write(out_path, y2, sr, subtype="PCM_24")
-    sf.write(diff_path, diff, sr, subtype="PCM_24")
+    sf.write(out_path, out_audio, sr, subtype="PCM_24")
+    sf.write(diff_path, diff_audio, sr, subtype="PCM_24")
 
     import json
 
@@ -822,7 +986,7 @@ def render_full_to_files(
 def build_ui() -> Any:
     import gradio as gr
 
-    def _load_user_presets(path: str) -> Dict[str, Dict[str, Any]]:
+    def _load_user_presets(path: str) -> dict[str, dict[str, object]]:
         try:
             import json
 
@@ -832,7 +996,7 @@ def build_ui() -> Any:
                 data = json.load(f)
             if not isinstance(data, dict):
                 return {}
-            out: Dict[str, Dict[str, Any]] = {}
+            out: dict[str, dict[str, object]] = {}
             for k, v in data.items():
                 if not isinstance(k, str) or not isinstance(v, dict):
                     continue
@@ -844,7 +1008,7 @@ def build_ui() -> Any:
         except Exception:
             return {}
 
-    def _save_user_preset(path: str, name: str, desc: str, values: Dict[str, Any]) -> None:
+    def _save_user_preset(path: str, name: str, desc: str, values: dict[str, object]) -> None:
         import json
 
         data = _load_user_presets(path)
@@ -854,7 +1018,7 @@ def build_ui() -> Any:
 
     USER_PRESETS_PATH = os.path.join(os.path.dirname(__file__), "ui_presets.json")
 
-    BASE_PRESETS: Dict[str, Dict[str, Any]] = {
+    base_presets: dict[str, dict[str, object]] = {
         # --- Simple (few knobs) ---
         "01 - Bypass (no processing)": {
             "desc": "Mix=0.0 (fully dry). Useful sanity check.",
@@ -1003,26 +1167,47 @@ def build_ui() -> Any:
         },
     }
 
-    ALL_PRESETS: Dict[str, Dict[str, Any]] = dict(BASE_PRESETS)
-    ALL_PRESETS.update(_load_user_presets(USER_PRESETS_PATH))
+    all_presets: dict[str, dict[str, object]] = dict(base_presets)
+    all_presets.update(_load_user_presets(USER_PRESETS_PATH))
 
     with gr.Blocks(title="Deshimmer - master.py UI") as demo:
+        # Inject global JavaScript for audio position preservation (runs once)
+        # Note: This is invisible but must not use visible=False or script won't execute
+        gr.HTML(_AUDIO_POSITION_SCRIPT)
+        
         gr.Markdown(
             "## Deshimmer UI (master.py)\n"
             "Load a file, pick a preview region, tweak knobs, then listen to input/output/diff and inspect spectrograms."
         )
 
         with gr.Row():
-            preset = gr.Dropdown(choices=list(ALL_PRESETS.keys()), value="02 - Default shimmer (recommended start)", label="Presets (simple → complex)")
+            preset = gr.Dropdown(choices=list(all_presets.keys()), value="02 - Default shimmer (recommended start)", label="Presets (simple → complex)")
             preset_apply = gr.Button("Apply preset", variant="secondary")
         preset_desc = gr.Markdown()
 
         with gr.Row():
             audio_in = gr.Audio(label="Input audio", type="numpy")
             with gr.Column():
-                preview_t0 = gr.Slider(0.0, 600.0, value=0.0, step=0.05, label="Preview start (s)")
-                preview_dur = gr.Slider(0.5, 20.0, value=6.0, step=0.05, label="Preview duration (s)")
-                loop_xfade_ms = gr.Slider(0.0, 250.0, value=35.0, step=1.0, label="Loop crossfade (ms)")
+                full_song_mode = gr.Checkbox(
+                    value=False, 
+                    label="Full Song Mode",
+                    info="Process the entire song instead of a short preview. Slower but lets you hear the effect on the whole track."
+                )
+                preview_t0 = gr.Slider(
+                    0.0, 600.0, value=0.0, step=0.05, 
+                    label="Preview start (s)",
+                    info="Where in the song to start the preview. Move this to test different sections."
+                )
+                preview_dur = gr.Slider(
+                    0.5, 20.0, value=6.0, step=0.05, 
+                    label="Preview duration (s)",
+                    info="How long the preview clip should be. Shorter = faster processing, longer = hear more context."
+                )
+                loop_xfade_ms = gr.Slider(
+                    0.0, 250.0, value=35.0, step=1.0, 
+                    label="Loop crossfade (ms)",
+                    info="Smooth the loop point so it doesn't click. Higher = smoother loop but slightly alters the audio."
+                )
                 run_btn = gr.Button("Run preview")
 
         with gr.Row():
@@ -1044,126 +1229,453 @@ def build_ui() -> Any:
             dl_diff = gr.File(label="Download: full diff.wav")
             dl_params = gr.File(label="Download: params.json")
 
-        with gr.Accordion("Shimmer band + core STFT", open=True):
+        with gr.Accordion("🎯 Shimmer Removal (main tool for AI sparkle/shimmer)", open=True):
+            gr.Markdown("*Targets the annoying 'sparkly' or 'shimmery' artifacts common in AI-generated music. Start here!*")
             with gr.Row():
-                start_hz = gr.Number(value=5100.0, label="start_hz")
-                end_hz = gr.Number(value=7200.0, label="end_hz")
-                edge_hz = gr.Number(value=200.0, label="edge_hz")
+                start_hz = gr.Number(
+                    value=5100.0, 
+                    label="Start frequency (Hz)",
+                    info="Lower edge of the shimmer band. AI shimmer typically lives around 5000-7000 Hz. Lower = catch more low-mid harshness."
+                )
+                end_hz = gr.Number(
+                    value=7200.0, 
+                    label="End frequency (Hz)",
+                    info="Upper edge of the shimmer band. Higher = catch more high-frequency sparkle. Don't go above your audio's limit."
+                )
+                edge_hz = gr.Number(
+                    value=200.0, 
+                    label="Edge softness (Hz)",
+                    info="How gradually the effect fades at band edges. Higher = smoother transition, less obvious processing."
+                )
             with gr.Row():
-                n_fft = gr.Dropdown([1024, 2048, 4096, 8192], value=2048, label="n_fft")
-                hop = gr.Dropdown([256, 512, 1024, 2048], value=512, label="hop")
+                n_fft = gr.Dropdown(
+                    [1024, 2048, 4096, 8192], value=2048, 
+                    label="FFT size",
+                    info="Analysis window size. Larger = better frequency detail but slower. 2048 is a good balance."
+                )
+                hop = gr.Dropdown(
+                    [256, 512, 1024, 2048], value=512, 
+                    label="Hop size",
+                    info="How much the analysis window moves. Smaller = smoother but slower. 512 works well for most cases."
+                )
             with gr.Row():
-                flat_start = gr.Slider(0.0, 1.0, value=0.25, step=0.01, label="flat_start")
-                flat_end = gr.Slider(0.0, 1.0, value=0.70, step=0.01, label="flat_end")
+                flat_start = gr.Slider(
+                    0.0, 1.0, value=0.25, step=0.01, 
+                    label="Noise detection: start",
+                    info="How 'noisy' audio must be before processing kicks in. Lower = more aggressive, catches more but may affect wanted sounds."
+                )
+                flat_end = gr.Slider(
+                    0.0, 1.0, value=0.70, step=0.01, 
+                    label="Noise detection: full",
+                    info="When audio is this 'noisy', full processing is applied. Higher = only process very noisy parts."
+                )
             with gr.Row():
-                freq_med_bins = gr.Slider(3, 61, value=9, step=2, label="freq_med_bins (odd)")
-                thr_db = gr.Slider(0.0, 24.0, value=8.0, step=0.1, label="thr_db")
-                slope = gr.Slider(0.0, 2.0, value=0.6, step=0.01, label="slope")
+                freq_med_bins = gr.Slider(
+                    3, 61, value=9, step=2, 
+                    label="Peak detection width",
+                    info="How wide to look when finding shimmer peaks. Larger = ignore broader peaks (like wanted harmonics), catch only narrow spikes."
+                )
+                thr_db = gr.Slider(
+                    0.0, 24.0, value=8.0, step=0.1, 
+                    label="Threshold (dB)",
+                    info="How much louder than surroundings a peak must be to get reduced. Lower = more aggressive, higher = only obvious spikes."
+                )
+                slope = gr.Slider(
+                    0.0, 2.0, value=0.6, step=0.01, 
+                    label="Reduction strength",
+                    info="How hard to push down detected shimmer. Higher = more reduction but risk of dullness. Start around 0.5-0.7."
+                )
             with gr.Row():
-                density_lo = gr.Slider(0.0, 0.5, value=0.02, step=0.005, label="density_lo")
-                density_hi = gr.Slider(0.0, 0.5, value=0.15, step=0.005, label="density_hi")
+                density_lo = gr.Slider(
+                    0.0, 0.5, value=0.02, step=0.005, 
+                    label="Density: sparse",
+                    info="When few peaks are detected, apply full processing. Shimmer is usually sparse."
+                )
+                density_hi = gr.Slider(
+                    0.0, 0.5, value=0.15, step=0.005, 
+                    label="Density: dense (back off)",
+                    info="When many peaks detected, back off—probably real music content, not artifacts."
+                )
             with gr.Row():
-                flux_thr_db = gr.Slider(0.0, 24.0, value=6.0, step=0.1, label="flux_thr_db")
-                flux_range_db = gr.Slider(0.0, 24.0, value=8.0, step=0.1, label="flux_range_db")
+                flux_thr_db = gr.Slider(
+                    0.0, 24.0, value=6.0, step=0.1, 
+                    label="Transient protection: threshold",
+                    info="Energy jump (in dB) that triggers transient protection. Protects drum hits and attacks from being dulled."
+                )
+                flux_range_db = gr.Slider(
+                    0.0, 24.0, value=8.0, step=0.1, 
+                    label="Transient protection: range",
+                    info="How gradually transient protection kicks in. Higher = more gradual fade-in of protection."
+                )
             with gr.Row():
-                noise_resynth = gr.Slider(0.0, 1.0, value=0.0, step=0.01, label="noise_resynth")
-                mix = gr.Slider(0.0, 1.0, value=1.0, step=0.01, label="mix (wet)")
+                noise_resynth = gr.Slider(
+                    0.0, 1.0, value=0.0, step=0.01, 
+                    label="Texture softening",
+                    info="Blend in random-phase noise to soften 'crystalline' texture. 0 = off, 0.2-0.4 = subtle softening. Can help with metallic artifacts."
+                )
+                mix = gr.Slider(
+                    0.0, 1.0, value=1.0, step=0.01, 
+                    label="Wet/dry mix",
+                    info="0 = original audio (bypass), 1 = fully processed. Use values in between for subtle blending."
+                )
+                delta_listen = gr.Checkbox(
+                    value=False, 
+                    label="Listen to removed audio",
+                    info="Hear what's being removed instead of the result. Useful for checking you're not removing wanted sounds!"
+                )
 
-        with gr.Accordion("Smart denoise", open=False):
+        with gr.Accordion("🔇 Smart Denoise (hiss/noise floor reduction)", open=False):
+            gr.Markdown("*Reduces background hiss and noise floor artifacts. Good for AI-generated 'swishy' or 'windy' sounds.*")
             with gr.Row():
-                denoise = gr.Slider(0.0, 1.0, value=0.0, step=0.01, label="denoise")
-                dn_floor_db = gr.Slider(-60.0, 0.0, value=-18.0, step=0.5, label="dn_floor_db")
+                denoise = gr.Slider(
+                    0.0, 1.0, value=0.0, step=0.01, 
+                    label="Denoise strength",
+                    info="Overall strength. 0 = off. Start low (0.2-0.3) and increase. Too high = 'underwater' sound."
+                )
+                dn_floor_db = gr.Slider(
+                    -60.0, 0.0, value=-18.0, step=0.5, 
+                    label="Noise floor limit (dB)",
+                    info="Never reduce below this level. Prevents complete silence and 'pumping'. More negative = deeper cuts allowed."
+                )
             with gr.Row():
-                dn_start_hz = gr.Number(value=120.0, label="dn_start_hz")
-                dn_end_hz = gr.Number(value=16000.0, label="dn_end_hz")
-                dn_edge_hz = gr.Number(value=200.0, label="dn_edge_hz")
+                dn_start_hz = gr.Number(
+                    value=120.0, 
+                    label="Start frequency (Hz)",
+                    info="Where to start denoising. Keep above ~100 Hz to avoid affecting bass."
+                )
+                dn_end_hz = gr.Number(
+                    value=16000.0, 
+                    label="End frequency (Hz)",
+                    info="Where to stop denoising. Usually covers most of audible range."
+                )
+                dn_edge_hz = gr.Number(
+                    value=200.0, 
+                    label="Edge softness (Hz)",
+                    info="Gradual fade at band edges for smoother processing."
+                )
             with gr.Row():
-                dn_psd_smooth_ms = gr.Slider(0.0, 300.0, value=50.0, step=1.0, label="dn_psd_smooth_ms")
-                dn_minwin_ms = gr.Slider(50.0, 2000.0, value=400.0, step=10.0, label="dn_minwin_ms")
-                dn_up_db_per_s = gr.Slider(0.0, 24.0, value=3.0, step=0.1, label="dn_up_db_per_s")
+                dn_psd_smooth_ms = gr.Slider(
+                    0.0, 300.0, value=50.0, step=1.0, 
+                    label="Noise tracking speed (ms)",
+                    info="How fast noise estimation adapts. Lower = faster tracking, higher = more stable."
+                )
+                dn_minwin_ms = gr.Slider(
+                    50.0, 2000.0, value=400.0, step=10.0, 
+                    label="Minimum window (ms)",
+                    info="Time window for finding quietest noise level. Longer = better at finding true noise floor but slower to adapt."
+                )
+                dn_up_db_per_s = gr.Slider(
+                    0.0, 24.0, value=3.0, step=0.1, 
+                    label="Noise rise rate (dB/s)",
+                    info="How fast estimated noise can increase. Prevents sudden jumps. Lower = more conservative."
+                )
             with gr.Row():
-                dn_attack_ms = gr.Slider(0.0, 200.0, value=5.0, step=1.0, label="dn_attack_ms")
-                dn_release_ms = gr.Slider(0.0, 1000.0, value=120.0, step=5.0, label="dn_release_ms")
-                dn_freq_smooth_bins = gr.Slider(1, 21, value=3, step=1, label="dn_freq_smooth_bins")
+                dn_attack_ms = gr.Slider(
+                    0.0, 200.0, value=5.0, step=1.0, 
+                    label="Attack speed (ms)",
+                    info="How fast reduction kicks in when noise detected. Lower = faster but may clip transients."
+                )
+                dn_release_ms = gr.Slider(
+                    0.0, 1000.0, value=120.0, step=5.0, 
+                    label="Release speed (ms)",
+                    info="How fast reduction backs off. Higher = smoother but may 'pump' on dynamic material."
+                )
+                dn_freq_smooth_bins = gr.Slider(
+                    1, 21, value=3, step=1, 
+                    label="Frequency smoothing",
+                    info="Smooth reduction across frequencies. Higher = less 'musical noise'/chirping but less precise."
+                )
 
-        with gr.Accordion("Smart de-resonator (dynamic EQ)", open=False):
+        with gr.Accordion("📢 De-Resonator (ringing/whine removal)", open=False):
+            gr.Markdown("*Targets persistent ringing tones and 'whine' artifacts. Great for Suno/Udio's characteristic 3-4kHz whine.*")
             with gr.Row():
-                deres = gr.Slider(0.0, 1.0, value=0.0, step=0.01, label="deres")
-                deq_max_att_db = gr.Slider(0.0, 24.0, value=8.0, step=0.1, label="deq_max_att_db")
+                deres = gr.Slider(
+                    0.0, 1.0, value=0.0, step=0.01, 
+                    label="De-resonator strength",
+                    info="Overall strength. 0 = off. Effective range is 0.3-0.8. Attacks narrow, persistent frequency peaks."
+                )
+                deq_max_att_db = gr.Slider(
+                    0.0, 24.0, value=8.0, step=0.1, 
+                    label="Maximum cut (dB)",
+                    info="Cap on how much to reduce resonances. Higher = more aggressive cuts. 6-12 dB is typical."
+                )
             with gr.Row():
-                deq_start_hz = gr.Number(value=180.0, label="deq_start_hz")
-                deq_end_hz = gr.Number(value=12000.0, label="deq_end_hz")
-                deq_edge_hz = gr.Number(value=150.0, label="deq_edge_hz")
+                deq_start_hz = gr.Number(
+                    value=180.0, 
+                    label="Start frequency (Hz)",
+                    info="Where to look for resonances. Suno/Udio whine often around 3000-4000 Hz."
+                )
+                deq_end_hz = gr.Number(
+                    value=12000.0, 
+                    label="End frequency (Hz)",
+                    info="Upper limit for resonance detection."
+                )
+                deq_edge_hz = gr.Number(
+                    value=150.0, 
+                    label="Edge softness (Hz)",
+                    info="Gradual fade at band edges."
+                )
             with gr.Row():
-                deq_freq_med_bins = gr.Slider(3, 121, value=31, step=2, label="deq_freq_med_bins (odd)")
-                deq_thr_db = gr.Slider(0.0, 24.0, value=6.0, step=0.1, label="deq_thr_db")
-                deq_slope = gr.Slider(0.0, 2.0, value=0.7, step=0.01, label="deq_slope")
+                deq_freq_med_bins = gr.Slider(
+                    3, 121, value=31, step=2, 
+                    label="Peak detection width",
+                    info="How wide to look for 'normal' level. Larger = catch wider resonances. For narrow whines, try 31-61."
+                )
+                deq_thr_db = gr.Slider(
+                    0.0, 24.0, value=6.0, step=0.1, 
+                    label="Threshold (dB)",
+                    info="How much louder than neighbors a peak must be to get cut. Lower = more aggressive."
+                )
+                deq_slope = gr.Slider(
+                    0.0, 2.0, value=0.7, step=0.01, 
+                    label="Reduction strength",
+                    info="How hard to cut detected resonances. Higher = stronger cuts."
+                )
             with gr.Row():
-                deq_density_lo = gr.Slider(0.0, 0.5, value=0.03, step=0.005, label="deq_density_lo")
-                deq_density_hi = gr.Slider(0.0, 0.5, value=0.20, step=0.005, label="deq_density_hi")
+                deq_density_lo = gr.Slider(
+                    0.0, 0.5, value=0.03, step=0.005, 
+                    label="Density: sparse (full processing)",
+                    info="When few peaks, apply full reduction—probably artifacts."
+                )
+                deq_density_hi = gr.Slider(
+                    0.0, 0.5, value=0.20, step=0.005, 
+                    label="Density: dense (back off)",
+                    info="When many peaks, back off—probably real harmonics."
+                )
             with gr.Row():
-                deq_persist_ms = gr.Slider(0.0, 5000.0, value=600.0, step=25.0, label="deq_persist_ms")
-                deq_persist_thr_db = gr.Slider(0.0, 24.0, value=2.5, step=0.1, label="deq_persist_thr_db")
-                deq_freq_smooth_bins = gr.Slider(1, 21, value=5, step=1, label="deq_freq_smooth_bins")
-                deq_tonal_boost_db = gr.Slider(0.0, 24.0, value=6.0, step=0.1, label="deq_tonal_boost_db")
+                deq_persist_ms = gr.Slider(
+                    0.0, 5000.0, value=600.0, step=25.0, 
+                    label="Persistence memory (ms)",
+                    info="How long a peak must persist to be considered a resonance. Catches steady whines, ignores moving melodies."
+                )
+                deq_persist_thr_db = gr.Slider(
+                    0.0, 24.0, value=2.5, step=0.1, 
+                    label="Persistence threshold (dB)",
+                    info="Accumulated level needed before peak is treated as resonance. Higher = more conservative."
+                )
+                deq_freq_smooth_bins = gr.Slider(
+                    1, 21, value=5, step=1, 
+                    label="Frequency smoothing",
+                    info="Smooth cuts across frequencies. Higher = less surgical but fewer artifacts."
+                )
+                deq_tonal_boost_db = gr.Slider(
+                    0.0, 24.0, value=6.0, step=0.1, 
+                    label="Tonal protection (dB)",
+                    info="Raise threshold when audio sounds 'tonal' (not noisy). Protects real harmonics."
+                )
             with gr.Row():
-                deq_time_floor = gr.Checkbox(value=False, label="deq_time_floor (target stationary ringing lines)")
-                deq_floor_smooth_ms = gr.Slider(0.0, 500.0, value=80.0, step=5.0, label="deq_floor_smooth_ms")
-                deq_floor_rise_db_per_s = gr.Slider(0.0, 12.0, value=1.0, step=0.1, label="deq_floor_rise_db_per_s")
+                deq_time_floor = gr.Checkbox(
+                    value=False, 
+                    label="Enable time-floor mode",
+                    info="Track bins that are ALWAYS loud—catches stationary ringing lines that never quiet down."
+                )
+                deq_floor_smooth_ms = gr.Slider(
+                    0.0, 500.0, value=80.0, step=5.0, 
+                    label="Floor tracking speed (ms)",
+                    info="How fast the 'always loud' detector adapts. Lower = faster."
+                )
+                deq_floor_rise_db_per_s = gr.Slider(
+                    0.0, 12.0, value=1.0, step=0.1, 
+                    label="Floor rise rate (dB/s)",
+                    info="How fast the floor estimate can rise. Lower = stricter about what counts as 'always on'."
+                )
 
-        with gr.Accordion("Advanced: diffusion grit tools (optional)", open=False):
+        with gr.Accordion("🔬 Advanced Tools (experimental - use with caution)", open=False):
+            gr.Markdown("*These are more aggressive/experimental tools. Most users won't need them.*")
+            
+            gr.Markdown("**Downward Expander** - Push down quiet parts in a frequency band (reduces lingering artifacts)")
             with gr.Row():
-                expander = gr.Checkbox(value=False, label="expander (downward expander in band)")
-                exp_threshold_db = gr.Slider(-90.0, 0.0, value=-45.0, step=0.5, label="exp_threshold_db")
-                exp_ratio = gr.Slider(1.0, 6.0, value=2.0, step=0.05, label="exp_ratio")
+                expander = gr.Checkbox(
+                    value=False, 
+                    label="Enable expander",
+                    info="Turn on the downward expander. Reduces quiet sounds in the target band."
+                )
+                exp_threshold_db = gr.Slider(
+                    -90.0, 0.0, value=-45.0, step=0.5, 
+                    label="Threshold (dB)",
+                    info="Level below which sounds get reduced. More negative = only very quiet sounds affected."
+                )
+                exp_ratio = gr.Slider(
+                    1.0, 6.0, value=2.0, step=0.05, 
+                    label="Ratio",
+                    info="How much to reduce. 2:1 = moderate, 4:1 = aggressive. Higher = more expansion."
+                )
             with gr.Row():
-                exp_start_hz = gr.Number(value=3000.0, label="exp_start_hz")
-                exp_end_hz = gr.Number(value=8000.0, label="exp_end_hz")
-                exp_attack_ms = gr.Slider(0.0, 200.0, value=10.0, step=1.0, label="exp_attack_ms")
-                exp_release_ms = gr.Slider(0.0, 1000.0, value=150.0, step=5.0, label="exp_release_ms")
+                exp_start_hz = gr.Number(
+                    value=3000.0, 
+                    label="Start frequency (Hz)",
+                    info="Lower edge of expander band."
+                )
+                exp_end_hz = gr.Number(
+                    value=8000.0, 
+                    label="End frequency (Hz)",
+                    info="Upper edge of expander band."
+                )
+                exp_attack_ms = gr.Slider(
+                    0.0, 200.0, value=10.0, step=1.0, 
+                    label="Attack (ms)",
+                    info="How fast expansion kicks in. Lower = faster but may affect transients."
+                )
+                exp_release_ms = gr.Slider(
+                    0.0, 1000.0, value=150.0, step=5.0, 
+                    label="Release (ms)",
+                    info="How fast expansion backs off. Higher = smoother."
+                )
 
+            gr.Markdown("**Harmonic/Percussive Separation** - Protect drums/transients from processing")
             with gr.Row():
-                hpss = gr.Checkbox(value=False, label="hpss (HPSS-ish harmonic mask in band)")
-                hpss_harmonic_only = gr.Checkbox(value=True, label="hpss_harmonic_only")
+                hpss = gr.Checkbox(
+                    value=False, 
+                    label="Enable HPSS",
+                    info="Separate harmonic (sustained) from percussive (transient) content."
+                )
+                hpss_harmonic_only = gr.Checkbox(
+                    value=True, 
+                    label="Process harmonic only",
+                    info="Only process the sustained/harmonic parts, leave drums/transients alone."
+                )
             with gr.Row():
-                hpss_start_hz = gr.Number(value=3000.0, label="hpss_start_hz")
-                hpss_end_hz = gr.Number(value=8000.0, label="hpss_end_hz")
-                hpss_time_frames = gr.Slider(3, 61, value=21, step=2, label="hpss_time_frames (odd)")
-                hpss_freq_bins = gr.Slider(3, 61, value=17, step=2, label="hpss_freq_bins (odd)")
+                hpss_start_hz = gr.Number(
+                    value=3000.0, 
+                    label="Start frequency (Hz)",
+                    info="Where to apply HPSS separation."
+                )
+                hpss_end_hz = gr.Number(
+                    value=8000.0, 
+                    label="End frequency (Hz)",
+                    info="Upper limit for HPSS."
+                )
+                hpss_time_frames = gr.Slider(
+                    3, 61, value=21, step=2, 
+                    label="Time window",
+                    info="Median filter over time. Larger = better separation but more smearing."
+                )
+                hpss_freq_bins = gr.Slider(
+                    3, 61, value=17, step=2, 
+                    label="Frequency window",
+                    info="Median filter over frequency. Larger = better separation but less precise."
+                )
 
+            gr.Markdown("**Phase Blur** - Soften harsh textures by randomizing phase")
             with gr.Row():
-                phase_blur = gr.Slider(0.0, 1.0, value=0.0, step=0.01, label="phase_blur (0..1)")
-                pb_harmonic_only = gr.Checkbox(value=True, label="pb_harmonic_only")
+                phase_blur = gr.Slider(
+                    0.0, 1.0, value=0.0, step=0.01, 
+                    label="Amount",
+                    info="How much to randomize phase. 0 = off. Subtle values (0.1-0.3) can soften metallic textures."
+                )
+                pb_harmonic_only = gr.Checkbox(
+                    value=True, 
+                    label="Harmonic only",
+                    info="Only blur harmonic content, preserve transients."
+                )
             with gr.Row():
-                pb_start_hz = gr.Number(value=3000.0, label="pb_start_hz")
-                pb_end_hz = gr.Number(value=8000.0, label="pb_end_hz")
+                pb_start_hz = gr.Number(
+                    value=3000.0, 
+                    label="Start frequency (Hz)",
+                    info="Where to apply phase blur."
+                )
+                pb_end_hz = gr.Number(
+                    value=8000.0, 
+                    label="End frequency (Hz)",
+                    info="Upper limit for phase blur."
+                )
 
+            gr.Markdown("**HF Resynthesis** - Nuclear option: remove HF entirely and regenerate from lower frequencies")
             with gr.Row():
-                hf_resynth = gr.Checkbox(value=False, label="hf_resynth (nuclear HF resynthesis)")
-                hf_mix = gr.Slider(0.0, 1.0, value=0.35, step=0.01, label="hf_mix")
+                hf_resynth = gr.Checkbox(
+                    value=False, 
+                    label="Enable HF resynthesis",
+                    info="⚠️ Destructive! Removes high frequencies and creates new ones from lower bands. Last resort."
+                )
+                hf_mix = gr.Slider(
+                    0.0, 1.0, value=0.35, step=0.01, 
+                    label="Mix amount",
+                    info="How much regenerated HF to blend in. Lower = subtler."
+                )
             with gr.Row():
-                hf_lp_hz = gr.Number(value=3000.0, label="hf_lp_hz")
-                hf_hp_hz = gr.Number(value=3000.0, label="hf_hp_hz")
-                hf_drive = gr.Slider(0.1, 10.0, value=2.0, step=0.05, label="hf_drive")
+                hf_lp_hz = gr.Number(
+                    value=3000.0, 
+                    label="Low-pass cutoff (Hz)",
+                    info="Keep everything below this frequency, remove above."
+                )
+                hf_hp_hz = gr.Number(
+                    value=3000.0, 
+                    label="Regenerated HF starts at (Hz)",
+                    info="Where regenerated harmonics begin."
+                )
+                hf_drive = gr.Slider(
+                    0.1, 10.0, value=2.0, step=0.05, 
+                    label="Drive",
+                    info="Saturation amount for generating harmonics. Higher = more harmonics but harsher."
+                )
             with gr.Row():
-                hf_src_lo_hz = gr.Number(value=1000.0, label="hf_src_lo_hz")
-                hf_src_hi_hz = gr.Number(value=2000.0, label="hf_src_hi_hz")
+                hf_src_lo_hz = gr.Number(
+                    value=1000.0, 
+                    label="Source band start (Hz)",
+                    info="Lower edge of the band used to generate new harmonics."
+                )
+                hf_src_hi_hz = gr.Number(
+                    value=2000.0, 
+                    label="Source band end (Hz)",
+                    info="Upper edge of the source band."
+                )
 
-        with gr.Accordion("Delivery mastering", open=False):
-            master_enabled = gr.Checkbox(value=False, label="Enable master stage")
+        with gr.Accordion("🎚️ Delivery Mastering (loudness/limiting)", open=False):
+            gr.Markdown("*Final loudness normalization and limiting for delivery. Only enable when you're done tweaking!*")
+            master_enabled = gr.Checkbox(
+                value=False, 
+                label="Enable mastering",
+                info="Turn on loudness normalization and limiting. Leave off while tweaking parameters."
+            )
             with gr.Row():
-                hp_hz = gr.Slider(0.0, 80.0, value=20.0, step=0.5, label="hp_hz")
-                tp_os = gr.Dropdown([1, 2, 4, 8], value=4, label="tp_os")
+                hp_hz = gr.Slider(
+                    0.0, 80.0, value=20.0, step=0.5, 
+                    label="High-pass filter (Hz)",
+                    info="Remove sub-bass rumble. 20-30 Hz is typical. Set to 0 to disable."
+                )
+                tp_os = gr.Dropdown(
+                    [1, 2, 4, 8], value=4, 
+                    label="True peak oversampling",
+                    info="Oversampling for accurate peak detection. 4x is standard, 8x is more accurate but slower."
+                )
             with gr.Row():
-                target_lufs = gr.Slider(-30.0, 999.0, value=-14.0, step=0.1, label="target_lufs (set >=998 to disable)")
-                target_rms_dbfs = gr.Slider(-40.0, -6.0, value=-16.0, step=0.1, label="target_rms_dbfs (fallback)")
+                target_lufs = gr.Slider(
+                    -30.0, 999.0, value=-14.0, step=0.1, 
+                    label="Target loudness (LUFS)",
+                    info="-14 LUFS = Spotify/YouTube. -16 = Apple. Set >=998 to disable loudness normalization."
+                )
+                target_rms_dbfs = gr.Slider(
+                    -40.0, -6.0, value=-16.0, step=0.1, 
+                    label="Fallback RMS target (dBFS)",
+                    info="Used if LUFS measurement fails. -16 to -14 is typical."
+                )
             with gr.Row():
-                norm_max_gain_db = gr.Slider(0.0, 24.0, value=12.0, step=0.5, label="norm_max_gain_db")
-                norm_max_atten_db = gr.Slider(0.0, 60.0, value=24.0, step=0.5, label="norm_max_atten_db")
+                norm_max_gain_db = gr.Slider(
+                    0.0, 24.0, value=12.0, step=0.5, 
+                    label="Max boost (dB)",
+                    info="Maximum gain increase allowed. Prevents over-boosting quiet tracks."
+                )
+                norm_max_atten_db = gr.Slider(
+                    0.0, 60.0, value=24.0, step=0.5, 
+                    label="Max cut (dB)",
+                    info="Maximum gain reduction allowed. Prevents over-cutting loud tracks."
+                )
             with gr.Row():
-                ceiling_dbtp = gr.Slider(-12.0, 0.0, value=-1.0, step=0.1, label="ceiling_dbtp")
-                lim_lookahead_ms = gr.Slider(0.0, 50.0, value=5.0, step=0.5, label="lim_lookahead_ms")
-                lim_release_ms = gr.Slider(10.0, 1000.0, value=100.0, step=5.0, label="lim_release_ms")
+                ceiling_dbtp = gr.Slider(
+                    -12.0, 0.0, value=-1.0, step=0.1, 
+                    label="True peak ceiling (dBTP)",
+                    info="Maximum peak level. -1 dBTP is safe for streaming, -0.5 for CD."
+                )
+                lim_lookahead_ms = gr.Slider(
+                    0.0, 50.0, value=5.0, step=0.5, 
+                    label="Limiter lookahead (ms)",
+                    info="How far ahead the limiter looks. Higher = cleaner limiting but adds latency."
+                )
+                lim_release_ms = gr.Slider(
+                    10.0, 1000.0, value=100.0, step=5.0, 
+                    label="Limiter release (ms)",
+                    info="How fast limiter recovers. Lower = more aggressive, higher = smoother."
+                )
 
         with gr.Accordion("Spectrogram settings (UI only)", open=False):
             with gr.Row():
@@ -1178,17 +1690,19 @@ def build_ui() -> Any:
             preset_user_desc = gr.Textbox(label="Preset description (optional)")
             preset_save = gr.Button("Save preset from current knobs", variant="primary")
             preset_save_status = gr.Markdown()
+            rt_export = gr.Button("Export knobs to realtime_params.json (for realtime_player.py)", variant="secondary")
+            rt_export_status = gr.Markdown()
 
         def _preset_desc_md(name: str) -> str:
-            p = ALL_PRESETS.get(name, {})
+            p = all_presets.get(name, {})
             desc = p.get("desc", "")
             return f"**{name}**  \n{desc}" if desc else f"**{name}**"
 
         def apply_preset(name: str):
-            p = ALL_PRESETS.get(name, {})
+            p = all_presets.get(name, {})
             vals = dict(p.get("values", {}))
             # return updates in the same order as outputs list below
-            def g(key: str, current):
+            def g(key: str, current: object) -> object:
                 return vals.get(key, current)
 
             return (
@@ -1208,6 +1722,7 @@ def build_ui() -> Any:
                 g("flux_range_db", flux_range_db.value),
                 g("noise_resynth", noise_resynth.value),
                 g("mix", mix.value),
+                g("delta_listen", delta_listen.value),
                 g("denoise", denoise.value),
                 g("dn_start_hz", dn_start_hz.value),
                 g("dn_end_hz", dn_end_hz.value),
@@ -1292,6 +1807,7 @@ def build_ui() -> Any:
             flux_range_db,
             noise_resynth,
             mix,
+            delta_listen,
             denoise,
             dn_start_hz,
             dn_end_hz,
@@ -1362,6 +1878,7 @@ def build_ui() -> Any:
             preview_t0,
             preview_dur,
             loop_xfade_ms,
+            full_song_mode,
             start_hz,
             end_hz,
             edge_hz,
@@ -1378,6 +1895,7 @@ def build_ui() -> Any:
             flux_range_db,
             noise_resynth,
             mix,
+            delta_listen,
             denoise,
             dn_start_hz,
             dn_end_hz,
@@ -1475,6 +1993,7 @@ def build_ui() -> Any:
         _bind_auto(preview_t0)
         _bind_auto(preview_dur)
         _bind_auto(loop_xfade_ms)
+        _bind_auto(full_song_mode)
 
         # Most knobs
         for c in [
@@ -1494,6 +2013,7 @@ def build_ui() -> Any:
             flux_range_db,
             noise_resynth,
             mix,
+            delta_listen,
             denoise,
             dn_start_hz,
             dn_end_hz,
@@ -1581,6 +2101,7 @@ def build_ui() -> Any:
             flux_range_db,
             noise_resynth,
             mix,
+            delta_listen,
             denoise,
             dn_start_hz,
             dn_end_hz,
@@ -1654,86 +2175,87 @@ def build_ui() -> Any:
             name: str,
             desc: str,
             # values follow: must match keys we store
-            start_hz_v,
-            end_hz_v,
-            edge_hz_v,
-            n_fft_v,
-            hop_v,
-            flat_start_v,
-            flat_end_v,
-            freq_med_bins_v,
-            thr_db_v,
-            slope_v,
-            density_lo_v,
-            density_hi_v,
-            flux_thr_db_v,
-            flux_range_db_v,
-            noise_resynth_v,
-            mix_v,
-            denoise_v,
-            dn_start_hz_v,
-            dn_end_hz_v,
-            dn_edge_hz_v,
-            dn_floor_db_v,
-            dn_psd_smooth_ms_v,
-            dn_minwin_ms_v,
-            dn_up_db_per_s_v,
-            dn_attack_ms_v,
-            dn_release_ms_v,
-            dn_freq_smooth_bins_v,
-            deres_v,
-            deq_start_hz_v,
-            deq_end_hz_v,
-            deq_edge_hz_v,
-            deq_freq_med_bins_v,
-            deq_thr_db_v,
-            deq_slope_v,
-            deq_max_att_db_v,
-            deq_density_lo_v,
-            deq_density_hi_v,
-            deq_persist_ms_v,
-            deq_persist_thr_db_v,
-            deq_freq_smooth_bins_v,
-            deq_tonal_boost_db_v,
-            deq_time_floor_v,
-            deq_floor_smooth_ms_v,
-            deq_floor_rise_db_per_s_v,
-            expander_v,
-            exp_start_hz_v,
-            exp_end_hz_v,
-            exp_threshold_db_v,
-            exp_ratio_v,
-            exp_attack_ms_v,
-            exp_release_ms_v,
-            hpss_v,
-            hpss_start_hz_v,
-            hpss_end_hz_v,
-            hpss_time_frames_v,
-            hpss_freq_bins_v,
-            hpss_harmonic_only_v,
-            phase_blur_v,
-            pb_start_hz_v,
-            pb_end_hz_v,
-            pb_harmonic_only_v,
-            hf_resynth_v,
-            hf_lp_hz_v,
-            hf_src_lo_hz_v,
-            hf_src_hi_hz_v,
-            hf_drive_v,
-            hf_hp_hz_v,
-            hf_mix_v,
-            master_enabled_v,
-            hp_hz_v,
-            target_lufs_v,
-            target_rms_dbfs_v,
-            norm_max_gain_db_v,
-            norm_max_atten_db_v,
-            ceiling_dbtp_v,
-            lim_lookahead_ms_v,
-            lim_release_ms_v,
-            tp_os_v,
+            start_hz_v: object,
+            end_hz_v: object,
+            edge_hz_v: object,
+            n_fft_v: object,
+            hop_v: object,
+            flat_start_v: object,
+            flat_end_v: object,
+            freq_med_bins_v: object,
+            thr_db_v: object,
+            slope_v: object,
+            density_lo_v: object,
+            density_hi_v: object,
+            flux_thr_db_v: object,
+            flux_range_db_v: object,
+            noise_resynth_v: object,
+            mix_v: object,
+            delta_listen_v: object,
+            denoise_v: object,
+            dn_start_hz_v: object,
+            dn_end_hz_v: object,
+            dn_edge_hz_v: object,
+            dn_floor_db_v: object,
+            dn_psd_smooth_ms_v: object,
+            dn_minwin_ms_v: object,
+            dn_up_db_per_s_v: object,
+            dn_attack_ms_v: object,
+            dn_release_ms_v: object,
+            dn_freq_smooth_bins_v: object,
+            deres_v: object,
+            deq_start_hz_v: object,
+            deq_end_hz_v: object,
+            deq_edge_hz_v: object,
+            deq_freq_med_bins_v: object,
+            deq_thr_db_v: object,
+            deq_slope_v: object,
+            deq_max_att_db_v: object,
+            deq_density_lo_v: object,
+            deq_density_hi_v: object,
+            deq_persist_ms_v: object,
+            deq_persist_thr_db_v: object,
+            deq_freq_smooth_bins_v: object,
+            deq_tonal_boost_db_v: object,
+            deq_time_floor_v: object,
+            deq_floor_smooth_ms_v: object,
+            deq_floor_rise_db_per_s_v: object,
+            expander_v: object,
+            exp_start_hz_v: object,
+            exp_end_hz_v: object,
+            exp_threshold_db_v: object,
+            exp_ratio_v: object,
+            exp_attack_ms_v: object,
+            exp_release_ms_v: object,
+            hpss_v: object,
+            hpss_start_hz_v: object,
+            hpss_end_hz_v: object,
+            hpss_time_frames_v: object,
+            hpss_freq_bins_v: object,
+            hpss_harmonic_only_v: object,
+            phase_blur_v: object,
+            pb_start_hz_v: object,
+            pb_end_hz_v: object,
+            pb_harmonic_only_v: object,
+            hf_resynth_v: object,
+            hf_lp_hz_v: object,
+            hf_src_lo_hz_v: object,
+            hf_src_hi_hz_v: object,
+            hf_drive_v: object,
+            hf_hp_hz_v: object,
+            hf_mix_v: object,
+            master_enabled_v: object,
+            hp_hz_v: object,
+            target_lufs_v: object,
+            target_rms_dbfs_v: object,
+            norm_max_gain_db_v: object,
+            norm_max_atten_db_v: object,
+            ceiling_dbtp_v: object,
+            lim_lookahead_ms_v: object,
+            lim_release_ms_v: object,
+            tp_os_v: object,
         ):
-            nonlocal ALL_PRESETS
+            nonlocal all_presets
             name = (name or "").strip()
             if not name:
                 return gr.update(), "Please enter a preset name."
@@ -1755,6 +2277,7 @@ def build_ui() -> Any:
                 "flux_range_db": float(flux_range_db_v),
                 "noise_resynth": float(noise_resynth_v),
                 "mix": float(mix_v),
+                "delta_listen": bool(delta_listen_v),
                 "denoise": float(denoise_v),
                 "dn_start_hz": float(dn_start_hz_v),
                 "dn_end_hz": float(dn_end_hz_v),
@@ -1819,9 +2342,9 @@ def build_ui() -> Any:
                 "tp_os": int(tp_os_v),
             }
             _save_user_preset(USER_PRESETS_PATH, name, desc, values)
-            ALL_PRESETS = dict(BASE_PRESETS)
-            ALL_PRESETS.update(_load_user_presets(USER_PRESETS_PATH))
-            return gr.update(choices=list(ALL_PRESETS.keys()), value=name), f"Saved preset to `{USER_PRESETS_PATH}`."
+            all_presets = dict(base_presets)
+            all_presets.update(_load_user_presets(USER_PRESETS_PATH))
+            return gr.update(choices=list(all_presets.keys()), value=name), f"Saved preset to `{USER_PRESETS_PATH}`."
 
         preset_save_inputs = [
             preset_name,
@@ -1842,6 +2365,7 @@ def build_ui() -> Any:
             flux_range_db,
             noise_resynth,
             mix,
+            delta_listen,
             denoise,
             dn_start_hz,
             dn_end_hz,
@@ -1910,6 +2434,191 @@ def build_ui() -> Any:
             inputs=[preset],
             outputs=[preset_desc],
         )
+
+        def export_realtime_params(
+            # current knob state (same as save)
+            start_hz_v: object,
+            end_hz_v: object,
+            edge_hz_v: object,
+            n_fft_v: object,
+            hop_v: object,
+            flat_start_v: object,
+            flat_end_v: object,
+            freq_med_bins_v: object,
+            thr_db_v: object,
+            slope_v: object,
+            density_lo_v: object,
+            density_hi_v: object,
+            flux_thr_db_v: object,
+            flux_range_db_v: object,
+            noise_resynth_v: object,
+            mix_v: object,
+            delta_listen_v: object,
+            denoise_v: object,
+            dn_start_hz_v: object,
+            dn_end_hz_v: object,
+            dn_edge_hz_v: object,
+            dn_floor_db_v: object,
+            dn_psd_smooth_ms_v: object,
+            dn_minwin_ms_v: object,
+            dn_up_db_per_s_v: object,
+            dn_attack_ms_v: object,
+            dn_release_ms_v: object,
+            dn_freq_smooth_bins_v: object,
+            deres_v: object,
+            deq_start_hz_v: object,
+            deq_end_hz_v: object,
+            deq_edge_hz_v: object,
+            deq_freq_med_bins_v: object,
+            deq_thr_db_v: object,
+            deq_slope_v: object,
+            deq_max_att_db_v: object,
+            deq_density_lo_v: object,
+            deq_density_hi_v: object,
+            deq_persist_ms_v: object,
+            deq_persist_thr_db_v: object,
+            deq_freq_smooth_bins_v: object,
+            deq_tonal_boost_db_v: object,
+            deq_time_floor_v: object,
+            deq_floor_smooth_ms_v: object,
+            deq_floor_rise_db_per_s_v: object,
+            expander_v: object,
+            exp_start_hz_v: object,
+            exp_end_hz_v: object,
+            exp_threshold_db_v: object,
+            exp_ratio_v: object,
+            exp_attack_ms_v: object,
+            exp_release_ms_v: object,
+            hpss_v: object,
+            hpss_start_hz_v: object,
+            hpss_end_hz_v: object,
+            hpss_time_frames_v: object,
+            hpss_freq_bins_v: object,
+            hpss_harmonic_only_v: object,
+            phase_blur_v: object,
+            pb_start_hz_v: object,
+            pb_end_hz_v: object,
+            pb_harmonic_only_v: object,
+            hf_resynth_v: object,
+            hf_lp_hz_v: object,
+            hf_src_lo_hz_v: object,
+            hf_src_hi_hz_v: object,
+            hf_drive_v: object,
+            hf_hp_hz_v: object,
+            hf_mix_v: object,
+            master_enabled_v: object,
+            hp_hz_v: object,
+            target_lufs_v: object,
+            target_rms_dbfs_v: object,
+            norm_max_gain_db_v: object,
+            norm_max_atten_db_v: object,
+            ceiling_dbtp_v: object,
+            lim_lookahead_ms_v: object,
+            lim_release_ms_v: object,
+            tp_os_v: object,
+        ) -> str:
+            import json
+
+            # Build a real Params + MasterParams using the existing builder, then dump asdict() (full key set).
+            p, mp, _ = _build_params(
+                start_hz=float(start_hz_v),
+                end_hz=float(end_hz_v),
+                edge_hz=float(edge_hz_v),
+                n_fft=int(n_fft_v),
+                hop=int(hop_v),
+                flat_start=float(flat_start_v),
+                flat_end=float(flat_end_v),
+                freq_med_bins=int(freq_med_bins_v),
+                thr_db=float(thr_db_v),
+                slope=float(slope_v),
+                density_lo=float(density_lo_v),
+                density_hi=float(density_hi_v),
+                flux_thr_db=float(flux_thr_db_v),
+                flux_range_db=float(flux_range_db_v),
+                noise_resynth=float(noise_resynth_v),
+                mix=float(mix_v),
+                delta_listen=bool(delta_listen_v),
+                denoise=float(denoise_v),
+                dn_start_hz=float(dn_start_hz_v),
+                dn_end_hz=float(dn_end_hz_v),
+                dn_edge_hz=float(dn_edge_hz_v),
+                dn_floor_db=float(dn_floor_db_v),
+                dn_psd_smooth_ms=float(dn_psd_smooth_ms_v),
+                dn_minwin_ms=float(dn_minwin_ms_v),
+                dn_up_db_per_s=float(dn_up_db_per_s_v),
+                dn_attack_ms=float(dn_attack_ms_v),
+                dn_release_ms=float(dn_release_ms_v),
+                dn_freq_smooth_bins=int(dn_freq_smooth_bins_v),
+                deres=float(deres_v),
+                deq_start_hz=float(deq_start_hz_v),
+                deq_end_hz=float(deq_end_hz_v),
+                deq_edge_hz=float(deq_edge_hz_v),
+                deq_freq_med_bins=int(deq_freq_med_bins_v),
+                deq_thr_db=float(deq_thr_db_v),
+                deq_slope=float(deq_slope_v),
+                deq_max_att_db=float(deq_max_att_db_v),
+                deq_density_lo=float(deq_density_lo_v),
+                deq_density_hi=float(deq_density_hi_v),
+                deq_persist_ms=float(deq_persist_ms_v),
+                deq_persist_thr_db=float(deq_persist_thr_db_v),
+                deq_freq_smooth_bins=int(deq_freq_smooth_bins_v),
+                deq_tonal_boost_db=float(deq_tonal_boost_db_v),
+                deq_time_floor=bool(deq_time_floor_v),
+                deq_floor_smooth_ms=float(deq_floor_smooth_ms_v),
+                deq_floor_rise_db_per_s=float(deq_floor_rise_db_per_s_v),
+                expander=bool(expander_v),
+                exp_start_hz=float(exp_start_hz_v),
+                exp_end_hz=float(exp_end_hz_v),
+                exp_threshold_db=float(exp_threshold_db_v),
+                exp_ratio=float(exp_ratio_v),
+                exp_attack_ms=float(exp_attack_ms_v),
+                exp_release_ms=float(exp_release_ms_v),
+                hpss=bool(hpss_v),
+                hpss_start_hz=float(hpss_start_hz_v),
+                hpss_end_hz=float(hpss_end_hz_v),
+                hpss_time_frames=int(hpss_time_frames_v),
+                hpss_freq_bins=int(hpss_freq_bins_v),
+                hpss_harmonic_only=bool(hpss_harmonic_only_v),
+                phase_blur=float(phase_blur_v),
+                pb_start_hz=float(pb_start_hz_v),
+                pb_end_hz=float(pb_end_hz_v),
+                pb_harmonic_only=bool(pb_harmonic_only_v),
+                hf_resynth=bool(hf_resynth_v),
+                hf_lp_hz=float(hf_lp_hz_v),
+                hf_src_lo_hz=float(hf_src_lo_hz_v),
+                hf_src_hi_hz=float(hf_src_hi_hz_v),
+                hf_drive=float(hf_drive_v),
+                hf_hp_hz=float(hf_hp_hz_v),
+                hf_mix=float(hf_mix_v),
+                master_enabled=bool(master_enabled_v),
+                hp_hz=float(hp_hz_v),
+                target_lufs=float(target_lufs_v),
+                target_rms_dbfs=float(target_rms_dbfs_v),
+                norm_max_gain_db=float(norm_max_gain_db_v),
+                norm_max_atten_db=float(norm_max_atten_db_v),
+                ceiling_dbtp=float(ceiling_dbtp_v),
+                lim_lookahead_ms=float(lim_lookahead_ms_v),
+                lim_release_ms=float(lim_release_ms_v),
+                tp_os=int(tp_os_v),
+                spec_n_fft=2048,
+                spec_hop=512,
+                spec_max_frames=1200,
+                spec_max_hz=20000.0,
+            )
+            # Realtime-ish player: prefer causal filters (avoid zero-phase filtfilt in chunked playback).
+            try:
+                p.hf_zero_phase = False
+            except Exception:
+                pass
+            path = os.path.join(os.path.dirname(__file__), "realtime_params.json")
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({"params": asdict(p), "master_params": asdict(mp)}, f, indent=2, sort_keys=True)
+            return (
+                f"Wrote `{path}`. Start `python realtime_player.py YOURFILE.wav --params {os.path.basename(path)}`"
+            )
+
+        rt_export_inputs = preset_save_inputs[2:]  # same knob list, without name/desc
+        rt_export.click(fn=export_realtime_params, inputs=rt_export_inputs, outputs=[rt_export_status])
 
         gr.Markdown(
             "### Tip\n"

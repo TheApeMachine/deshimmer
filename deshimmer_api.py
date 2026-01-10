@@ -96,6 +96,8 @@ def process_audio(
 
     # ---- STFT repair ----
     y_repaired = _m.process_stft(x2, sr, p, dbg=dbg_collector)
+    # Optional "nuclear" HF resynthesis
+    y_repaired = _m.hf_resynth_post(y_repaired, sr, p)
     y_rep_2d = _m._as_2d(y_repaired)
     info["measure_after_repair"] = {
         "sample_peak_dbfs": float(_m._lin_to_db(np.max(np.abs(y_rep_2d)) + 1e-12)),

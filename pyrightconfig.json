@@ -1,0 +1,15 @@
+{
+  "typeCheckingMode": "basic",
+  "exclude": [
+    "ui_gradio.py",
+    "realtime_player.py"
+  ],
+  "reportMissingTypeStubs": "none",
+  "reportUnknownMemberType": "none",
+  "reportUnknownArgumentType": "none",
+  "reportUnknownVariableType": "none",
+  "reportUnknownParameterType": "none",
+  "reportPrivateUsage": "none"
+}
+
+

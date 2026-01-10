@@ -7,3 +7,4 @@ ui_downloads/
 Demon3_debug/
 .venv/
 .DS_Store
+vst/DeAI/Builds/MacOSX/build/Debug/libDeAI.a
