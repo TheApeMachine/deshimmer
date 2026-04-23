@@ -38,6 +38,7 @@ import numpy as np
 import soundfile as sf
 
 import master
+import auto_tune
 from deshimmer_api import process_audio
 
 
@@ -983,6 +984,49 @@ def render_full_to_files(
     return out_path, diff_path, params_path
 
 
+def _params_to_slider_tuple(p: master.Params, mp: master.MasterParams) -> tuple[Any, ...]:
+    """
+    Flatten Params + MasterParams into a tuple matching the order of the UI's
+    preset_outputs list (everything *except* the trailing markdown component).
+    Used by both Apply-preset and the Auto-tune Analyze/Refine buttons.
+    """
+    target_lufs_v = 999.0 if mp.target_lufs is None else float(mp.target_lufs)
+    return (
+        float(p.start_hz), float(p.end_hz), float(p.edge_hz),
+        int(p.n_fft), int(p.hop),
+        float(p.flat_start), float(p.flat_end),
+        int(p.freq_med_bins), float(p.thr_db), float(p.slope),
+        float(p.density_lo), float(p.density_hi),
+        float(p.flux_thr_db), float(p.flux_range_db),
+        float(p.noise_resynth), float(p.mix), bool(p.delta_listen),
+        float(p.denoise), float(p.dn_start_hz), float(p.dn_end_hz), float(p.dn_edge_hz),
+        float(p.dn_floor_db), float(p.dn_psd_smooth_ms), float(p.dn_minwin_ms),
+        float(p.dn_up_db_per_s), float(p.dn_attack_ms), float(p.dn_release_ms),
+        int(p.dn_freq_smooth_bins),
+        float(p.deres), float(p.deq_start_hz), float(p.deq_end_hz), float(p.deq_edge_hz),
+        int(p.deq_freq_med_bins), float(p.deq_thr_db), float(p.deq_slope),
+        float(p.deq_max_att_db), float(p.deq_density_lo), float(p.deq_density_hi),
+        float(p.deq_persist_ms), float(p.deq_persist_thr_db),
+        int(p.deq_freq_smooth_bins), float(p.deq_tonal_boost_db),
+        bool(p.deq_time_floor), float(p.deq_floor_smooth_ms),
+        float(p.deq_floor_rise_db_per_s),
+        bool(p.expander), float(p.exp_start_hz), float(p.exp_end_hz),
+        float(p.exp_threshold_db), float(p.exp_ratio),
+        float(p.exp_attack_ms), float(p.exp_release_ms),
+        bool(p.hpss), float(p.hpss_start_hz), float(p.hpss_end_hz),
+        int(p.hpss_time_frames), int(p.hpss_freq_bins), bool(p.hpss_harmonic_only),
+        float(p.phase_blur), float(p.pb_start_hz), float(p.pb_end_hz),
+        bool(p.pb_harmonic_only),
+        bool(p.hf_resynth), float(p.hf_lp_hz), float(p.hf_src_lo_hz),
+        float(p.hf_src_hi_hz), float(p.hf_drive), float(p.hf_hp_hz), float(p.hf_mix),
+        bool(mp.enabled), float(mp.hp_hz), float(target_lufs_v),
+        float(mp.target_rms_dbfs if mp.target_rms_dbfs is not None else -16.0),
+        float(mp.norm_max_gain_db), float(mp.norm_max_atten_db),
+        float(mp.ceiling_dbtp), float(mp.lookahead_ms), float(mp.release_ms),
+        int(mp.os_factor),
+    )
+
+
 def build_ui() -> Any:
     import gradio as gr
 
@@ -1228,6 +1272,43 @@ def build_ui() -> Any:
             dl_out = gr.File(label="Download: full output.wav")
             dl_diff = gr.File(label="Download: full diff.wav")
             dl_params = gr.File(label="Download: params.json")
+
+        with gr.Accordion("✨ Auto-tune (Analyze + Refine)", open=True):
+            gr.Markdown(
+                "*Auto-derive sensible defaults from the audio (Analyze), then optionally refine with a "
+                "Bayesian search across a few preview regions (Refine). Both write directly into the sliders below.*"
+            )
+            with gr.Row():
+                auto_aggressiveness = gr.Slider(
+                    0.0, 1.0, value=0.5, step=0.05,
+                    label="Aggressiveness",
+                    info="0 = preserve content (more conservative), 1 = maximise artifact reduction. Refine only.",
+                )
+                auto_n_trials = gr.Slider(
+                    4, 30, value=12, step=1,
+                    label="Trials per stage",
+                    info="Higher = better tuning but slower. ~12 is a good default. Refine only.",
+                )
+                auto_refine_dur = gr.Slider(
+                    1.0, 6.0, value=3.0, step=0.25,
+                    label="Refine region duration (s)",
+                    info="Shorter regions = faster optimisation. Refine only.",
+                )
+            with gr.Row():
+                auto_use_preview = gr.Checkbox(
+                    value=True,
+                    label="Use current preview as one region",
+                    info="When on, the current preview start/duration is locked in as one of the auto regions.",
+                )
+                auto_n_regions = gr.Slider(
+                    1, 4, value=3, step=1,
+                    label="Number of regions",
+                    info="How many short windows to sample (auto-picks quiet/loud/transient).",
+                )
+            with gr.Row():
+                analyze_btn = gr.Button("🔍 Analyze (set defaults from audio)", variant="secondary")
+                refine_btn = gr.Button("⚙️ Refine (Bayesian optimise)", variant="primary")
+            auto_report = gr.Markdown()
 
         with gr.Accordion("🎯 Shimmer Removal (main tool for AI sparkle/shimmer)", open=True):
             gr.Markdown("*Targets the annoying 'sparkly' or 'shimmery' artifacts common in AI-generated music. Start here!*")
@@ -1972,6 +2053,166 @@ def build_ui() -> Any:
 
         # Apply preset, then rerender preview (restart output loop)
         preset_apply.click(fn=apply_preset, inputs=[preset], outputs=preset_outputs).then(
+            fn=run_once,
+            inputs=inputs,
+            outputs=[a_in, a_out, a_diff, im_in, im_out, im_diff, metrics, params_json],
+        )
+
+        # ---- Auto-tune wiring (Analyze + Refine) ----
+        # The "knob inputs" tail is identical for both buttons; we slice it from the existing
+        # `inputs` list so we never have to repeat the 80-element knob enumeration.
+        # `inputs` layout:
+        #   [audio_in, preview_t0, preview_dur, loop_xfade_ms, full_song_mode, ...80 knobs..., spec_*4]
+        knob_inputs = inputs[5:-4]   # drop preview-only prefix and spec-only suffix
+        spec_inputs = inputs[-4:]
+
+        # auto_outputs mirrors preset_outputs exactly, but with the report markdown at the tail.
+        auto_outputs = preset_outputs[:-1] + [auto_report]
+
+        def _build_base_params_from_knobs(knob_vals: list[Any], spec_vals: list[Any]) -> tuple[master.Params, master.MasterParams]:
+            kw: dict[str, Any] = {}
+            knob_names = [
+                "start_hz", "end_hz", "edge_hz", "n_fft", "hop", "flat_start", "flat_end",
+                "freq_med_bins", "thr_db", "slope", "density_lo", "density_hi",
+                "flux_thr_db", "flux_range_db", "noise_resynth", "mix", "delta_listen",
+                "denoise", "dn_start_hz", "dn_end_hz", "dn_edge_hz", "dn_floor_db",
+                "dn_psd_smooth_ms", "dn_minwin_ms", "dn_up_db_per_s", "dn_attack_ms",
+                "dn_release_ms", "dn_freq_smooth_bins",
+                "deres", "deq_start_hz", "deq_end_hz", "deq_edge_hz", "deq_freq_med_bins",
+                "deq_thr_db", "deq_slope", "deq_max_att_db", "deq_density_lo",
+                "deq_density_hi", "deq_persist_ms", "deq_persist_thr_db",
+                "deq_freq_smooth_bins", "deq_tonal_boost_db", "deq_time_floor",
+                "deq_floor_smooth_ms", "deq_floor_rise_db_per_s",
+                "expander", "exp_start_hz", "exp_end_hz", "exp_threshold_db",
+                "exp_ratio", "exp_attack_ms", "exp_release_ms",
+                "hpss", "hpss_start_hz", "hpss_end_hz", "hpss_time_frames",
+                "hpss_freq_bins", "hpss_harmonic_only",
+                "phase_blur", "pb_start_hz", "pb_end_hz", "pb_harmonic_only",
+                "hf_resynth", "hf_lp_hz", "hf_src_lo_hz", "hf_src_hi_hz",
+                "hf_drive", "hf_hp_hz", "hf_mix",
+                "master_enabled", "hp_hz", "target_lufs", "target_rms_dbfs",
+                "norm_max_gain_db", "norm_max_atten_db", "ceiling_dbtp",
+                "lim_lookahead_ms", "lim_release_ms", "tp_os",
+            ]
+            for name, val in zip(knob_names, knob_vals):
+                kw[name] = val
+            spec_names = ["spec_n_fft", "spec_hop", "spec_max_frames", "spec_max_hz"]
+            for name, val in zip(spec_names, spec_vals):
+                kw[name] = val
+            p, mp, _dp = _build_params(**kw)
+            return p, mp
+
+        def do_analyze(
+            audio_in_v: tuple[int, np.ndarray] | None,
+            preview_t0_v: float,
+            preview_dur_v: float,
+            use_preview_v: bool,
+            n_regions_v: float,
+            *args: Any,
+        ) -> tuple[Any, ...]:
+            n_knobs_plus_specs = len(knob_inputs) + len(spec_inputs)
+            if len(args) < n_knobs_plus_specs:
+                raise ValueError(f"do_analyze: expected {n_knobs_plus_specs} trailing args, got {len(args)}")
+            knob_vals = list(args[: len(knob_inputs)])
+            spec_vals = list(args[len(knob_inputs):])
+            if audio_in_v is None:
+                report = "**Auto-analyze:** please load an audio file first."
+                return tuple(list(_params_to_slider_tuple(master.Params(), master.MasterParams())) + [report])
+
+            sr_v, x_v = audio_in_v
+            sr_v = int(sr_v)
+            x_v = _to_float_audio(x_v)
+
+            base_p, _base_mp = _build_base_params_from_knobs(knob_vals, spec_vals)
+
+            locked = None
+            if bool(use_preview_v):
+                locked = auto_tune.Region(t0=float(preview_t0_v), dur=float(preview_dur_v), label="user")
+            n_reg = int(max(1, round(float(n_regions_v))))
+            regions = auto_tune.pick_regions(x_v, sr_v, n=n_reg, dur=max(2.0, float(preview_dur_v)), locked=locked)
+            new_p, new_mp, report = auto_tune.analyze(x_v, sr_v, regions, base_params=base_p)
+            return tuple(list(_params_to_slider_tuple(new_p, new_mp)) + [report.to_markdown()])
+
+        def do_refine(
+            audio_in_v: tuple[int, np.ndarray] | None,
+            preview_t0_v: float,
+            preview_dur_v: float,
+            use_preview_v: bool,
+            n_regions_v: float,
+            aggressiveness_v: float,
+            n_trials_v: float,
+            refine_dur_v: float,
+            *args: Any,
+            progress: Any = gr.Progress(track_tqdm=False),
+        ) -> tuple[Any, ...]:
+            n_knobs_plus_specs = len(knob_inputs) + len(spec_inputs)
+            if len(args) < n_knobs_plus_specs:
+                raise ValueError(f"do_refine: expected {n_knobs_plus_specs} trailing args, got {len(args)}")
+            knob_vals = list(args[: len(knob_inputs)])
+            spec_vals = list(args[len(knob_inputs):])
+            if audio_in_v is None:
+                report = "**Auto-refine:** please load an audio file first."
+                return tuple(list(_params_to_slider_tuple(master.Params(), master.MasterParams())) + [report])
+
+            sr_v, x_v = audio_in_v
+            sr_v = int(sr_v)
+            x_v = _to_float_audio(x_v)
+
+            base_p, base_mp = _build_base_params_from_knobs(knob_vals, spec_vals)
+
+            locked = None
+            if bool(use_preview_v):
+                locked = auto_tune.Region(t0=float(preview_t0_v), dur=float(preview_dur_v), label="user")
+            n_reg = int(max(1, round(float(n_regions_v))))
+            refine_dur = float(max(1.0, min(refine_dur_v, preview_dur_v + 1.0)))
+            region_dur = float(max(refine_dur + 0.5, preview_dur_v, 4.0))
+            regions = auto_tune.pick_regions(x_v, sr_v, n=n_reg, dur=region_dur, locked=locked)
+
+            def _cb(frac: float, msg: str) -> None:
+                try:
+                    progress(float(frac), desc=msg)
+                except Exception:
+                    pass
+            progress(0.0, desc="Refining...")
+
+            new_p, summary = auto_tune.refine(
+                x_v, sr_v,
+                base_params=base_p,
+                regions=regions,
+                aggressiveness=float(aggressiveness_v),
+                n_trials_per_stage=int(n_trials_v),
+                refine_dur=refine_dur,
+                progress_cb=_cb,
+            )
+
+            # Build a concise report of the refine outcome.
+            stages_md_lines = ["**Auto-refine results**", ""]
+            stages_md_lines.append(f"- Aggressiveness: **{float(aggressiveness_v):.2f}**, trials/stage: **{int(n_trials_v)}**, regions: {len(regions)}")
+            stages_md_lines.append(f"- Final composite score: **{summary.get('final_score', 0.0):+.3f}**")
+            for s in summary.get("stages", []):
+                stages_md_lines.append(f"- Stage **{s['stage']}**: best={s['best_score']:+.3f}")
+                bp = s.get("best_params", {})
+                if bp:
+                    bp_s = ", ".join(f"`{k}`={v:.3g}" if isinstance(v, float) else f"`{k}`={v}" for k, v in bp.items())
+                    stages_md_lines.append(f"  - {bp_s}")
+            stages_md_lines.append("")
+            stages_md_lines.append("_(Higher score = better. Sliders below have been updated; press Run preview to listen.)_")
+            return tuple(list(_params_to_slider_tuple(new_p, base_mp)) + ["\n".join(stages_md_lines)])
+
+        # Build the input lists for the two buttons. Layout:
+        #   analyze: [audio_in, preview_t0, preview_dur, use_preview, n_regions] + knobs + specs
+        #   refine : [audio_in, preview_t0, preview_dur, use_preview, n_regions, aggressiveness, n_trials, refine_dur] + knobs + specs
+        analyze_inputs = [audio_in, preview_t0, preview_dur, auto_use_preview, auto_n_regions] + list(knob_inputs) + list(spec_inputs)
+        refine_inputs = [audio_in, preview_t0, preview_dur, auto_use_preview, auto_n_regions,
+                         auto_aggressiveness, auto_n_trials, auto_refine_dur] + list(knob_inputs) + list(spec_inputs)
+
+        analyze_btn.click(fn=do_analyze, inputs=analyze_inputs, outputs=auto_outputs).then(
+            fn=run_once,
+            inputs=inputs,
+            outputs=[a_in, a_out, a_diff, im_in, im_out, im_diff, metrics, params_json],
+        )
+
+        refine_btn.click(fn=do_refine, inputs=refine_inputs, outputs=auto_outputs).then(
             fn=run_once,
             inputs=inputs,
             outputs=[a_in, a_out, a_diff, im_in, im_out, im_diff, metrics, params_json],
