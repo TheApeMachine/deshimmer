@@ -26,7 +26,6 @@ from __future__ import annotations
 # pyright: reportPrivateUsage=false
 # pyright: reportUnusedCallResult=false
 
-import base64
 import io
 import math
 import os
@@ -39,7 +38,7 @@ import soundfile as sf
 
 import master
 import auto_tune
-from deshimmer_api import process_audio
+from deshimmer_api import process_audio, slice_with_context
 
 
 def _to_float_audio(x: np.ndarray) -> np.ndarray:
@@ -102,137 +101,12 @@ def _spectrogram_png_bytes(x: np.ndarray, sr: int, n_fft: int, hop: int, max_fra
     return buf.getvalue()
 
 
-def _audio_to_wav_data_uri(x: np.ndarray, sr: int) -> str:
-    """Encode small preview audio to a data: URI for <audio> tags."""
+def _gradio_audio(x: np.ndarray, sr: int) -> tuple[int, np.ndarray]:
+    """Return (sample_rate, float32 audio) for gr.Audio outputs."""
     x2 = _to_float_audio(x)
-    buf = io.BytesIO()
-    # PCM_16 keeps data URIs smaller and is fine for preview A/B.
-    sf.write(buf, x2, int(sr), format="WAV", subtype="PCM_16")
-    b64 = base64.b64encode(buf.getvalue()).decode("ascii")
-    return f"data:audio/wav;base64,{b64}"
-
-
-def _audio_player_html(title: str, wav_data_uri: str, *, autoplay: bool, loop: bool = True, player_id: str = "") -> str:
-    """
-    Generate HTML for an audio player with a stable ID for position preservation.
-    Position saving/restoring is handled by the global _AUDIO_POSITION_SCRIPT.
-    """
-    autoplay_attr = " autoplay" if autoplay else ""
-    loop_attr = " loop" if loop else ""
-    id_attr = f' id="{player_id}"' if player_id else ""
-    
-    return (
-        f"<div style='display:flex;flex-direction:column;gap:6px'>"
-        f"<div><b>{title}</b></div>"
-        f"<audio{id_attr} class='deshimmer-audio' controls{autoplay_attr}{loop_attr} playsinline style='width:100%' src='{wav_data_uri}'></audio>"
-        f"</div>"
-    )
-
-
-# Global JavaScript that persists and is injected once via gr.HTML at page load.
-# Uses MutationObserver to watch for audio element src changes and restore position.
-# Global JavaScript that persists and is injected once via gr.HTML at page load.
-# Uses MutationObserver to watch for audio element src changes and restore position.
-_AUDIO_POSITION_SCRIPT = """
-<script>
-(function() {
-    console.log('[Deshimmer] Robust audio script loaded');
-    
-    // State storage by INDEX (0=Input, 1=Output, 2=Diff)
-    // We use a global variable on window to survive some re-renders if the script wrapper stays
-    if (!window._deshimmerState) {
-        window._deshimmerState = {};
-    }
-    
-    function saveState(index, audio) {
-        window._deshimmerState[index] = {
-            time: audio.currentTime,
-            playing: !audio.paused,
-            src: audio.src,
-            timestamp: Date.now()
-        };
-        // Also save to session storage for page reloads
-        try {
-            sessionStorage.setItem('deshimmer_idx_' + index, JSON.stringify(window._deshimmerState[index]));
-        } catch(e) {}
-    }
-    
-    function loadState(index) {
-        // Try memory first, then session storage
-        if (window._deshimmerState[index]) return window._deshimmerState[index];
-        try {
-            var s = sessionStorage.getItem('deshimmer_idx_' + index);
-            if (s) return JSON.parse(s);
-        } catch(e) {}
-        return null;
-    }
-    
-    function setupPlayers() {
-        // Find ALL audio players with our class
-        setTimeout(() => {
-            console.log('[Deshimmer] Setting up players');
-            const players = document.querySelectorAll('.deshimmer-audio');
-            
-            players.forEach(function(audio, index) {
-                // Prevent double-setup
-                if (audio.getAttribute('data-setup') === 'true') return;
-                audio.setAttribute('data-setup', 'true');
-                
-                console.log('[Deshimmer] Found player index ' + index);
-                
-                var state = loadState(index);
-                
-                // If we have state, logic to restore it
-                if (state) {
-                    // If this is a FRESH load (new src), restore position
-                    // We check if src changed slightly or just assume if it's a re-render we want the old time
-                    // The safest is: if we have a saved time, and we are near 0, jump to saved time.
-                    
-                    var restore = function() {
-                        if (state.time > 0 && audio.duration > 0) {
-                            var newTime = state.time % audio.duration;
-                            if (Math.abs(audio.currentTime - newTime) > 0.5) {
-                                console.log('[Deshimmer] Restoring idx ' + index + ' to ' + newTime);
-                                audio.currentTime = newTime;
-                            }
-                        }
-                        if (state.playing) {
-                            var promise = audio.play();
-                            if (promise) promise.catch(e => console.log('Autoplay prevented:', e));
-                        }
-                    };
-
-                    // Try immediately if ready
-                    if (audio.readyState >= 1) restore();
-                    
-                    // And on metadata load
-                    audio.addEventListener('loadedmetadata', restore);
-                    
-                    // And on 'canplay' for good measure (covers some browser quirks)
-                    audio.addEventListener('canplay', function() {
-                        // Only restore if we haven't drifted far (prevents fighting user seeks)
-                        if (audio.currentTime < 0.5 && state.time > 0.5) restore();
-                    });
-                })
-            
-            // Listeners to save state
-            audio.addEventListener('timeupdate', function() {
-                saveState(index, audio);
-            });
-            audio.addEventListener('play', function() {
-                saveState(index, audio);
-            });
-            audio.addEventListener('pause', function() {
-                saveState(index, audio);
-            });
-        });
-    }
-
-    // Initial run
-    setupPlayers();
-})();
-</script>
-"""
+    if x2.shape[1] == 1:
+        return int(sr), x2[:, 0]
+    return int(sr), x2
 
 
 def _loop_crossfade_rotate(x: np.ndarray, sr: int, crossfade_ms: float) -> np.ndarray:
@@ -267,13 +141,13 @@ def _loop_crossfade_rotate(x: np.ndarray, sr: int, crossfade_ms: float) -> np.nd
     return y.astype(np.float32, copy=False)
 
 
-def _png_bytes_to_rgb(png_bytes: bytes) -> np.ndarray | None:
+def _png_bytes_to_rgb(png_bytes: bytes) -> np.ndarray:
     if not png_bytes:
-        return None
+        return np.zeros((1, 1, 3), dtype=np.uint8)
     try:
         from PIL import Image
     except Exception:
-        return None
+        return np.zeros((1, 1, 3), dtype=np.uint8)
     im = Image.open(io.BytesIO(png_bytes)).convert("RGB")
     return np.asarray(im)
 
@@ -300,7 +174,7 @@ def _render_metrics_md(info: dict[str, object]) -> str:
         "",
         "### Notes",
         "- `diff = input - output` (what was removed)",
-        "- Preview region is processed independently (fast iteration; results may differ slightly from full-track processing at boundaries)",
+        "- Preview region is processed with temporal context padding (matches full-track stateful DSP more closely)",
     ]
     return "\n".join(lines)
 
@@ -355,6 +229,7 @@ def _build_params(
     deq_time_floor: bool,
     deq_floor_smooth_ms: float,
     deq_floor_rise_db_per_s: float,
+    deq_floor_thr_db: float,
     # downward expander
     expander: bool,
     exp_start_hz: float,
@@ -370,11 +245,27 @@ def _build_params(
     hpss_time_frames: int,
     hpss_freq_bins: int,
     hpss_harmonic_only: bool,
+    hpss_protect_percussive: float,
+    magnitude_inpaint: bool,
+    deq_inpaint: bool,
+    total_att_cap_db: float,
+    nuclear_mode: bool,
+    ms_process: bool,
+    ms_side_scale: float,
     # phase blur
     phase_blur: float,
     pb_start_hz: float,
     pb_end_hz: float,
     pb_harmonic_only: bool,
+    # swish repair (phase coherence)
+    swish_repair: float,
+    swish_start_hz: float,
+    swish_end_hz: float,
+    swish_time_amt: float,
+    swish_freq_amt: float,
+    hf_decorrelate: float,
+    hf_dec_start_hz: float,
+    hf_dec_end_hz: float,
     # nuclear HF resynthesis
     hf_resynth: bool,
     hf_lp_hz: float,
@@ -383,6 +274,7 @@ def _build_params(
     hf_drive: float,
     hf_hp_hz: float,
     hf_mix: float,
+    hf_confidence_blend: bool,
     # mastering
     master_enabled: bool,
     hp_hz: float,
@@ -450,6 +342,7 @@ def _build_params(
         deq_time_floor=bool(deq_time_floor),
         deq_floor_smooth_ms=float(deq_floor_smooth_ms),
         deq_floor_rise_db_per_s=float(deq_floor_rise_db_per_s),
+        deq_floor_thr_db=float(deq_floor_thr_db),
 
         expander=bool(expander),
         exp_start_hz=float(exp_start_hz),
@@ -465,11 +358,28 @@ def _build_params(
         hpss_time_frames=int(hpss_time_frames),
         hpss_freq_bins=int(hpss_freq_bins),
         hpss_harmonic_only=bool(hpss_harmonic_only),
+        hpss_protect_percussive=float(hpss_protect_percussive),
+
+        magnitude_inpaint=bool(magnitude_inpaint),
+        deq_inpaint=bool(deq_inpaint),
+        total_att_cap_db=float(total_att_cap_db),
+        nuclear_mode=bool(nuclear_mode),
+        ms_process=bool(ms_process),
+        ms_side_scale=float(ms_side_scale),
 
         phase_blur=float(phase_blur),
         pb_start_hz=float(pb_start_hz),
         pb_end_hz=float(pb_end_hz),
         pb_harmonic_only=bool(pb_harmonic_only),
+
+        swish_repair=float(swish_repair),
+        swish_start_hz=float(swish_start_hz),
+        swish_end_hz=float(swish_end_hz),
+        swish_time_amt=float(swish_time_amt),
+        swish_freq_amt=float(swish_freq_amt),
+        hf_decorrelate=float(hf_decorrelate),
+        hf_dec_start_hz=float(hf_dec_start_hz),
+        hf_dec_end_hz=float(hf_dec_end_hz),
 
         hf_resynth=bool(hf_resynth),
         hf_lp_hz=float(hf_lp_hz),
@@ -478,6 +388,7 @@ def _build_params(
         hf_drive=float(hf_drive),
         hf_hp_hz=float(hf_hp_hz),
         hf_mix=float(hf_mix),
+        hf_confidence_blend=bool(hf_confidence_blend),
     )
 
     # LUFS: if user sets huge value, treat as disabled (match CLI convention)
@@ -561,6 +472,7 @@ def run_once(
     deq_time_floor: bool,
     deq_floor_smooth_ms: float,
     deq_floor_rise_db_per_s: float,
+    deq_floor_thr_db: float,
     # downward expander
     expander: bool,
     exp_start_hz: float,
@@ -576,11 +488,27 @@ def run_once(
     hpss_time_frames: int,
     hpss_freq_bins: int,
     hpss_harmonic_only: bool,
+    hpss_protect_percussive: float,
+    magnitude_inpaint: bool,
+    deq_inpaint: bool,
+    total_att_cap_db: float,
+    nuclear_mode: bool,
+    ms_process: bool,
+    ms_side_scale: float,
     # phase blur
     phase_blur: float,
     pb_start_hz: float,
     pb_end_hz: float,
     pb_harmonic_only: bool,
+    # swish repair (phase coherence)
+    swish_repair: float,
+    swish_start_hz: float,
+    swish_end_hz: float,
+    swish_time_amt: float,
+    swish_freq_amt: float,
+    hf_decorrelate: float,
+    hf_dec_start_hz: float,
+    hf_dec_end_hz: float,
     # nuclear HF resynthesis
     hf_resynth: bool,
     hf_lp_hz: float,
@@ -589,6 +517,7 @@ def run_once(
     hf_drive: float,
     hf_hp_hz: float,
     hf_mix: float,
+    hf_confidence_blend: bool,
     # mastering
     master_enabled: bool,
     hp_hz: float,
@@ -605,20 +534,22 @@ def run_once(
     spec_hop: int,
     spec_max_frames: int,
     spec_max_hz: float,
-) -> tuple[str, str, str, np.ndarray | None, np.ndarray | None, np.ndarray | None, str, dict[str, object]]:
+) -> tuple[
+    tuple[int, np.ndarray],
+    tuple[int, np.ndarray],
+    tuple[int, np.ndarray],
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    str,
+    dict[str, object],
+]:
     if audio_in is None:
         raise ValueError("Please load an audio file first.")
 
     sr, x = audio_in
     sr = int(sr)
     x = _to_float_audio(x)
-
-    # In full song mode, process the entire song; otherwise just the preview slice
-    if full_song_mode:
-        x_seg = x
-        s0, s1 = 0, x.shape[0]
-    else:
-        x_seg, s0, s1 = _slice_preview(x, sr, preview_t0, preview_dur)
 
     p, mp, dp = _build_params(
         start_hz=start_hz,
@@ -666,6 +597,7 @@ def run_once(
         deq_time_floor=deq_time_floor,
         deq_floor_smooth_ms=deq_floor_smooth_ms,
         deq_floor_rise_db_per_s=deq_floor_rise_db_per_s,
+        deq_floor_thr_db=deq_floor_thr_db,
         expander=expander,
         exp_start_hz=exp_start_hz,
         exp_end_hz=exp_end_hz,
@@ -679,10 +611,25 @@ def run_once(
         hpss_time_frames=hpss_time_frames,
         hpss_freq_bins=hpss_freq_bins,
         hpss_harmonic_only=hpss_harmonic_only,
+        hpss_protect_percussive=hpss_protect_percussive,
+        magnitude_inpaint=magnitude_inpaint,
+        deq_inpaint=deq_inpaint,
+        total_att_cap_db=total_att_cap_db,
+        nuclear_mode=nuclear_mode,
+        ms_process=ms_process,
+        ms_side_scale=ms_side_scale,
         phase_blur=phase_blur,
         pb_start_hz=pb_start_hz,
         pb_end_hz=pb_end_hz,
         pb_harmonic_only=pb_harmonic_only,
+        swish_repair=swish_repair,
+        swish_start_hz=swish_start_hz,
+        swish_end_hz=swish_end_hz,
+        swish_time_amt=swish_time_amt,
+        swish_freq_amt=swish_freq_amt,
+        hf_decorrelate=hf_decorrelate,
+        hf_dec_start_hz=hf_dec_start_hz,
+        hf_dec_end_hz=hf_dec_end_hz,
         hf_resynth=hf_resynth,
         hf_lp_hz=hf_lp_hz,
         hf_src_lo_hz=hf_src_lo_hz,
@@ -690,6 +637,7 @@ def run_once(
         hf_drive=hf_drive,
         hf_hp_hz=hf_hp_hz,
         hf_mix=hf_mix,
+        hf_confidence_blend=hf_confidence_blend,
         master_enabled=master_enabled,
         hp_hz=hp_hz,
         target_lufs=target_lufs,
@@ -706,65 +654,72 @@ def run_once(
         spec_max_hz=spec_max_hz,
     )
 
-    y, info = process_audio(x_seg, sr, params=p, master_params=mp, debug_params=dp)
-    y2 = _to_float_audio(y)
-
-    # If delta_listen is enabled, master.py returns removed-only (input - processed).
-    if bool(delta_listen):
-        removed = y2
-        processed = _to_float_audio(x_seg[: removed.shape[0], :] - removed)
-        out_sig = removed
-        aux_sig = processed
-        if full_song_mode:
-            out_title = "Full song: removed-only"
-            aux_title = "Full song: processed"
-        else:
-            out_title = "Preview: removed-only (loop)"
-            aux_title = "Preview: processed (loop)"
-    else:
-        processed = y2
-        removed = (x_seg[: processed.shape[0], :] - processed).astype(np.float32)
-        out_sig = processed
-        aux_sig = removed
-        if full_song_mode:
-            out_title = "Full song: output"
-            aux_title = "Full song: diff / removed"
-        else:
-            out_title = "Preview: output (loop)"
-            aux_title = "Preview: diff / removed (loop)"
-
-    # Make loop seam smoother (rotate+crossfade) for playback - skip for full song mode
     if full_song_mode:
-        # No crossfade for full song - just use the audio as-is
+        y, info = process_audio(x, sr, params=p, master_params=mp, debug_params=dp)
+        y2 = _to_float_audio(y)
+        n = min(x.shape[0], y2.shape[0])
+        x_seg = x[:n, :]
+        if bool(delta_listen):
+            removed = y2[:n, :]
+            processed = _to_float_audio(x_seg - removed)
+            out_sig = removed
+            aux_sig = processed
+        else:
+            processed = y2[:n, :]
+            removed = (x_seg - processed).astype(np.float32)
+            out_sig = processed
+            aux_sig = removed
         x_play = x_seg
         out_play = out_sig
         aux_play = aux_sig
-        in_title = "Full song: input"
-        do_loop = False
+        mode_note = (
+            f"\n\n**Full song mode** — processed {n / sr:.1f}s. "
+            "Spectrograms are downsampled; use *Render full & generate downloads* for WAV exports."
+        )
     else:
+        x_seg, s0, s1 = _slice_preview(x, sr, preview_t0, preview_dur)
+        x_ctx, target_s0, target_s1, ctx_s0 = slice_with_context(
+            x, sr, preview_t0, preview_dur, params=p,
+        )
+        y_ctx, info = process_audio(x_ctx, sr, params=p, master_params=mp, debug_params=dp)
+        trim0 = target_s0 - ctx_s0
+        trim1 = target_s1 - ctx_s0
+        y = np.asarray(y_ctx)[trim0:trim1]
+        y2 = _to_float_audio(y)
+
+        if bool(delta_listen):
+            removed = y2
+            processed = _to_float_audio(x_seg[: removed.shape[0], :] - removed)
+            out_sig = removed
+            aux_sig = processed
+        else:
+            processed = y2
+            removed = (x_seg[: processed.shape[0], :] - processed).astype(np.float32)
+            out_sig = processed
+            aux_sig = removed
+
         x_play = _loop_crossfade_rotate(x_seg, sr, loop_xfade_ms)
         out_play = _loop_crossfade_rotate(out_sig, sr, loop_xfade_ms)
         aux_play = _loop_crossfade_rotate(aux_sig, sr, loop_xfade_ms)
-        in_title = "Preview: input (loop)"
-        do_loop = True
+        mode_note = ""
 
     # Spectrograms
     in_png = _spectrogram_png_bytes(x_seg, sr, n_fft=int(spec_n_fft), hop=int(spec_hop), max_frames=int(spec_max_frames), max_hz=float(spec_max_hz))
     out_png = _spectrogram_png_bytes(out_sig, sr, n_fft=int(spec_n_fft), hop=int(spec_hop), max_frames=int(spec_max_frames), max_hz=float(spec_max_hz))
     diff_png = _spectrogram_png_bytes(aux_sig, sr, n_fft=int(spec_n_fft), hop=int(spec_hop), max_frames=int(spec_max_frames), max_hz=float(spec_max_hz))
 
-    metrics_md = _render_metrics_md(info)
+    metrics_md = _render_metrics_md(info) + mode_note
     params_json: dict[str, object] = {"params": asdict(p), "master_params": asdict(mp)}
 
     return (
-        _audio_player_html(in_title, _audio_to_wav_data_uri(x_play, sr), autoplay=False, loop=do_loop, player_id="deshimmer_input"),
-        _audio_player_html(out_title, _audio_to_wav_data_uri(out_play, sr), autoplay=True, loop=do_loop, player_id="deshimmer_output"),
-        _audio_player_html(aux_title, _audio_to_wav_data_uri(aux_play, sr), autoplay=False, loop=do_loop, player_id="deshimmer_diff"),
+        _gradio_audio(x_play, sr),
+        _gradio_audio(out_play, sr),
+        _gradio_audio(aux_play, sr),
         _png_bytes_to_rgb(in_png),
         _png_bytes_to_rgb(out_png),
         _png_bytes_to_rgb(diff_png),
         metrics_md,
-        params_json,  # dict shown in JSON component
+        params_json,
     )
 
 
@@ -816,6 +771,7 @@ def render_full_to_files(
     deq_time_floor: bool,
     deq_floor_smooth_ms: float,
     deq_floor_rise_db_per_s: float,
+    deq_floor_thr_db: float,
     # downward expander
     expander: bool,
     exp_start_hz: float,
@@ -831,11 +787,27 @@ def render_full_to_files(
     hpss_time_frames: int,
     hpss_freq_bins: int,
     hpss_harmonic_only: bool,
+    hpss_protect_percussive: float,
+    magnitude_inpaint: bool,
+    deq_inpaint: bool,
+    total_att_cap_db: float,
+    nuclear_mode: bool,
+    ms_process: bool,
+    ms_side_scale: float,
     # phase blur
     phase_blur: float,
     pb_start_hz: float,
     pb_end_hz: float,
     pb_harmonic_only: bool,
+    # swish repair (phase coherence)
+    swish_repair: float,
+    swish_start_hz: float,
+    swish_end_hz: float,
+    swish_time_amt: float,
+    swish_freq_amt: float,
+    hf_decorrelate: float,
+    hf_dec_start_hz: float,
+    hf_dec_end_hz: float,
     # nuclear HF resynthesis
     hf_resynth: bool,
     hf_lp_hz: float,
@@ -844,6 +816,7 @@ def render_full_to_files(
     hf_drive: float,
     hf_hp_hz: float,
     hf_mix: float,
+    hf_confidence_blend: bool,
     master_enabled: bool,
     hp_hz: float,
     target_lufs: float,
@@ -913,6 +886,7 @@ def render_full_to_files(
         deq_time_floor=deq_time_floor,
         deq_floor_smooth_ms=deq_floor_smooth_ms,
         deq_floor_rise_db_per_s=deq_floor_rise_db_per_s,
+        deq_floor_thr_db=deq_floor_thr_db,
         expander=expander,
         exp_start_hz=exp_start_hz,
         exp_end_hz=exp_end_hz,
@@ -926,10 +900,25 @@ def render_full_to_files(
         hpss_time_frames=hpss_time_frames,
         hpss_freq_bins=hpss_freq_bins,
         hpss_harmonic_only=hpss_harmonic_only,
+        hpss_protect_percussive=hpss_protect_percussive,
+        magnitude_inpaint=magnitude_inpaint,
+        deq_inpaint=deq_inpaint,
+        total_att_cap_db=total_att_cap_db,
+        nuclear_mode=nuclear_mode,
+        ms_process=ms_process,
+        ms_side_scale=ms_side_scale,
         phase_blur=phase_blur,
         pb_start_hz=pb_start_hz,
         pb_end_hz=pb_end_hz,
         pb_harmonic_only=pb_harmonic_only,
+        swish_repair=swish_repair,
+        swish_start_hz=swish_start_hz,
+        swish_end_hz=swish_end_hz,
+        swish_time_amt=swish_time_amt,
+        swish_freq_amt=swish_freq_amt,
+        hf_decorrelate=hf_decorrelate,
+        hf_dec_start_hz=hf_dec_start_hz,
+        hf_dec_end_hz=hf_dec_end_hz,
         hf_resynth=hf_resynth,
         hf_lp_hz=hf_lp_hz,
         hf_src_lo_hz=hf_src_lo_hz,
@@ -937,6 +926,7 @@ def render_full_to_files(
         hf_drive=hf_drive,
         hf_hp_hz=hf_hp_hz,
         hf_mix=hf_mix,
+        hf_confidence_blend=hf_confidence_blend,
         master_enabled=master_enabled,
         hp_hz=hp_hz,
         target_lufs=target_lufs,
@@ -1009,16 +999,32 @@ def _params_to_slider_tuple(p: master.Params, mp: master.MasterParams) -> tuple[
         float(p.deq_persist_ms), float(p.deq_persist_thr_db),
         int(p.deq_freq_smooth_bins), float(p.deq_tonal_boost_db),
         bool(p.deq_time_floor), float(p.deq_floor_smooth_ms),
-        float(p.deq_floor_rise_db_per_s),
+        float(p.deq_floor_rise_db_per_s), float(p.deq_floor_thr_db),
         bool(p.expander), float(p.exp_start_hz), float(p.exp_end_hz),
         float(p.exp_threshold_db), float(p.exp_ratio),
         float(p.exp_attack_ms), float(p.exp_release_ms),
         bool(p.hpss), float(p.hpss_start_hz), float(p.hpss_end_hz),
         int(p.hpss_time_frames), int(p.hpss_freq_bins), bool(p.hpss_harmonic_only),
+        float(getattr(p, "hpss_protect_percussive", 0.0)),
+        bool(getattr(p, "magnitude_inpaint", True)),
+        bool(getattr(p, "deq_inpaint", True)),
+        float(getattr(p, "total_att_cap_db", 12.0)),
+        bool(getattr(p, "nuclear_mode", False)),
+        bool(getattr(p, "ms_process", False)),
+        float(getattr(p, "ms_side_scale", 0.35)),
         float(p.phase_blur), float(p.pb_start_hz), float(p.pb_end_hz),
         bool(p.pb_harmonic_only),
+        float(getattr(p, "swish_repair", 0.0)),
+        float(getattr(p, "swish_start_hz", 3500.0)),
+        float(getattr(p, "swish_end_hz", 14000.0)),
+        float(getattr(p, "swish_time_amt", 0.55)),
+        float(getattr(p, "swish_freq_amt", 0.30)),
+        float(getattr(p, "hf_decorrelate", 0.0)),
+        float(getattr(p, "hf_dec_start_hz", 4500.0)),
+        float(getattr(p, "hf_dec_end_hz", 16000.0)),
         bool(p.hf_resynth), float(p.hf_lp_hz), float(p.hf_src_lo_hz),
         float(p.hf_src_hi_hz), float(p.hf_drive), float(p.hf_hp_hz), float(p.hf_mix),
+        bool(getattr(p, "hf_confidence_blend", True)),
         bool(mp.enabled), float(mp.hp_hz), float(target_lufs_v),
         float(mp.target_rms_dbfs if mp.target_rms_dbfs is not None else -16.0),
         float(mp.norm_max_gain_db), float(mp.norm_max_atten_db),
@@ -1194,6 +1200,7 @@ def build_ui() -> Any:
                 "deq_time_floor": True,
                 "deq_floor_smooth_ms": 80.0,
                 "deq_floor_rise_db_per_s": 1.0,
+                "deq_floor_thr_db": 3.0,
                 # Denoise for the 'carpet'
                 "denoise": 0.8,
                 "dn_start_hz": 3000.0,
@@ -1215,10 +1222,6 @@ def build_ui() -> Any:
     all_presets.update(_load_user_presets(USER_PRESETS_PATH))
 
     with gr.Blocks(title="Deshimmer - master.py UI") as demo:
-        # Inject global JavaScript for audio position preservation (runs once)
-        # Note: This is invisible but must not use visible=False or script won't execute
-        gr.HTML(_AUDIO_POSITION_SCRIPT)
-        
         gr.Markdown(
             "## Deshimmer UI (master.py)\n"
             "Load a file, pick a preview region, tweak knobs, then listen to input/output/diff and inspect spectrograms."
@@ -1233,9 +1236,9 @@ def build_ui() -> Any:
             audio_in = gr.Audio(label="Input audio", type="numpy")
             with gr.Column():
                 full_song_mode = gr.Checkbox(
-                    value=False, 
+                    value=False,
                     label="Full Song Mode",
-                    info="Process the entire song instead of a short preview. Slower but lets you hear the effect on the whole track."
+                    info="Process and play back the entire track in the players below (slower). Preview start/duration are ignored. For WAV exports, use Render full & generate downloads.",
                 )
                 preview_t0 = gr.Slider(
                     0.0, 600.0, value=0.0, step=0.05, 
@@ -1252,12 +1255,12 @@ def build_ui() -> Any:
                     label="Loop crossfade (ms)",
                     info="Smooth the loop point so it doesn't click. Higher = smoother loop but slightly alters the audio."
                 )
-                run_btn = gr.Button("Run preview")
+                run_btn = gr.Button("Run preview / full song")
 
         with gr.Row():
-            a_in = gr.HTML()
-            a_out = gr.HTML()
-            a_diff = gr.HTML()
+            a_in = gr.Audio(label="Input", type="numpy", interactive=False)
+            a_out = gr.Audio(label="Output", type="numpy", interactive=False, autoplay=True)
+            a_diff = gr.Audio(label="Diff / removed", type="numpy", interactive=False)
 
         with gr.Row():
             im_in = gr.Image(label="Spectrogram: input", type="numpy")
@@ -1301,7 +1304,7 @@ def build_ui() -> Any:
                     info="When on, the current preview start/duration is locked in as one of the auto regions.",
                 )
                 auto_n_regions = gr.Slider(
-                    1, 4, value=3, step=1,
+                    1, 8, value=5, step=1,
                     label="Number of regions",
                     info="How many short windows to sample (auto-picks quiet/loud/transient).",
                 )
@@ -1560,6 +1563,11 @@ def build_ui() -> Any:
                     label="Floor rise rate (dB/s)",
                     info="How fast the floor estimate can rise. Lower = stricter about what counts as 'always on'."
                 )
+                deq_floor_thr_db = gr.Slider(
+                    0.0, 12.0, value=3.0, step=0.1,
+                    label="Floor excess threshold (dB)",
+                    info="How many dB above the local frequency floor a stationary bin must sit before de-resonance acts."
+                )
 
         with gr.Accordion("🔬 Advanced Tools (experimental - use with caution)", open=False):
             gr.Markdown("*These are more aggressive/experimental tools. Most users won't need them.*")
@@ -1636,6 +1644,45 @@ def build_ui() -> Any:
                     label="Frequency window",
                     info="Median filter over frequency. Larger = better separation but less precise."
                 )
+                hpss_protect_percussive = gr.Slider(
+                    0.0, 1.0, value=0.0, step=0.05,
+                    label="Protect percussive (0–1)",
+                    info="Reduce repair depth on percussive bins. 0 = off, 1 = strong cymbal/snare protection."
+                )
+
+            gr.Markdown("**Repair philosophy** — inpainting, combined cap, Mid/Side")
+            with gr.Row():
+                magnitude_inpaint = gr.Checkbox(
+                    value=True,
+                    label="Magnitude inpainting (shimmer)",
+                    info="Cap spikes to local median instead of pure attenuation (preserves air)."
+                )
+                deq_inpaint = gr.Checkbox(
+                    value=True,
+                    label="Magnitude inpainting (de-res)",
+                    info="Same inpainting approach for persistent resonances."
+                )
+                ms_process = gr.Checkbox(
+                    value=False,
+                    label="Mid/Side processing",
+                    info="Apply full repair on Mid; scale repair on Side to preserve stereo width."
+                )
+            with gr.Row():
+                total_att_cap_db = gr.Slider(
+                    3.0, 24.0, value=12.0, step=0.5,
+                    label="Combined attenuation cap (dB)",
+                    info="Max product attenuation per bin across denoise/deq/shimmer/expander."
+                )
+                ms_side_scale = gr.Slider(
+                    0.0, 1.0, value=0.35, step=0.05,
+                    label="Side channel repair scale",
+                    info="When Mid/Side is on, Side gets this fraction of repair depth."
+                )
+                nuclear_mode = gr.Checkbox(
+                    value=False,
+                    label="Nuclear mode (disable cap)",
+                    info="Disables combined attenuation cap. Use with HF resynth only when desperate."
+                )
 
             gr.Markdown("**Phase Blur** - Soften harsh textures by randomizing phase")
             with gr.Row():
@@ -1661,6 +1708,49 @@ def build_ui() -> Any:
                     info="Upper limit for phase blur."
                 )
 
+            gr.Markdown("**Swish Repair** — adaptive phase coherence for moving AI 'swish' (not EQ-able)")
+            with gr.Row():
+                swish_repair = gr.Slider(
+                    0.0, 1.0, value=0.0, step=0.01,
+                    label="Swish repair amount",
+                    info="Smooths erratic inter-frame/inter-bin phase where instability is high. Start ~0.3–0.5 on tonal AI material.",
+                )
+                swish_time_amt = gr.Slider(
+                    0.0, 1.0, value=0.55, step=0.01,
+                    label="Inter-frame smoothing",
+                    info="Time-axis phase coherence (targets moving swish).",
+                )
+                swish_freq_amt = gr.Slider(
+                    0.0, 1.0, value=0.30, step=0.01,
+                    label="Inter-bin smoothing",
+                    info="Frequency-axis phase coherence.",
+                )
+            with gr.Row():
+                swish_start_hz = gr.Number(
+                    value=3500.0,
+                    label="Swish band start (Hz)",
+                    info="Lower edge for phase repair.",
+                )
+                swish_end_hz = gr.Number(
+                    value=14000.0,
+                    label="Swish band end (Hz)",
+                    info="Upper edge for phase repair.",
+                )
+            with gr.Row():
+                hf_decorrelate = gr.Slider(
+                    0.0, 1.0, value=0.0, step=0.01,
+                    label="HF decorrelate",
+                    info="Break synthetic L/R phase lock in upper band. Try 0.15–0.35 on stereo AI exports.",
+                )
+                hf_dec_start_hz = gr.Number(
+                    value=4500.0,
+                    label="Decorrelate start (Hz)",
+                )
+                hf_dec_end_hz = gr.Number(
+                    value=16000.0,
+                    label="Decorrelate end (Hz)",
+                )
+
             gr.Markdown("**HF Resynthesis** - Nuclear option: remove HF entirely and regenerate from lower frequencies")
             with gr.Row():
                 hf_resynth = gr.Checkbox(
@@ -1672,6 +1762,11 @@ def build_ui() -> Any:
                     0.0, 1.0, value=0.35, step=0.01, 
                     label="Mix amount",
                     info="How much regenerated HF to blend in. Lower = subtler."
+                )
+                hf_confidence_blend = gr.Checkbox(
+                    value=True,
+                    label="Confidence-masked blend",
+                    info="Only resynthesize HF where artifact confidence is high."
                 )
             with gr.Row():
                 hf_lp_hz = gr.Number(
@@ -1832,6 +1927,7 @@ def build_ui() -> Any:
                 g("deq_time_floor", deq_time_floor.value),
                 g("deq_floor_smooth_ms", deq_floor_smooth_ms.value),
                 g("deq_floor_rise_db_per_s", deq_floor_rise_db_per_s.value),
+                g("deq_floor_thr_db", deq_floor_thr_db.value),
                 g("expander", expander.value),
                 g("exp_start_hz", exp_start_hz.value),
                 g("exp_end_hz", exp_end_hz.value),
@@ -1845,10 +1941,25 @@ def build_ui() -> Any:
                 g("hpss_time_frames", hpss_time_frames.value),
                 g("hpss_freq_bins", hpss_freq_bins.value),
                 g("hpss_harmonic_only", hpss_harmonic_only.value),
+                g("hpss_protect_percussive", hpss_protect_percussive.value),
+                g("magnitude_inpaint", magnitude_inpaint.value),
+                g("deq_inpaint", deq_inpaint.value),
+                g("total_att_cap_db", total_att_cap_db.value),
+                g("nuclear_mode", nuclear_mode.value),
+                g("ms_process", ms_process.value),
+                g("ms_side_scale", ms_side_scale.value),
                 g("phase_blur", phase_blur.value),
                 g("pb_start_hz", pb_start_hz.value),
                 g("pb_end_hz", pb_end_hz.value),
                 g("pb_harmonic_only", pb_harmonic_only.value),
+                g("swish_repair", swish_repair.value),
+                g("swish_start_hz", swish_start_hz.value),
+                g("swish_end_hz", swish_end_hz.value),
+                g("swish_time_amt", swish_time_amt.value),
+                g("swish_freq_amt", swish_freq_amt.value),
+                g("hf_decorrelate", hf_decorrelate.value),
+                g("hf_dec_start_hz", hf_dec_start_hz.value),
+                g("hf_dec_end_hz", hf_dec_end_hz.value),
                 g("hf_resynth", hf_resynth.value),
                 g("hf_lp_hz", hf_lp_hz.value),
                 g("hf_src_lo_hz", hf_src_lo_hz.value),
@@ -1856,6 +1967,7 @@ def build_ui() -> Any:
                 g("hf_drive", hf_drive.value),
                 g("hf_hp_hz", hf_hp_hz.value),
                 g("hf_mix", hf_mix.value),
+                g("hf_confidence_blend", hf_confidence_blend.value),
                 g("master_enabled", master_enabled.value),
                 g("hp_hz", hp_hz.value),
                 g("target_lufs", target_lufs.value),
@@ -1917,6 +2029,7 @@ def build_ui() -> Any:
             deq_time_floor,
             deq_floor_smooth_ms,
             deq_floor_rise_db_per_s,
+            deq_floor_thr_db,
             expander,
             exp_start_hz,
             exp_end_hz,
@@ -1930,10 +2043,25 @@ def build_ui() -> Any:
             hpss_time_frames,
             hpss_freq_bins,
             hpss_harmonic_only,
+            hpss_protect_percussive,
+            magnitude_inpaint,
+            deq_inpaint,
+            total_att_cap_db,
+            nuclear_mode,
+            ms_process,
+            ms_side_scale,
             phase_blur,
             pb_start_hz,
             pb_end_hz,
             pb_harmonic_only,
+            swish_repair,
+            swish_start_hz,
+            swish_end_hz,
+            swish_time_amt,
+            swish_freq_amt,
+            hf_decorrelate,
+            hf_dec_start_hz,
+            hf_dec_end_hz,
             hf_resynth,
             hf_lp_hz,
             hf_src_lo_hz,
@@ -1941,6 +2069,7 @@ def build_ui() -> Any:
             hf_drive,
             hf_hp_hz,
             hf_mix,
+            hf_confidence_blend,
             master_enabled,
             hp_hz,
             target_lufs,
@@ -2005,6 +2134,7 @@ def build_ui() -> Any:
             deq_time_floor,
             deq_floor_smooth_ms,
             deq_floor_rise_db_per_s,
+            deq_floor_thr_db,
             expander,
             exp_start_hz,
             exp_end_hz,
@@ -2018,10 +2148,25 @@ def build_ui() -> Any:
             hpss_time_frames,
             hpss_freq_bins,
             hpss_harmonic_only,
+            hpss_protect_percussive,
+            magnitude_inpaint,
+            deq_inpaint,
+            total_att_cap_db,
+            nuclear_mode,
+            ms_process,
+            ms_side_scale,
             phase_blur,
             pb_start_hz,
             pb_end_hz,
             pb_harmonic_only,
+            swish_repair,
+            swish_start_hz,
+            swish_end_hz,
+            swish_time_amt,
+            swish_freq_amt,
+            hf_decorrelate,
+            hf_dec_start_hz,
+            hf_dec_end_hz,
             hf_resynth,
             hf_lp_hz,
             hf_src_lo_hz,
@@ -2029,6 +2174,7 @@ def build_ui() -> Any:
             hf_drive,
             hf_hp_hz,
             hf_mix,
+            hf_confidence_blend,
             master_enabled,
             hp_hz,
             target_lufs,
@@ -2082,14 +2228,18 @@ def build_ui() -> Any:
                 "deq_thr_db", "deq_slope", "deq_max_att_db", "deq_density_lo",
                 "deq_density_hi", "deq_persist_ms", "deq_persist_thr_db",
                 "deq_freq_smooth_bins", "deq_tonal_boost_db", "deq_time_floor",
-                "deq_floor_smooth_ms", "deq_floor_rise_db_per_s",
+                "deq_floor_smooth_ms", "deq_floor_rise_db_per_s", "deq_floor_thr_db",
                 "expander", "exp_start_hz", "exp_end_hz", "exp_threshold_db",
                 "exp_ratio", "exp_attack_ms", "exp_release_ms",
                 "hpss", "hpss_start_hz", "hpss_end_hz", "hpss_time_frames",
-                "hpss_freq_bins", "hpss_harmonic_only",
+                "hpss_freq_bins", "hpss_harmonic_only", "hpss_protect_percussive",
+                "magnitude_inpaint", "deq_inpaint", "total_att_cap_db", "nuclear_mode",
+                "ms_process", "ms_side_scale",
                 "phase_blur", "pb_start_hz", "pb_end_hz", "pb_harmonic_only",
+                "swish_repair", "swish_start_hz", "swish_end_hz", "swish_time_amt", "swish_freq_amt",
+                "hf_decorrelate", "hf_dec_start_hz", "hf_dec_end_hz",
                 "hf_resynth", "hf_lp_hz", "hf_src_lo_hz", "hf_src_hi_hz",
-                "hf_drive", "hf_hp_hz", "hf_mix",
+                "hf_drive", "hf_hp_hz", "hf_mix", "hf_confidence_blend",
                 "master_enabled", "hp_hz", "target_lufs", "target_rms_dbfs",
                 "norm_max_gain_db", "norm_max_atten_db", "ceiling_dbtp",
                 "lim_lookahead_ms", "lim_release_ms", "tp_os",
@@ -2190,13 +2340,23 @@ def build_ui() -> Any:
             stages_md_lines.append(f"- Aggressiveness: **{float(aggressiveness_v):.2f}**, trials/stage: **{int(n_trials_v)}**, regions: {len(regions)}")
             stages_md_lines.append(f"- Final composite score: **{summary.get('final_score', 0.0):+.3f}**")
             for s in summary.get("stages", []):
-                stages_md_lines.append(f"- Stage **{s['stage']}**: best={s['best_score']:+.3f}")
+                stages_md_lines.append(f"- Stage **{s['stage']}**: pareto artifact={s['best_score']:+.3f}")
+                pareto = s.get("pareto", {})
+                if pareto:
+                    for mode in ("safe", "balanced", "aggressive"):
+                        pt = pareto.get(mode, {})
+                        vals = pt.get("values") or []
+                        if vals:
+                            stages_md_lines.append(
+                                f"  - **{mode}**: artifact={vals[0]:+.2f}, "
+                                f"music={-vals[1]:+.2f}, stereo={-vals[3]:+.2f}"
+                            )
                 bp = s.get("best_params", {})
                 if bp:
                     bp_s = ", ".join(f"`{k}`={v:.3g}" if isinstance(v, float) else f"`{k}`={v}" for k, v in bp.items())
                     stages_md_lines.append(f"  - {bp_s}")
             stages_md_lines.append("")
-            stages_md_lines.append("_(Higher score = better. Sliders below have been updated; press Run preview to listen.)_")
+            stages_md_lines.append("_(Pareto NSGA-II: balanced candidate applied to sliders. safe/aggressive listed for reference.)_")
             return tuple(list(_params_to_slider_tuple(new_p, base_mp)) + ["\n".join(stages_md_lines)])
 
         # Build the input lists for the two buttons. Layout:
@@ -2283,6 +2443,7 @@ def build_ui() -> Any:
             deq_time_floor,
             deq_floor_smooth_ms,
             deq_floor_rise_db_per_s,
+            deq_floor_thr_db,
             expander,
             exp_start_hz,
             exp_end_hz,
@@ -2296,10 +2457,25 @@ def build_ui() -> Any:
             hpss_time_frames,
             hpss_freq_bins,
             hpss_harmonic_only,
+            hpss_protect_percussive,
+            magnitude_inpaint,
+            deq_inpaint,
+            total_att_cap_db,
+            nuclear_mode,
+            ms_process,
+            ms_side_scale,
             phase_blur,
             pb_start_hz,
             pb_end_hz,
             pb_harmonic_only,
+            swish_repair,
+            swish_start_hz,
+            swish_end_hz,
+            swish_time_amt,
+            swish_freq_amt,
+            hf_decorrelate,
+            hf_dec_start_hz,
+            hf_dec_end_hz,
             hf_resynth,
             hf_lp_hz,
             hf_src_lo_hz,
@@ -2307,6 +2483,7 @@ def build_ui() -> Any:
             hf_drive,
             hf_hp_hz,
             hf_mix,
+            hf_confidence_blend,
             master_enabled,
             hp_hz,
             target_lufs,
@@ -2371,6 +2548,7 @@ def build_ui() -> Any:
             deq_time_floor,
             deq_floor_smooth_ms,
             deq_floor_rise_db_per_s,
+            deq_floor_thr_db,
             expander,
             exp_start_hz,
             exp_end_hz,
@@ -2384,10 +2562,25 @@ def build_ui() -> Any:
             hpss_time_frames,
             hpss_freq_bins,
             hpss_harmonic_only,
+            hpss_protect_percussive,
+            magnitude_inpaint,
+            deq_inpaint,
+            total_att_cap_db,
+            nuclear_mode,
+            ms_process,
+            ms_side_scale,
             phase_blur,
             pb_start_hz,
             pb_end_hz,
             pb_harmonic_only,
+            swish_repair,
+            swish_start_hz,
+            swish_end_hz,
+            swish_time_amt,
+            swish_freq_amt,
+            hf_decorrelate,
+            hf_dec_start_hz,
+            hf_dec_end_hz,
             hf_resynth,
             hf_lp_hz,
             hf_src_lo_hz,
@@ -2395,6 +2588,7 @@ def build_ui() -> Any:
             hf_drive,
             hf_hp_hz,
             hf_mix,
+            hf_confidence_blend,
             master_enabled,
             hp_hz,
             target_lufs,
@@ -2461,6 +2655,7 @@ def build_ui() -> Any:
             deq_time_floor_v: object,
             deq_floor_smooth_ms_v: object,
             deq_floor_rise_db_per_s_v: object,
+            deq_floor_thr_db_v: object,
             expander_v: object,
             exp_start_hz_v: object,
             exp_end_hz_v: object,
@@ -2474,10 +2669,25 @@ def build_ui() -> Any:
             hpss_time_frames_v: object,
             hpss_freq_bins_v: object,
             hpss_harmonic_only_v: object,
+            hpss_protect_percussive_v: object,
+            magnitude_inpaint_v: object,
+            deq_inpaint_v: object,
+            total_att_cap_db_v: object,
+            nuclear_mode_v: object,
+            ms_process_v: object,
+            ms_side_scale_v: object,
             phase_blur_v: object,
             pb_start_hz_v: object,
             pb_end_hz_v: object,
             pb_harmonic_only_v: object,
+            swish_repair_v: object,
+            swish_start_hz_v: object,
+            swish_end_hz_v: object,
+            swish_time_amt_v: object,
+            swish_freq_amt_v: object,
+            hf_decorrelate_v: object,
+            hf_dec_start_hz_v: object,
+            hf_dec_end_hz_v: object,
             hf_resynth_v: object,
             hf_lp_hz_v: object,
             hf_src_lo_hz_v: object,
@@ -2485,6 +2695,7 @@ def build_ui() -> Any:
             hf_drive_v: object,
             hf_hp_hz_v: object,
             hf_mix_v: object,
+            hf_confidence_blend_v: object,
             master_enabled_v: object,
             hp_hz_v: object,
             target_lufs_v: object,
@@ -2547,6 +2758,7 @@ def build_ui() -> Any:
                 "deq_time_floor": bool(deq_time_floor_v),
                 "deq_floor_smooth_ms": float(deq_floor_smooth_ms_v),
                 "deq_floor_rise_db_per_s": float(deq_floor_rise_db_per_s_v),
+                "deq_floor_thr_db": float(deq_floor_thr_db_v),
                 "expander": bool(expander_v),
                 "exp_start_hz": float(exp_start_hz_v),
                 "exp_end_hz": float(exp_end_hz_v),
@@ -2560,10 +2772,25 @@ def build_ui() -> Any:
                 "hpss_time_frames": int(hpss_time_frames_v),
                 "hpss_freq_bins": int(hpss_freq_bins_v),
                 "hpss_harmonic_only": bool(hpss_harmonic_only_v),
+                "hpss_protect_percussive": float(hpss_protect_percussive_v),
+                "magnitude_inpaint": bool(magnitude_inpaint_v),
+                "deq_inpaint": bool(deq_inpaint_v),
+                "total_att_cap_db": float(total_att_cap_db_v),
+                "nuclear_mode": bool(nuclear_mode_v),
+                "ms_process": bool(ms_process_v),
+                "ms_side_scale": float(ms_side_scale_v),
                 "phase_blur": float(phase_blur_v),
                 "pb_start_hz": float(pb_start_hz_v),
                 "pb_end_hz": float(pb_end_hz_v),
                 "pb_harmonic_only": bool(pb_harmonic_only_v),
+                "swish_repair": float(swish_repair_v),
+                "swish_start_hz": float(swish_start_hz_v),
+                "swish_end_hz": float(swish_end_hz_v),
+                "swish_time_amt": float(swish_time_amt_v),
+                "swish_freq_amt": float(swish_freq_amt_v),
+                "hf_decorrelate": float(hf_decorrelate_v),
+                "hf_dec_start_hz": float(hf_dec_start_hz_v),
+                "hf_dec_end_hz": float(hf_dec_end_hz_v),
                 "hf_resynth": bool(hf_resynth_v),
                 "hf_lp_hz": float(hf_lp_hz_v),
                 "hf_src_lo_hz": float(hf_src_lo_hz_v),
@@ -2571,6 +2798,7 @@ def build_ui() -> Any:
                 "hf_drive": float(hf_drive_v),
                 "hf_hp_hz": float(hf_hp_hz_v),
                 "hf_mix": float(hf_mix_v),
+                "hf_confidence_blend": bool(hf_confidence_blend_v),
                 "master_enabled": bool(master_enabled_v),
                 "hp_hz": float(hp_hz_v),
                 "target_lufs": float(target_lufs_v),
@@ -2635,6 +2863,7 @@ def build_ui() -> Any:
             deq_time_floor,
             deq_floor_smooth_ms,
             deq_floor_rise_db_per_s,
+            deq_floor_thr_db,
             expander,
             exp_start_hz,
             exp_end_hz,
@@ -2648,10 +2877,25 @@ def build_ui() -> Any:
             hpss_time_frames,
             hpss_freq_bins,
             hpss_harmonic_only,
+            hpss_protect_percussive,
+            magnitude_inpaint,
+            deq_inpaint,
+            total_att_cap_db,
+            nuclear_mode,
+            ms_process,
+            ms_side_scale,
             phase_blur,
             pb_start_hz,
             pb_end_hz,
             pb_harmonic_only,
+            swish_repair,
+            swish_start_hz,
+            swish_end_hz,
+            swish_time_amt,
+            swish_freq_amt,
+            hf_decorrelate,
+            hf_dec_start_hz,
+            hf_dec_end_hz,
             hf_resynth,
             hf_lp_hz,
             hf_src_lo_hz,
@@ -2659,6 +2903,7 @@ def build_ui() -> Any:
             hf_drive,
             hf_hp_hz,
             hf_mix,
+            hf_confidence_blend,
             master_enabled,
             hp_hz,
             target_lufs,
@@ -2723,6 +2968,7 @@ def build_ui() -> Any:
             deq_time_floor_v: object,
             deq_floor_smooth_ms_v: object,
             deq_floor_rise_db_per_s_v: object,
+            deq_floor_thr_db_v: object,
             expander_v: object,
             exp_start_hz_v: object,
             exp_end_hz_v: object,
@@ -2736,10 +2982,25 @@ def build_ui() -> Any:
             hpss_time_frames_v: object,
             hpss_freq_bins_v: object,
             hpss_harmonic_only_v: object,
+            hpss_protect_percussive_v: object,
+            magnitude_inpaint_v: object,
+            deq_inpaint_v: object,
+            total_att_cap_db_v: object,
+            nuclear_mode_v: object,
+            ms_process_v: object,
+            ms_side_scale_v: object,
             phase_blur_v: object,
             pb_start_hz_v: object,
             pb_end_hz_v: object,
             pb_harmonic_only_v: object,
+            swish_repair_v: object,
+            swish_start_hz_v: object,
+            swish_end_hz_v: object,
+            swish_time_amt_v: object,
+            swish_freq_amt_v: object,
+            hf_decorrelate_v: object,
+            hf_dec_start_hz_v: object,
+            hf_dec_end_hz_v: object,
             hf_resynth_v: object,
             hf_lp_hz_v: object,
             hf_src_lo_hz_v: object,
@@ -2747,6 +3008,7 @@ def build_ui() -> Any:
             hf_drive_v: object,
             hf_hp_hz_v: object,
             hf_mix_v: object,
+            hf_confidence_blend_v: object,
             master_enabled_v: object,
             hp_hz_v: object,
             target_lufs_v: object,
@@ -2807,6 +3069,7 @@ def build_ui() -> Any:
                 deq_time_floor=bool(deq_time_floor_v),
                 deq_floor_smooth_ms=float(deq_floor_smooth_ms_v),
                 deq_floor_rise_db_per_s=float(deq_floor_rise_db_per_s_v),
+                deq_floor_thr_db=float(deq_floor_thr_db_v),
                 expander=bool(expander_v),
                 exp_start_hz=float(exp_start_hz_v),
                 exp_end_hz=float(exp_end_hz_v),
@@ -2820,10 +3083,25 @@ def build_ui() -> Any:
                 hpss_time_frames=int(hpss_time_frames_v),
                 hpss_freq_bins=int(hpss_freq_bins_v),
                 hpss_harmonic_only=bool(hpss_harmonic_only_v),
+                hpss_protect_percussive=float(hpss_protect_percussive_v),
+                magnitude_inpaint=bool(magnitude_inpaint_v),
+                deq_inpaint=bool(deq_inpaint_v),
+                total_att_cap_db=float(total_att_cap_db_v),
+                nuclear_mode=bool(nuclear_mode_v),
+                ms_process=bool(ms_process_v),
+                ms_side_scale=float(ms_side_scale_v),
                 phase_blur=float(phase_blur_v),
                 pb_start_hz=float(pb_start_hz_v),
                 pb_end_hz=float(pb_end_hz_v),
                 pb_harmonic_only=bool(pb_harmonic_only_v),
+                swish_repair=float(swish_repair_v),
+                swish_start_hz=float(swish_start_hz_v),
+                swish_end_hz=float(swish_end_hz_v),
+                swish_time_amt=float(swish_time_amt_v),
+                swish_freq_amt=float(swish_freq_amt_v),
+                hf_decorrelate=float(hf_decorrelate_v),
+                hf_dec_start_hz=float(hf_dec_start_hz_v),
+                hf_dec_end_hz=float(hf_dec_end_hz_v),
                 hf_resynth=bool(hf_resynth_v),
                 hf_lp_hz=float(hf_lp_hz_v),
                 hf_src_lo_hz=float(hf_src_lo_hz_v),
@@ -2831,6 +3109,7 @@ def build_ui() -> Any:
                 hf_drive=float(hf_drive_v),
                 hf_hp_hz=float(hf_hp_hz_v),
                 hf_mix=float(hf_mix_v),
+                hf_confidence_blend=bool(hf_confidence_blend_v),
                 master_enabled=bool(master_enabled_v),
                 hp_hz=float(hp_hz_v),
                 target_lufs=float(target_lufs_v),

@@ -19,6 +19,51 @@ import numpy as np
 import master as _m
 
 
+def preview_context_seconds(params: Optional[_m.Params] = None) -> float:
+    """Lead-in/out duration so preview/refine match full-track stateful DSP."""
+    p = params if params is not None else _m.Params()
+    return max(
+        1.5,
+        2.0 * float(getattr(p, "deq_persist_ms", 600.0)) / 1000.0,
+        2.0 * float(getattr(p, "dn_minwin_ms", 300.0)) / 1000.0,
+    )
+
+
+def _slice_samples(x: np.ndarray, sr: int, t0: float, dur: float) -> tuple[np.ndarray, int, int]:
+    n = x.shape[0]
+    s0 = int(round(max(0.0, t0) * sr))
+    s1 = int(round(max(0.0, t0 + dur) * sr))
+    s0 = max(0, min(n, s0))
+    s1 = max(s0, min(n, s1))
+    if x.ndim == 1:
+        return x[s0:s1], s0, s1
+    return x[s0:s1, :], s0, s1
+
+
+def slice_with_context(
+    x: np.ndarray,
+    sr: int,
+    t0: float,
+    dur: float,
+    *,
+    context_s: Optional[float] = None,
+    params: Optional[_m.Params] = None,
+) -> tuple[np.ndarray, int, int, int]:
+    """
+    Slice audio with temporal context for stateful processing.
+
+    Returns (x_ctx, target_s0, target_s1, ctx_s0) where target_* are sample
+    indices in the original x for the requested [t0, t0+dur) window.
+    Trim processed output with y[target_s0 - ctx_s0 : target_s1 - ctx_s0].
+    """
+    ctx = preview_context_seconds(params) if context_s is None else float(context_s)
+    ctx_t0 = max(0.0, float(t0) - ctx)
+    ctx_dur = float(dur) + 2.0 * ctx
+    x_ctx, ctx_s0, _ = _slice_samples(x, sr, ctx_t0, ctx_dur)
+    _, target_s0, target_s1 = _slice_samples(x, sr, t0, dur)
+    return x_ctx, target_s0, target_s1, ctx_s0
+
+
 def process_audio(
     x: np.ndarray,
     sr: int,
@@ -97,7 +142,7 @@ def process_audio(
     # ---- STFT repair ----
     y_repaired = _m.process_stft(x2, sr, p, dbg=dbg_collector)
     # Optional "nuclear" HF resynthesis
-    y_repaired = _m.hf_resynth_post(y_repaired, sr, p)
+    y_repaired = _m.hf_resynth_post(y_repaired, sr, p, artifact_conf=_m._LAST_ARTIFACT_CONF_FRAMES)
     y_rep_2d = _m._as_2d(y_repaired)
     info["measure_after_repair"] = {
         "sample_peak_dbfs": float(_m._lin_to_db(np.max(np.abs(y_rep_2d)) + 1e-12)),
