@@ -10,7 +10,7 @@ truth" and only re-exports the types/functions we need.
 
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
@@ -71,6 +71,7 @@ def process_audio(
     params: Optional[_m.Params] = None,
     master_params: Optional[_m.MasterParams] = None,
     debug_params: Optional[_m.DebugParams] = None,
+    include_residuals: bool = False,
 ) -> Tuple[np.ndarray, Dict[str, Any]]:
     """
     Process audio and return (y_out, info).
@@ -80,6 +81,11 @@ def process_audio(
     - params/master_params/debug_params: optional dataclass instances
 
     info includes measurements and (if debug enabled) a debug_dir or debug blobs.
+    With include_residuals, info["residuals"] contains artifact_repair_diff
+    (a separate render without engineering/mastering) and total_enhancement_diff
+    (input minus final output). This costs one additional repair pass when
+    engineering is enabled. Their difference includes interactions between stages.
+    delta_listen returns input minus final output, after all enabled processing.
     """
     if sr <= 0:
         raise ValueError("sr must be > 0")
@@ -140,9 +146,7 @@ def process_audio(
         )
 
     # ---- STFT repair ----
-    y_repaired = _m.process_stft(x2, sr, p, dbg=dbg_collector)
-    # Optional "nuclear" HF resynthesis
-    y_repaired = _m.hf_resynth_post(y_repaired, sr, p, artifact_conf=_m._LAST_ARTIFACT_CONF_FRAMES)
+    y_repaired = _m.process_stft(x2, sr, replace(p, delta_listen=False), dbg=dbg_collector)
     y_rep_2d = _m._as_2d(y_repaired)
     info["measure_after_repair"] = {
         "sample_peak_dbfs": float(_m._lin_to_db(np.max(np.abs(y_rep_2d)) + 1e-12)),
@@ -162,11 +166,24 @@ def process_audio(
     }
     info["master_info"] = master_info
 
+    if include_residuals:
+        artifact_output = y_rep_2d
+
+        if p.enhance and p.mix != 0.0:
+            artifact_output = _m._as_2d(_m.process_stft(
+                x2, sr, replace(p, enhance=False, delta_listen=False),
+            ))
+
+        info["residuals"] = {
+            "artifact_repair_diff": (x2 - artifact_output).squeeze(),
+            "total_enhancement_diff": (x2 - y_out_2d).squeeze(),
+        }
+
     dbg_data: Dict[str, Any] = {}
     if dp.enabled and dbg_collector is not None:
         dbg_data = dbg_collector.finalize()
         info["dbg_data_keys"] = sorted(list(dbg_data.keys()))
         # Note: rendering PNGs is intentionally left to callers (UI can choose).
-    return y_out_2d.squeeze(), info
-
+    result = x2 - y_out_2d if p.delta_listen else y_out_2d
+    return result.squeeze(), info
 

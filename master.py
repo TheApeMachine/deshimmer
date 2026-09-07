@@ -26,13 +26,13 @@ import argparse
 import json
 import math
 import os
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import Optional, Tuple, Dict, Any, List
 
 import numpy as np
 import soundfile as sf
 from scipy.ndimage import median_filter, minimum_filter1d, uniform_filter1d, maximum_filter1d
-from scipy.signal import butter, sosfiltfilt, sosfilt, resample_poly, lfilter, lfilter_zi, stft, istft
+from scipy.signal import butter, sosfiltfilt, sosfilt, resample_poly, lfilter, lfilter_zi, stft, istft, correlate
 
 
 # -----------------------------
@@ -132,8 +132,8 @@ def align_lr_delay(x: np.ndarray, sr: int, max_delay_ms: float = 3.0) -> np.ndar
     l_segment = left[:analysis_len]
     r_segment = right[:analysis_len]
 
-    # Calculate cross-correlation
-    corr = np.correlate(l_segment, r_segment, mode='same')
+    # FFT correlation avoids quadratic work on the analysis segment.
+    corr = correlate(l_segment, r_segment, mode='same', method='fft')
     center = corr.size // 2
     lag = np.argmax(corr) - center
 
@@ -144,15 +144,13 @@ def align_lr_delay(x: np.ndarray, sr: int, max_delay_ms: float = 3.0) -> np.ndar
 
     y = x.copy()
     if lag > 0:
-        # Left channel leads Right -> Delay Left channel to match Right
-        y_left = np.zeros_like(left)
-        y_left[lag:] = left[:-lag]
-        y[:, 0] = y_left
+        # Positive correlation lag means Left is late: delay Right.
+        y[:, 1] = 0
+        y[lag:, 1] = right[:-lag]
     else:
-        # Right channel leads Left -> Delay Right channel to match Left
-        y_right = np.zeros_like(right)
-        y_right[-lag:] = right[:lag]
-        y[:, 1] = y_right
+        # Negative correlation lag means Right is late: delay Left.
+        y[:, 0] = 0
+        y[-lag:, 0] = left[:lag]
 
     return y
 
@@ -300,6 +298,9 @@ class Params:
 
     # Wet/dry
     mix: float = 1.0
+
+    # Optional engineering stages, separate from artifact repair for residual audits.
+    enhance: bool = True
 
     # Padding & fade
     pad: bool = True
@@ -1099,11 +1100,21 @@ def _artifact_confidence_map(
 # Core STFT repair
 # -----------------------------
 def process_stft(x: np.ndarray, sr: int, p: Params, dbg: Optional[DebugCollector] = None) -> np.ndarray:
+    """Repair the wet signal; mix and delta always reference the original samples."""
+    global _LAST_ARTIFACT_CONF_FRAMES
+    _LAST_ARTIFACT_CONF_FRAMES = None
+
     if x.ndim == 1:
         x = x[:, None]
+
+    dry = x
+
+    if p.mix == 0.0:
+        return (np.zeros_like(dry) if p.delta_listen else dry.copy()).squeeze()
     
     # --- High-Fidelity Step 1: Align Left/Right micro-delays (Time Domain) ---
-    x = align_lr_delay(x, sr)
+    if p.enhance:
+        x = align_lr_delay(x, sr)
     
     x_t = x.T
     n_ch, n_samples = x_t.shape
@@ -1115,7 +1126,8 @@ def process_stft(x: np.ndarray, sr: int, p: Params, dbg: Optional[DebugCollector
     Z = Z.transpose(1, 2, 0).astype(np.complex64)
     
     # --- High-Fidelity Step 2: Symmetric L/R spectral balancing (Spectral Domain) ---
-    Z = balance_lr_spectrum(Z)
+    if p.enhance:
+        Z = balance_lr_spectrum(Z)
     
     freqs = f.astype(np.float32)
     nyq = f[-1] if len(f) > 0 else 0.0
@@ -1461,17 +1473,19 @@ def process_stft(x: np.ndarray, sr: int, p: Params, dbg: Optional[DebugCollector
         Z = Z_orig.copy()
 
     # --- High-Fidelity Step 3: Dynamic Spectral Carving (Spectral Domain) ---
-    Z = dynamic_spectral_carver(Z, freqs)
+    if p.enhance:
+        Z = dynamic_spectral_carver(Z, freqs)
 
     # Track artifact confidence
-    global _LAST_ARTIFACT_CONF_FRAMES
+    artifact_conf_frames = None
+
     if artifact_conf_parts:
         conf_per_frame = np.zeros(n_cols, dtype=np.float32)
         for part in artifact_conf_parts:
             conf_per_frame = np.maximum(conf_per_frame, np.max(part, axis=0))
-        _LAST_ARTIFACT_CONF_FRAMES = conf_per_frame.reshape(1, -1)
-    else:
-        _LAST_ARTIFACT_CONF_FRAMES = None
+        artifact_conf_frames = conf_per_frame.reshape(1, -1)
+
+    _LAST_ARTIFACT_CONF_FRAMES = artifact_conf_frames
 
     # --- Shimmer noise resynth (post-gain) ---
     if sh_idx.size >= 8 and float(p.noise_resynth) > 0.0:
@@ -1540,8 +1554,7 @@ def process_stft(x: np.ndarray, sr: int, p: Params, dbg: Optional[DebugCollector
 
     # --- Debug collection ---
     if dbg is not None:
-        flux_full = np.zeros(n_cols, dtype=np.float32)
-        flux_full[1:] = flux.astype(np.float32, copy=False)
+        flux_full = flux.astype(np.float32, copy=False)
 
         def _att_db_from_gain(g_map: Optional[np.ndarray]) -> Optional[np.ndarray]:
             if g_map is None:
@@ -1595,11 +1608,13 @@ def process_stft(x: np.ndarray, sr: int, p: Params, dbg: Optional[DebugCollector
     elif y_rec.shape[0] < x.shape[0]:
         y_rec = np.pad(y_rec, ((0, x.shape[0]-y_rec.shape[0]), (0,0)))
         
+    # HF resynthesis is part of the wet repair, before mix and delta listening.
+    y_rec = _as_2d(hf_resynth_post(y_rec, sr, p, artifact_conf=artifact_conf_frames))
     mix_p = float(p.mix)
-    y_final = mix_p * y_rec + (1.0 - mix_p) * x
+    y_final = mix_p * y_rec + (1.0 - mix_p) * dry
     
     if p.delta_listen:
-        return (x - y_final).squeeze()
+        return (dry - y_final).squeeze()
     return y_final.squeeze()
 
 
@@ -1938,6 +1953,8 @@ def main() -> int:
 
     ap.add_argument("--noise-resynth", type=float, default=0.0)
     ap.add_argument("--mix", type=float, default=1.0)
+    ap.add_argument("--repair-only", action="store_true",
+                    help="Disable L/R alignment, spectral balancing, and spectral carving")
 
     ap.add_argument("--no-pad", action="store_true")
     ap.add_argument("--fade-ms", type=float, default=5.0)
@@ -2069,6 +2086,7 @@ def main() -> int:
 
         noise_resynth=float(args.noise_resynth),
         mix=float(args.mix),
+        enhance=not args.repair_only,
 
         pad=(not args.no_pad),
         fade_ms=float(args.fade_ms),
@@ -2163,6 +2181,14 @@ def main() -> int:
         spec_max_hz=float(args.debug_spec_max_hz),
     )
 
+    summary: Dict[str, Any] = {
+        "sr": int(sr),
+        "channels": int(x.shape[1]),
+        "duration_s": float(x.shape[0] / sr),
+        "params": asdict(p),
+        "master_params": asdict(mp),
+        "debug_params": asdict(dp),
+    }
     meas_in = {
         "sample_peak_dbfs": float(_lin_to_db(np.max(np.abs(x)) + 1e-12)),
         "true_peak_dbtp": float(measure_true_peak_db(x, os_factor=max(1, int(args.tp_os)))),
@@ -2202,8 +2228,7 @@ def main() -> int:
         )
 
     # ---- Core processing ----
-    y_repaired = process_stft(x, sr, p, dbg=dbg_collector)
-    y_repaired = hf_resynth_post(y_repaired, sr, p, artifact_conf=_LAST_ARTIFACT_CONF_FRAMES)
+    y_repaired = process_stft(x, sr, replace(p, delta_listen=False), dbg=dbg_collector)
     y_rep_2d = _as_2d(y_repaired)
 
     meas_rep = {
@@ -2228,6 +2253,9 @@ def main() -> int:
     summary["master_info"] = master_info
 
     # ---- output writing ----
+    if p.delta_listen:
+        y_out_2d = x - y_out_2d
+
     subtype = str(args.subtype)
     sf.write(args.output, y_out_2d.astype(np.float32, copy=False), sr, subtype=subtype)
 

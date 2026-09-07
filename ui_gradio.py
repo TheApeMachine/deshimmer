@@ -173,7 +173,7 @@ def _render_metrics_md(info: dict[str, object]) -> str:
         f"| Output | {fmt(mo.get('sample_peak_dbfs'))} | {fmt(mo.get('true_peak_dbtp'))} | {fmt(mo.get('rms_dbfs'))} | {fmt(mo.get('lufs'))} |",
         "",
         "### Notes",
-        "- `diff = input - output` (what was removed)",
+        "- Default diff = input - final output, including engineering and mastering; repair-only diff uses a separate render.",
         "- Preview region is processed with temporal context padding (matches full-track stateful DSP more closely)",
     ]
     return "\n".join(lines)
@@ -350,6 +350,7 @@ def run_once(
     loop_xfade_ms: float,
     full_song_mode: bool,
     param_state: Mapping[str, object] | None,
+    repair_only_diff: bool = False,
 ) -> tuple[
     tuple[int, np.ndarray],
     tuple[int, np.ndarray],
@@ -366,57 +367,45 @@ def run_once(
     sr, x = audio_in
     sr = int(sr)
     x = _to_float_audio(x)
-
     p, mp, dp = _build_params(param_state)
+    x_ctx = x
+    trim0, trim1 = 0, x.shape[0]
+    x_seg = x
+    mode_note = ""
 
-    if full_song_mode:
-        y, info = process_audio(x, sr, params=p, master_params=mp, debug_params=dp)
-        y2 = _to_float_audio(y)
-        n = min(x.shape[0], y2.shape[0])
-        x_seg = x[:n, :]
-        if bool(p.delta_listen):
-            removed = y2[:n, :]
-            processed = _to_float_audio(x_seg - removed)
-            out_sig = removed
-            aux_sig = processed
-        else:
-            processed = y2[:n, :]
-            removed = (x_seg - processed).astype(np.float32)
-            out_sig = processed
-            aux_sig = removed
-        x_play = x_seg
-        out_play = out_sig
-        aux_play = aux_sig
-        mode_note = (
-            f"\n\n**Full song mode** — processed {n / sr:.1f}s. "
-            "Spectrograms are downsampled; use *Render full & generate downloads* for WAV exports."
-        )
-    else:
-        x_seg, s0, s1 = _slice_preview(x, sr, preview_t0, preview_dur)
+    if not full_song_mode:
+        x_seg, _, _ = _slice_preview(x, sr, preview_t0, preview_dur)
         x_ctx, target_s0, target_s1, ctx_s0 = slice_with_context(
             x, sr, preview_t0, preview_dur, params=p,
         )
-        y_ctx, info = process_audio(x_ctx, sr, params=p, master_params=mp, debug_params=dp)
-        trim0 = target_s0 - ctx_s0
-        trim1 = target_s1 - ctx_s0
-        y = np.asarray(y_ctx)[trim0:trim1]
-        y2 = _to_float_audio(y)
+        trim0, trim1 = target_s0 - ctx_s0, target_s1 - ctx_s0
 
-        if bool(p.delta_listen):
-            removed = y2
-            processed = _to_float_audio(x_seg[: removed.shape[0], :] - removed)
-            out_sig = removed
-            aux_sig = processed
-        else:
-            processed = y2
-            removed = (x_seg[: processed.shape[0], :] - processed).astype(np.float32)
-            out_sig = processed
-            aux_sig = removed
+    y_ctx, info = process_audio(
+        x_ctx, sr, params=replace(p, delta_listen=False), master_params=mp,
+        debug_params=dp, include_residuals=repair_only_diff,
+    )
+    processed = _to_float_audio(y_ctx)[trim0:trim1]
+    removed = x_seg - processed
 
+    if repair_only_diff:
+        removed = _to_float_audio(info["residuals"]["artifact_repair_diff"])[trim0:trim1]
+        mode_note += ("\n\n**Repair-only diff** — input minus a separate repair render "
+                      "without L/R alignment, spectral balancing, spectral carving, or mastering.")
+
+    out_sig = removed if p.delta_listen else processed
+    aux_sig = processed if p.delta_listen else removed
+    x_play, out_play, aux_play = x_seg, out_sig, aux_sig
+
+    if not full_song_mode:
         x_play = _loop_crossfade_rotate(x_seg, sr, loop_xfade_ms)
         out_play = _loop_crossfade_rotate(out_sig, sr, loop_xfade_ms)
         aux_play = _loop_crossfade_rotate(aux_sig, sr, loop_xfade_ms)
-        mode_note = ""
+
+    if full_song_mode:
+        mode_note += (
+            f"\n\n**Full song mode** — processed {x_seg.shape[0] / sr:.1f}s. "
+            "Spectrograms are downsampled; use *Render full & generate downloads* for WAV exports."
+        )
 
     # Spectrograms
     in_png = _spectrogram_png_bytes(x_seg, sr, n_fft=dp.spec_n_fft, hop=dp.spec_hop, max_frames=dp.spec_max_frames, max_hz=dp.spec_max_hz)
@@ -441,6 +430,7 @@ def run_once(
 def render_full_to_files(
     audio_in: tuple[int, np.ndarray] | None,
     param_state: Mapping[str, object] | None,
+    repair_only_diff: bool = False,
 ) -> tuple[str, str, str]:
     if audio_in is None:
         raise ValueError("Please load an audio file first.")
@@ -451,18 +441,18 @@ def render_full_to_files(
 
     p, mp, dp = _build_params(param_state)
 
-    y, _ = process_audio(x, sr, params=p, master_params=mp, debug_params=dp)
-    y2 = _to_float_audio(y)
-    if bool(p.delta_listen):
-        removed = y2
-        processed = _to_float_audio(x[: removed.shape[0], :] - removed)
-        out_audio = removed
-        diff_audio = processed
-    else:
-        processed = y2
-        removed = (x[: processed.shape[0], :] - processed).astype(np.float32)
-        out_audio = processed
-        diff_audio = removed
+    y, info = process_audio(
+        x, sr, params=replace(p, delta_listen=False), master_params=mp,
+        debug_params=dp, include_residuals=repair_only_diff,
+    )
+    processed = _to_float_audio(y)
+    removed = x - processed
+
+    if repair_only_diff:
+        removed = _to_float_audio(info["residuals"]["artifact_repair_diff"])
+
+    out_audio = removed if p.delta_listen else processed
+    diff_audio = processed if p.delta_listen else removed
 
     outdir = os.path.join(os.path.dirname(__file__), "ui_downloads")
     os.makedirs(outdir, exist_ok=True)
@@ -477,7 +467,7 @@ def render_full_to_files(
     import json
 
     with open(params_path, "w", encoding="utf-8") as f:
-        json.dump({"params": asdict(p), "master_params": asdict(mp)}, f, indent=2, sort_keys=True)
+        json.dump({"params": asdict(p), "master_params": asdict(mp), "repair_only_diff": repair_only_diff}, f, indent=2, sort_keys=True)
 
     return out_path, diff_path, params_path
 
@@ -521,7 +511,7 @@ def build_ui() -> Any:
         # --- Simple (few knobs) ---
         "01 - Bypass (no processing)": {
             "desc": "Mix=0.0 (fully dry). Useful sanity check.",
-            "values": {"mix": 0.0, "noise_resynth": 0.0, "denoise": 0.0, "deres": 0.0, "master_enabled": False},
+            "values": {"mix": 0.0, "delta_listen": False, "noise_resynth": 0.0, "denoise": 0.0, "deres": 0.0, "master_enabled": False},
         },
         "02 - Default shimmer (recommended start)": {
             "desc": "Conservative shimmer suppression in 5.1–7.2 kHz.",
@@ -706,6 +696,11 @@ def build_ui() -> Any:
                 )
                 run_btn = gr.Button("Run preview / full song")
 
+        repair_only_diff = gr.Checkbox(
+            value=False, label="Listen to repair-only diff",
+            info="Compare repair without alignment, balancing, carving, or mastering. Adds a render pass.",
+        )
+
         with gr.Row():
             a_in = gr.Audio(label="Input", type="numpy", interactive=False)
             a_out = gr.Audio(label="Output", type="numpy", interactive=False, autoplay=True)
@@ -728,13 +723,13 @@ def build_ui() -> Any:
         with gr.Accordion("✨ Auto-tune (Analyze + Refine)", open=True):
             gr.Markdown(
                 "*Auto-derive sensible defaults from the audio (Analyze), then optionally refine with a "
-                "Bayesian search across a few preview regions (Refine). Both write directly into the sliders below.*"
+                "multi-objective search across a few preview regions (Refine). Both write directly into the sliders below.*"
             )
             with gr.Row():
                 auto_aggressiveness = gr.Slider(
                     0.0, 1.0, value=0.5, step=0.05,
                     label="Aggressiveness",
-                    info="0 = preserve content (more conservative), 1 = maximise artifact reduction. Refine only.",
+                    info="0 = preserve content (more conservative), 1 = stronger artifact reduction while retaining music-damage penalties. Refine only.",
                 )
                 auto_n_trials = gr.Slider(
                     4, 30, value=12, step=1,
@@ -759,7 +754,7 @@ def build_ui() -> Any:
                 )
             with gr.Row():
                 analyze_btn = gr.Button("🔍 Analyze (set defaults from audio)", variant="secondary")
-                refine_btn = gr.Button("⚙️ Refine (Bayesian optimise)", variant="primary")
+                refine_btn = gr.Button("⚙️ Refine (multi-objective optimise)", variant="primary")
             auto_report = gr.Markdown()
 
         with gr.Accordion("🎯 Shimmer Removal (main tool for AI sparkle/shimmer)", open=True):
@@ -1325,7 +1320,7 @@ def build_ui() -> Any:
         }
         param_outputs = [param_components[name] for name in PARAM_STATE_NAMES]
         result_outputs = [a_in, a_out, a_diff, im_in, im_out, im_diff, metrics, params_json]
-        render_inputs = [audio_in, preview_t0, preview_dur, loop_xfade_ms, full_song_mode, params_state]
+        render_inputs = [audio_in, preview_t0, preview_dur, loop_xfade_ms, full_song_mode, params_state, repair_only_diff]
 
         def _preset_desc_md(name: str) -> str:
             p = all_presets.get(name, {})
@@ -1447,7 +1442,7 @@ def build_ui() -> Any:
             if failure_log:
                 stages_md_lines.append(f"- Failed-trial diagnostics: `{failure_log}`")
             stages_md_lines.append("")
-            stages_md_lines.append("_(NSGA-II runs with flat objective weights; aggressiveness selects from the Pareto front after search.)_")
+            stages_md_lines.append("_(Aggressiveness weights the five NSGA-II objectives; selection and final score use their total utility. Current settings are retained if proposals score worse.)_")
 
             new_state = _merge_param_state(current_state, _state_from_dataclasses(new_p, base_mp))
             return tuple([new_state] + _state_to_component_values(new_state) + ["\n".join(stages_md_lines)])
@@ -1476,7 +1471,8 @@ def build_ui() -> Any:
 
         demo.load(fn=_preset_desc_md, inputs=[preset], outputs=[preset_desc])
         run_btn.click(fn=run_once, inputs=render_inputs, outputs=result_outputs)
-        full_btn.click(fn=render_full_to_files, inputs=[audio_in, params_state], outputs=[dl_out, dl_diff, dl_params])
+        repair_only_diff.change(fn=run_once, inputs=render_inputs, outputs=result_outputs)
+        full_btn.click(fn=render_full_to_files, inputs=[audio_in, params_state, repair_only_diff], outputs=[dl_out, dl_diff, dl_params])
 
         def _bind_preview_auto(comp: Any) -> None:
             handler = getattr(comp, "release", None)

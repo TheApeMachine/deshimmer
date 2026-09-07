@@ -34,6 +34,7 @@ from scipy.ndimage import median_filter, uniform_filter1d
 from scipy.signal import stft as _scipy_stft
 
 import master as _m
+from master import align_lr_delay, balance_lr_spectrum, dynamic_spectral_carver
 from deshimmer_api import process_audio, preview_context_seconds, slice_with_context
 
 
@@ -490,6 +491,23 @@ class Weights:
     diff_onset_corr: float
     stereo_width: float
 
+    def objectives(self, metrics: dict[str, float]) -> tuple[float, float, float, float, float]:
+        """Partition weighted utility into five objectives, counting each term once."""
+        return (
+            self.band_reduction * metrics["band_reduction_db"]
+            + self.swish_reduction * metrics["swish_reduction"],
+            -(self.out_of_band_change * metrics["out_of_band_change_db"]
+              + self.musical_noise * metrics["musical_noise"]
+              + self.band_energy_loss * metrics["band_energy_loss_db"]
+              + self.centroid_shift * metrics["centroid_shift"]),
+            -(self.transient_leak * metrics["transient_leak"]
+              + self.harmonic_leak * metrics["harmonic_leak"]
+              + self.diff_onset_corr * metrics["diff_onset_corr"]),
+            -self.stereo_width * metrics["stereo_width_delta"],
+            -(self.loudness_loss * metrics["loudness_loss_db"]
+              + self.spectral_tilt * metrics["spectral_tilt_delta"]),
+        )
+
 
 def flat_weights() -> Weights:
     return Weights(
@@ -599,118 +617,6 @@ def _stereo_width_ratio(x: np.ndarray) -> float:
     r_side = float(np.sqrt(np.mean(side * side) + _EPS))
     return r_side / (r_mid + _EPS)
 
-def align_lr_delay(x: np.ndarray, sr: int, max_delay_ms: float = 3.0) -> np.ndarray:
-    """
-    Analyzes and aligns Left and Right channel micro-delays using cross-correlation.
-    Eliminates high-frequency comb-filtering and centers the stereo image.
-    """
-    if x.ndim == 1 or x.shape[1] < 2:
-        return x
-        
-    left = x[:, 0]
-    right = x[:, 1]
-    
-    # Analyze the first 15 seconds to calculate the temporal lag quickly and reliably
-    analysis_len = min(left.size, int(sr * 15))
-    l_segment = left[:analysis_len]
-    r_segment = right[:analysis_len]
-    
-    # Calculate cross-correlation
-    corr = np.correlate(l_segment, r_segment, mode='same')
-    center = corr.size // 2
-    lag = np.argmax(corr) - center
-    
-    max_delay_samples = int(math.ceil((max_delay_ms / 1000.0) * sr))
-    
-    if abs(lag) > max_delay_samples or lag == 0:
-        return x  # Delay is either too large to be an alignment issue or already perfect
-        
-    y = x.copy()
-    if lag > 0:
-        # Left channel leads Right -> Delay Left channel to match Right
-        y_left = np.zeros_like(left)
-        y_left[lag:] = left[:-lag]
-        y[:, 0] = y_left
-    else:
-        # Right channel leads Left -> Delay Right channel to match Left
-        y_right = np.zeros_like(right)
-        y_right[-lag:] = right[:lag]
-        y[:, 1] = y_right
-        
-    return y
-
-def balance_lr_spectrum(Z: np.ndarray, smooth_bins: int = 21) -> np.ndarray:
-    """
-    Symmetrically balances Left and Right channels' long-term average spectra
-    to restore a perfectly centered, stable stereo field.
-    Z is (F, T, Ch)
-    """
-    if Z.shape[2] < 2:
-        return Z
-        
-    eps = 1e-12
-    # Compute long-term average magnitude for both channels
-    mag_l = np.mean(np.abs(Z[:, :, 0]), axis=1)
-    mag_r = np.mean(np.abs(Z[:, :, 1]), axis=1)
-    
-    # Calculate difference ratio
-    ratio = (mag_l + eps) / (mag_r + eps)
-    
-    # Smooth the ratio over frequency to prevent narrow-band distortions
-    ratio_smooth = uniform_filter1d(ratio, size=smooth_bins, mode='nearest')
-    
-    # Limit maximum correction to +/- 3 dB to preserve artistic mixing intents
-    ratio_smooth = np.clip(ratio_smooth, 10.0**(-3.0/20.0), 10.0**(3.0/20.0))
-    
-    # Symmetrically apply correction (split the difference between channels)
-    comp_l = 1.0 / np.sqrt(ratio_smooth)
-    comp_r = np.sqrt(ratio_smooth)
-    
-    Z_new = Z.copy()
-    Z_new[:, :, 0] *= comp_l[:, None]
-    Z_new[:, :, 1] *= comp_r[:, None]
-    return Z_new
-
-def dynamic_spectral_carver(Z: np.ndarray, freqs: np.ndarray, target_slope: float = -3.5) -> np.ndarray:
-    """
-    Dynamically carves and compresses frequency accumulations to conform with
-    the statistical target curves of commercial mastering (-3.5 dB/octave slope).
-    Z is (F, T, Ch)
-    """
-    eps = 1e-12
-    F, T, Ch = Z.shape
-    
-    # Target mastering curve: 0 dB reference at 100 Hz, rolling off by target_slope per octave
-    octaves = np.log2(np.clip(freqs, 100.0, freqs[-1]) / 100.0)
-    target_db = target_slope * octaves
-    target_linear = 10.0 ** (target_db / 20.0)
-    
-    Z_new = Z.copy()
-    for t in range(T):
-        # Average magnitude of the current frame across channels
-        mag_frame = np.mean(np.abs(Z[:, t, :]), axis=1)
-        
-        # Smooth frame envelope to find broad resonances (muddiness/harshness)
-        mag_smooth = uniform_filter1d(mag_frame, size=31, mode='nearest')
-        
-        # Normalize the target shape to match the current frame's total energy
-        scale_factor = np.sum(mag_frame) / np.sum(target_linear)
-        frame_target = target_linear * scale_factor
-        
-        # Calculate excess energy relative to high-fidelity target shape
-        excess = mag_smooth / (frame_target + eps)
-        
-        # Target only build-ups exceeding the curve by 1.5 dB
-        carve_mask = excess > 10.0 ** (1.5 / 20.0)
-        
-        if np.any(carve_mask):
-            # Dynamic compression: apply a gentle 20% correction ratio
-            g_carve = 1.0 - 0.20 * (1.0 - 1.0 / excess)
-            g_carve = np.clip(g_carve, 0.5, 1.0) # limit maximum carve cut to -6 dB
-            
-            Z_new[carve_mask, t, :] *= g_carve[carve_mask, None]
-            
-    return Z_new
 
 def score_processed(
     x_in: np.ndarray,
@@ -719,43 +625,63 @@ def score_processed(
     *,
     band: tuple[float, float],
     weights: Weights,
+    swish_band: tuple[float, float],
 ) -> dict[str, float]:
+    """Measure shimmer and swish in their respective bands and apply weighted utility."""
+    if sr <= 0:
+        raise ValueError("scoring requires a positive sample rate")
+
     xm_in = _to_mono_float(x_in)
     xm_out = _to_mono_float(y_out)
-    n = min(xm_in.size, xm_out.size)
+
+    if _m._as_2d(np.asarray(x_in)).shape != _m._as_2d(np.asarray(y_out)).shape:
+        raise ValueError("scoring requires matching input and output shapes")
+
+    if not np.all(np.isfinite(x_in)) or not np.all(np.isfinite(y_out)):
+        raise ValueError("scoring requires finite audio samples")
+
+    n = xm_in.size
+
     if n < 2048:
-        return {"total": 0.0, "_note": "region too short to score"}
-    xm_in = xm_in[:n]
-    xm_out = xm_out[:n]
+        raise ValueError("scoring requires at least 2048 samples")
     diff = xm_in - xm_out
 
     mag_in, freqs = _stft_mag(xm_in, sr)
     mag_out, _ = _stft_mag(xm_out, sr)
     mag_diff, _ = _stft_mag(diff, sr)
 
+    for name, bounds in (("shimmer", band), ("swish", swish_band)):
+        if not np.all(np.isfinite(bounds)) or _band_idx(freqs, *bounds).size < 4:
+            raise ValueError(f"{name} scoring band requires at least four FFT bins below Nyquist")
+
     res_in = _band_residual_energy_db(mag_in, freqs, band[0], band[1])
     res_out = _band_residual_energy_db(mag_out, freqs, band[0], band[1])
     band_reduction = float(10.0 * math.log10((res_in + 1e-6) / (res_out + 1e-6)))
     band_reduction = float(np.clip(band_reduction, -10.0, 30.0))
 
-    inst_in = _m.measure_phase_instability(xm_in, sr, band[0], band[1])
-    inst_out = _m.measure_phase_instability(xm_out, sr, band[0], band[1])
+    inst_in = _m.measure_phase_instability(xm_in, sr, *swish_band)
+    inst_out = _m.measure_phase_instability(xm_out, sr, *swish_band)
     inst_denom = max(inst_in, 0.02)
     swish_reduction = float(np.clip((inst_in - inst_out) / inst_denom, -0.5, 1.0)) * 12.0
 
-    oob_in_db = _energy_db(np.delete(mag_in, _band_idx(freqs, band[0], band[1]), axis=0))
-    oob_out_db = _energy_db(np.delete(mag_out, _band_idx(freqs, band[0], band[1]), axis=0))
-    out_of_band_change = float(abs(oob_in_db - oob_out_db))
+    outside_band = (freqs < band[0]) | (freqs > band[1])
+    # A full-spectrum treatment has no out-of-band bins to change.
+    out_of_band_change = 0.0
 
-    band_db_out = _frame_db(mag_out)
-    thr = float(np.percentile(band_db_out, 25.0))
-    quiet_mask = band_db_out <= thr
+    if np.any(outside_band):
+        out_of_band_change = abs(_energy_db(mag_in[outside_band]) - _energy_db(mag_out[outside_band]))
+
+    band_db_in = _frame_db(mag_in)
+    thr = float(np.percentile(band_db_in, 25.0))
+    quiet_mask = band_db_in <= thr
     if int(np.sum(quiet_mask)) >= 4:
-        Pq = mag_out[:, quiet_mask] ** 2
+        # Penalize added musical noise in the same input-defined quiet frames.
+        Pq = np.stack((mag_in[:, quiet_mask], mag_out[:, quiet_mask]), axis=2) ** 2
         Pq = Pq / (np.sum(Pq, axis=0, keepdims=True) + _EPS)
         ent = -np.sum(Pq * np.log(Pq + _EPS), axis=0)
         ent_norm = ent / max(_EPS, math.log(Pq.shape[0]))
-        musical_noise = float(np.var(np.diff(ent_norm))) * 100.0
+        variation = np.var(np.diff(ent_norm, axis=0), axis=0)
+        musical_noise = float(max(0.0, variation[1] - variation[0])) * 100.0
     else:
         musical_noise = 0.0
 
@@ -787,7 +713,7 @@ def score_processed(
     env_in = _onset_envelope(xm_in, sr)
     env_diff = _onset_envelope(diff, sr)
     mlen = min(env_in.size, env_diff.size)
-    if mlen >= 8:
+    if mlen >= 8 and np.std(env_in[:mlen]) > 0.0 and np.std(env_diff[:mlen]) > 0.0:
         c = np.corrcoef(env_in[:mlen], env_diff[:mlen])[0, 1]
         diff_onset_corr = float(max(0.0, c)) if math.isfinite(float(c)) else 0.0
     else:
@@ -797,26 +723,7 @@ def score_processed(
     w_out = _stereo_width_ratio(y_out)
     stereo_width_delta = float(abs(w_out - w_in)) * 50.0
 
-    music_damage = (
-        out_of_band_change + band_energy_loss + spectral_tilt_delta + centroid_shift + loud_loss
-    )
-
-    total = (
-        weights.band_reduction * band_reduction
-        + weights.swish_reduction * swish_reduction
-        - weights.out_of_band_change * out_of_band_change
-        - weights.musical_noise * musical_noise
-        - weights.transient_leak * transient_leak
-        - weights.harmonic_leak * harmonic_leak
-        - weights.loudness_loss * loud_loss
-        - weights.band_energy_loss * band_energy_loss
-        - weights.spectral_tilt * spectral_tilt_delta
-        - weights.centroid_shift * centroid_shift
-        - weights.diff_onset_corr * diff_onset_corr
-        - weights.stereo_width * stereo_width_delta
-    )
-    return {
-        "total": float(total),
+    metrics = {
         "band_reduction_db": band_reduction,
         "swish_reduction": swish_reduction,
         "phase_instability_in": inst_in,
@@ -832,12 +739,17 @@ def score_processed(
         "diff_onset_corr": diff_onset_corr,
         "stereo_width_delta": stereo_width_delta,
         "diff_total_e": diff_total_e,
-        "artifact_reduction": float(band_reduction + 0.65 * swish_reduction),
-        "music_damage": float(music_damage),
-        "diff_music_leakage": float(transient_leak + harmonic_leak),
-        "stereo_damage": float(stereo_width_delta),
-        "loudness_or_tilt_damage": float(loud_loss + spectral_tilt_delta),
     }
+    objectives = weights.objectives(metrics)
+    metrics.update({
+        "total": float(sum(objectives)),
+        "artifact_reduction": objectives[0],
+        "music_damage": -objectives[1],
+        "diff_music_leakage": -objectives[2],
+        "stereo_damage": -objectives[3],
+        "loudness_or_tilt_damage": -objectives[4],
+    })
+    return metrics
 
 
 def score_objectives(
@@ -847,15 +759,12 @@ def score_objectives(
     *,
     band: tuple[float, float],
     weights: Weights,
+    swish_band: tuple[float, float],
 ) -> tuple[float, float, float, float, float]:
-    s = score_processed(x_in, y_out, sr, band=band, weights=weights)
-    return (
-        float(s.get("artifact_reduction", 0.0)),
-        float(-s.get("music_damage", 0.0)),
-        float(-s.get("diff_music_leakage", 0.0)),
-        float(-s.get("stereo_damage", 0.0)),
-        float(-s.get("loudness_or_tilt_damage", 0.0)),
+    metrics = score_processed(
+        x_in, y_out, sr, band=band, swish_band=swish_band, weights=weights,
     )
+    return weights.objectives(metrics)
 
 
 MATH_FAILURES = (ValueError, FloatingPointError, RuntimeWarning, ArithmeticError, np.linalg.LinAlgError)
@@ -939,7 +848,7 @@ def _evaluate_params_multi(
 ) -> tuple[float, float, float, float, float]:
     mp = _m.MasterParams(enabled=False)
     dp = _m.DebugParams(enabled=False)
-    p_use = replace(p, delta_listen=False, mix=1.0 if p.mix < 1e-6 else p.mix)
+    p_use = replace(p, delta_listen=False)
     context_s = preview_context_seconds(p_use)
     objs_acc = np.zeros(5, dtype=np.float64)
     count = 0
@@ -948,17 +857,33 @@ def _evaluate_params_multi(
         seg_t0 = r.t0 + inset
         seg_dur = min(r.dur, refine_dur)
         if seg_dur <= 0.0:
-            continue
+            raise ValueError(f"region '{r.label}' has no audio to score")
         x_ctx, target_s0, target_s1, ctx_s0 = slice_with_context(
             x, sr, seg_t0, seg_dur, context_s=context_s, params=p_use,
         )
-        if x_ctx.shape[0] < int(0.5 * sr):
-            continue
+        if target_s1 - target_s0 < max(2048, int(0.5 * sr)):
+            raise ValueError(f"region '{r.label}' requires at least 0.5 seconds and 2048 samples")
         try:
             with warnings.catch_warnings():
                 warnings.simplefilter("error", RuntimeWarning)
                 with np.errstate(divide="raise", over="raise", invalid="raise", under="ignore"):
                     y_ctx, _info = process_audio(x_ctx, sr, params=p_use, master_params=mp, debug_params=dp)
+                    trim0 = target_s0 - ctx_s0
+                    trim1 = target_s1 - ctx_s0
+                    y = np.asarray(y_ctx)[trim0:trim1]
+                    seg = x[target_s0:target_s1]
+
+                    if seg.ndim == 2:
+                        y = _m._as_2d(y)
+
+                    objectives = score_objectives(
+                        seg, y, sr, band=band,
+                        swish_band=(p_use.swish_start_hz, p_use.swish_end_hz),
+                        weights=weights,
+                    )
+
+                    if not np.all(np.isfinite(objectives)):
+                        raise ValueError("scoring produced non-finite objectives")
         except MATH_FAILURES as exc:
             if failure_log is not None:
                 fatal = failure_log.record(
@@ -973,17 +898,16 @@ def _evaluate_params_multi(
                         "Optimization failed due to persistent mathematical instability. "
                         f"See {failure_log.path}"
                     ) from exc
-            return (-1e9, -1e9, -1e9, -1e9, -1e9)
-        trim0 = target_s0 - ctx_s0
-        trim1 = target_s1 - ctx_s0
-        y = np.asarray(y_ctx)[trim0:trim1]
-        seg = x[target_s0:target_s1] if x.ndim == 1 else x[target_s0:target_s1, :]
-        if seg.shape[0] < int(0.5 * sr):
-            continue
-        objs_acc += np.array(score_objectives(seg, y, sr, band=band, weights=weights), dtype=np.float64)
+                import optuna
+
+                raise optuna.TrialPruned(f"invalid DSP evaluation: {exc}") from exc
+
+            raise
+
+        objs_acc += np.asarray(objectives, dtype=np.float64)
         count += 1
     if count == 0:
-        return (-1e9, -1e9, -1e9, -1e9, -1e9)
+        raise ValueError("evaluation requires at least one scorable region")
     if failure_log is not None:
         failure_log.success(stage)
     mean = objs_acc / float(count)
@@ -1000,8 +924,8 @@ def _evaluate_params_single(
     refine_dur: float,
 ) -> float:
     obj = _evaluate_params_multi(x, sr, regions, p, weights, band, refine_dur)
-    # Combine objective scalars using weights
-    return obj[0] + obj[1] + obj[2] + obj[3] + obj[4]
+    # Each metric contributes to exactly one weighted objective.
+    return float(sum(obj))
 
 
 # ---------------------------------------------------------------------------
@@ -1057,59 +981,26 @@ def _make_stage(name: str, p: _m.Params, trial: Any) -> _m.Params:
     raise ValueError(f"unknown stage: {name}")
 
 
-def _pick_pareto_trial(study: Any, mode: str = "balanced", aggressiveness: float = 0.5) -> Any:
-    import optuna
+def _pick_pareto_trial(study: Any, mode: str = "balanced") -> Any:
+    """Select weighted utility on the study's maximizing Pareto front."""
+    front_trials = study.best_trials
 
-    complete = [
-        t for t in study.trials
-        if t.state == optuna.trial.TrialState.COMPLETE and t.values is not None
-    ]
-    if not complete:
-        raise RuntimeError("no completed trials")
-    if len(complete) == 1:
-        return complete[0]
+    if not front_trials:
+        raise RuntimeError("no completed, valid trials")
 
-    vals = np.array([t.values for t in complete], dtype=np.float64)
-    if vals.ndim != 2 or vals.shape[0] == 0:
-        return complete[0]
-
-    n = vals.shape[0]
-    dominated = np.zeros(n, dtype=bool)
-    for i in range(n):
-        for j in range(n):
-            if i == j:
-                continue
-            if np.all(vals[j] >= vals[i]) and np.any(vals[j] > vals[i]):
-                dominated[i] = True
-                break
-    front_idx = np.where(~dominated)[0]
-    front_trials = [complete[i] for i in front_idx]
+    if not all(np.all(np.isfinite(trial.values)) for trial in front_trials):
+        raise ValueError("Pareto selection requires finite objectives")
 
     if mode == "safe":
-        # Minimize musical damage and stereo soundstage deviations
-        return max(front_trials, key=lambda t: t.values[1] + t.values[2] + t.values[3] + t.values[4])
+        return max(front_trials, key=lambda trial: sum(trial.values[1:]))
+
     if mode == "aggressive":
-        # Maximize artifact reduction
-        return max(front_trials, key=lambda t: t.values[0])
+        return max(front_trials, key=lambda trial: trial.values[0])
 
-    front_vals = np.array([t.values for t in front_trials], dtype=np.float64)
-    reduction = front_vals[:, 0]
-    preservation = front_vals[:, 1] + front_vals[:, 2] + front_vals[:, 3] + front_vals[:, 4]
+    if mode != "balanced":
+        raise ValueError(f"unknown Pareto selection mode: {mode}")
 
-    def _norm(v: np.ndarray) -> np.ndarray:
-        span = float(np.max(v) - np.min(v))
-        if span <= 1e-12:
-            return np.zeros_like(v)
-        return (v - np.min(v)) / span
-
-    a = float(np.clip(aggressiveness, 0.0, 1.0))
-    if a <= 1e-9:
-        return front_trials[int(np.argmax(preservation))]
-    if a >= 1.0 - 1e-9:
-        return front_trials[int(np.argmax(reduction))]
-
-    score = a * _norm(reduction) + (1.0 - a) * _norm(preservation)
-    return front_trials[int(np.argmax(score))]
+    return max(front_trials, key=lambda trial: sum(trial.values))
 
 
 def refine(
@@ -1138,8 +1029,11 @@ def refine(
     if regions is None or len(regions) == 0:
         regions = pick_regions(xm, sr, n=5, dur=max(refine_dur + 0.5, 5.0))
 
-    objective_weights = flat_weights()
+    if n_trials_per_stage < 1 or refine_dur <= 0.0:
+        raise ValueError("refinement requires positive trial count and duration")
+
     selection_weights = weights_from_aggressiveness(aggressiveness)
+    objective_weights = selection_weights
     band = (float(base_params.start_hz), float(base_params.end_hz))
     failure_log = EvaluationFailureLog(
         debug_dir or os.path.join(os.getcwd(), "auto_tune_debug"),
@@ -1148,7 +1042,8 @@ def refine(
         max_failure_rate=0.20,
     )
 
-    p_cur = replace(base_params)
+    # Refining from bypass must return the wet mix that was actually evaluated.
+    p_cur = replace(base_params, mix=1.0 if base_params.mix == 0.0 else base_params.mix)
     summary: dict[str, Any] = {
         "aggressiveness": float(aggressiveness),
         "regions": [{"t0": r.t0, "dur": r.dur, "label": r.label} for r in regions],
@@ -1175,10 +1070,7 @@ def refine(
 
     def _emit(frac: float, msg: str) -> None:
         if progress_cb is not None:
-            try:
-                progress_cb(float(np.clip(frac, 0.0, 1.0)), msg)
-            except Exception:
-                pass
+            progress_cb(float(np.clip(frac, 0.0, 1.0)), msg)
 
     _emit(0.0, "Starting refine")
 
@@ -1188,6 +1080,12 @@ def refine(
             directions=["maximize", "maximize", "maximize", "maximize", "maximize"],
             sampler=sampler,
         )
+
+        # Retain the current settings when every proposed change scores worse.
+        baseline = _evaluate_params_multi(
+            xm, sr, regions, p_cur, objective_weights, band, refine_dur,
+        )
+        study.add_trial(optuna.trial.create_trial(values=baseline))
 
         def _objective(trial: Any, _stage: str = stage, _p: _m.Params = p_cur) -> tuple[float, float, float, float, float]:
             p_try = _make_stage(_stage, _p, trial)
@@ -1208,22 +1106,25 @@ def refine(
         for _ in range(n_trials_per_stage):
             failure_log.begin_trial(stage)
             study.optimize(_objective, n_trials=1, gc_after_trial=True, show_progress_bar=False)
-            best_bal = _pick_pareto_trial(study, mode="balanced", aggressiveness=float(aggressiveness))
-            trial_scores.append(float(best_bal.values[0]) if best_bal.values else 0.0)
+            best_bal = _pick_pareto_trial(study, mode="balanced")
+            trial_scores.append(float(sum(best_bal.values)))
             done += 1
-            _emit(done / total_trials, f"Stage '{stage}': trial {done}/{total_trials}, pareto={trial_scores[-1]:.3f}")
+            _emit(done / total_trials, f"Stage '{stage}': trial {done}/{total_trials}, score={trial_scores[-1]:.3f}")
 
-        best_trial = _pick_pareto_trial(study, mode="balanced", aggressiveness=float(aggressiveness))
+        best_trial = _pick_pareto_trial(study, mode="balanced")
         safe_trial = _pick_pareto_trial(study, mode="safe")
         agg_trial = _pick_pareto_trial(study, mode="aggressive")
-        p_cur = _make_stage(stage, p_cur, _SnapshotTrial(best_trial.params))
+        if best_trial.params:
+            p_cur = _make_stage(stage, p_cur, _SnapshotTrial(best_trial.params))
         summary["stages"].append({
             "stage": stage,
             "n_trials": n_trials_per_stage,
-            "selected_score": float(best_trial.values[0]) if best_trial.values else 0.0,
+            "selected_score": float(sum(best_trial.values)),
             "selected_params": dict(best_trial.params),
-            "selection_mode": "aggressiveness",
-            "best_score": float(best_trial.values[0]) if best_trial.values else 0.0,
+            "selection_mode": "weighted_utility",
+            "baseline_score": float(sum(baseline)),
+            "retained_baseline": not bool(best_trial.params),
+            "best_score": float(sum(best_trial.values)),
             "best_params": dict(best_trial.params),
             "trial_scores": trial_scores,
             "pareto": {

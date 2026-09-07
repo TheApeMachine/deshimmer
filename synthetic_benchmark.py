@@ -137,7 +137,10 @@ def run_benchmark(
         except Exception as exc:
             out.append(BenchmarkResult(spec.name, -999.0, {}, 0.0, notes=[str(exc)]))
             continue
-        sc = score_processed(clean, repaired, sr, band=band, weights=weights)
+        sc = score_processed(
+            clean, repaired, sr, band=band,
+            swish_band=(p.swish_start_hz, p.swish_end_hz), weights=weights,
+        )
         proxy = _visqol_proxy_db(clean, repaired, sr)
         out.append(BenchmarkResult(
             degradation=spec.name,
