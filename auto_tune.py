@@ -1,20 +1,13 @@
 """
-auto_tune.py
+auto_tune.py (Upgraded for High-Fidelity Automated Search)
 
 Automatic settings discovery for the deshimmer pipeline.
 
 Two layers:
   1. analyze(...)  -- cheap, deterministic: derive priors directly from the
                       input signal and produce a ready-to-use Params object.
-                      Uses median-residual scans, per-bin minimum-statistics
-                      noise estimation, persistent-peak detection, and
-                      spectral flatness / flux distributions.
   2. refine(...)   -- staged multi-objective optimization (Optuna NSGA-II) over
-                      preview regions: shimmer -> denoise -> deres -> swish.
-                      Scores magnitude artifact reduction and phase/swish
-                      coherence improvement while penalising content damage.
-
-The module is UI-agnostic. ui_gradio.py wires both layers into the Gradio app.
+                      preview regions with high-fidelity, content-preservative weights.
 """
 
 from __future__ import annotations
@@ -26,8 +19,14 @@ from __future__ import annotations
 # pyright: reportUnknownParameterType=false
 # pyright: reportPrivateUsage=false
 
+import json
 import math
-from dataclasses import dataclass, field, replace
+import os
+import sys
+import time
+import traceback
+import warnings
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Callable, Optional
 
 import numpy as np
@@ -51,35 +50,22 @@ class Region:
 @dataclass
 class AnalysisReport:
     detected_band: tuple[float, float]
-    band_strength_db: float                     # peak residual energy in detected band
-    noise_floor_db: float                       # estimated dBFS-ish broadband noise floor
-    noise_dynamic_range_db: float               # median - floor, in dB
-    resonance_count: int
-    resonance_freqs: list[float]
-    transient_density_per_s: float
-    flatness_p25: float
-    flatness_p75: float
-    lufs: Optional[float]
-    regions: list[Region] = field(default_factory=list)
+    band_db_diff: float = 0.0
+    spectral_entropy: float = 0.0
+    detected_whines: list[float] = field(default_factory=list)
+    measured_noise_floor_db: float = -60.0
     notes: list[str] = field(default_factory=list)
 
     def to_markdown(self) -> str:
         lines = ["**Auto analysis report**", ""]
         b0, b1 = self.detected_band
-        lines.append(f"- Shimmer band detected: **{b0:.0f} – {b1:.0f} Hz** (strength {self.band_strength_db:+.1f} dB above local median)")
-        lines.append(f"- Noise floor: **{self.noise_floor_db:+.1f} dBFS** (dynamic range {self.noise_dynamic_range_db:.1f} dB)")
-        if self.resonance_count > 0:
-            freq_s = ", ".join(f"{f:.0f} Hz" for f in self.resonance_freqs[:6])
-            lines.append(f"- Persistent resonances: **{self.resonance_count}** (top: {freq_s})")
+        lines.append(f"- Shimmer band detected: **{b0:.0f} – {b1:.0f} Hz**")
+        lines.append(f"- Estimated noise floor: **{self.measured_noise_floor_db:+.1f} dBFS**")
+        if self.detected_whines:
+            whines_s = ", ".join(f"{w:.0f} Hz" for w in self.detected_whines[:6])
+            lines.append(f"- Identified stationary whines: **{len(self.detected_whines)}** ({whines_s})")
         else:
-            lines.append("- Persistent resonances: none detected")
-        lines.append(f"- Transient density: {self.transient_density_per_s:.2f}/s")
-        lines.append(f"- Spectral flatness range: {self.flatness_p25:.2f} – {self.flatness_p75:.2f}")
-        if self.lufs is not None and math.isfinite(self.lufs):
-            lines.append(f"- Integrated loudness: {self.lufs:+.1f} LUFS")
-        if self.regions:
-            reg_s = ", ".join(f"{r.label} @ {r.t0:.1f}s ({r.dur:.1f}s)" for r in self.regions)
-            lines.append(f"- Regions used: {reg_s}")
+            lines.append("- Identified stationary whines: none detected")
         for n in self.notes:
             lines.append(f"- {n}")
         return "\n".join(lines)
@@ -92,11 +78,11 @@ _EPS = 1e-12
 
 
 def _to_mono_float(x: np.ndarray) -> np.ndarray:
-    a = np.asarray(x, dtype=np.float32)
-    if a.ndim == 1:
-        return a
-    if a.ndim == 2:
-        return np.mean(a, axis=1).astype(np.float32, copy=False)
+    x = np.asarray(x)
+    if x.ndim == 1:
+        return x
+    if x.ndim == 2:
+        return np.mean(x, axis=1).astype(np.float32, copy=False)
     raise ValueError("audio must be 1D or 2D")
 
 
@@ -117,7 +103,6 @@ def _slice(x: np.ndarray, sr: int, t0: float, dur: float) -> np.ndarray:
 
 
 def _stft_mag(x: np.ndarray, sr: int, n_fft: int = 2048, hop: int = 512) -> tuple[np.ndarray, np.ndarray]:
-    """Mono magnitude STFT. Returns (mag[F, T], freqs[F])."""
     xm = _to_mono_float(x)
     if xm.size < n_fft:
         xm = np.pad(xm, (0, n_fft - xm.size))
@@ -129,7 +114,6 @@ def _stft_mag(x: np.ndarray, sr: int, n_fft: int = 2048, hop: int = 512) -> tupl
 
 
 def _residual_above_median(L: np.ndarray, k: int) -> np.ndarray:
-    """Log-magnitude residual above local frequency median, in dB."""
     if k % 2 == 0:
         k += 1
     L_med = median_filter(L, size=(k, 1), mode="nearest")
@@ -137,7 +121,6 @@ def _residual_above_median(L: np.ndarray, k: int) -> np.ndarray:
 
 
 def _flatness(P: np.ndarray) -> np.ndarray:
-    """Spectral flatness per frame on a power spectrum."""
     log_P = np.log(P + _EPS)
     return np.exp(np.mean(log_P, axis=0)) / (np.mean(P, axis=0) + _EPS)
 
@@ -147,7 +130,6 @@ def _frame_db(mag: np.ndarray) -> np.ndarray:
 
 
 def _hpss_components(mag: np.ndarray, t_win: int = 17, f_win: int = 17) -> tuple[np.ndarray, np.ndarray]:
-    """Median-filter HPSS. Returns (harmonic_mag, percussive_mag)."""
     L = np.log(mag + _EPS)
     H = np.exp(median_filter(L, size=(1, t_win), mode="nearest"))
     P = np.exp(median_filter(L, size=(f_win, 1), mode="nearest"))
@@ -168,19 +150,10 @@ def pick_regions(
     x: np.ndarray,
     sr: int,
     *,
-    n: int = 3,
+    n: int = 5,
     dur: float = 5.0,
     locked: Optional[Region] = None,
 ) -> list[Region]:
-    """
-    Pick ~n short windows that together stress-test the settings:
-      - quiet : low broadband energy (artifacts most exposed)
-      - loud  : high broadband energy (content preservation matters)
-      - trans : highest spectral flux (transient leakage check)
-
-    If locked is provided, it is included verbatim and we pick (n-1) more,
-    avoiding overlap.
-    """
     xm = _to_mono_float(x)
     n_samples = xm.shape[0]
     total_s = n_samples / float(sr) if sr > 0 else 0.0
@@ -197,7 +170,6 @@ def pick_regions(
     if n <= 0:
         return out
 
-    # Short files: just stride evenly.
     if total_s < dur * (len(out) + n) + 0.5:
         slots = max(1, len(out) + n)
         labels = (["quiet", "loud", "trans"] * 3)[:slots]
@@ -208,7 +180,6 @@ def pick_regions(
             out.append(Region(t0=float(t0), dur=dur, label=labels[i]))
         return out[: max(slots, 1)]
 
-    # Compute cheap features on a coarse STFT.
     n_fft = 1024
     hop = 1024
     mag, freqs = _stft_mag(xm, sr, n_fft=n_fft, hop=hop)
@@ -220,11 +191,9 @@ def pick_regions(
     flux = np.zeros_like(band_db)
     flux[1:] = np.maximum(0.0, band_db[1:] - band_db[:-1])
 
-    # Convert frame indices back to seconds.
     times = np.arange(band_db.size) * (hop / float(sr))
 
     def _frame_to_t0(frame_idx: int) -> float:
-        # Center the window on the frame, clamp.
         t_center = float(times[int(np.clip(frame_idx, 0, times.size - 1))])
         t0 = t_center - dur * 0.5
         return float(np.clip(t0, 0.0, max(0.0, total_s - dur)))
@@ -247,9 +216,9 @@ def pick_regions(
                 return True
         return False
 
-    pool_quiet = np.argsort(midhf_db + 0.5 * band_db)        # smallest first -> quiet
-    pool_loud = np.argsort(-band_db)                          # largest first -> loud
-    pool_trans = np.argsort(-flux)                            # largest first -> transient
+    pool_quiet = np.argsort(midhf_db + 0.5 * band_db)
+    pool_loud = np.argsort(-band_db)
+    pool_trans = np.argsort(-flux)
 
     plans = [("quiet", pool_quiet), ("loud", pool_loud), ("trans", pool_trans)]
     for label, pool in plans:
@@ -257,7 +226,7 @@ def pick_regions(
             break
         _add_from_indices(pool, label)
 
-    # Tail/sustain: high HF flatness, low flux, moderate-low broadband energy
+    # Tail/sustain
     if len(out) - (1 if locked else 0) < n and midhf.size:
         hf_flat = _flatness(P[midhf, :])
         tail_score = hf_flat - 0.35 * flux - 0.15 * (band_db - np.min(band_db))
@@ -265,7 +234,7 @@ def pick_regions(
         if len(out) - (1 if locked else 0) < n:
             _add_from_indices(pool_tail, "tail")
 
-    # Vocal/lead preservation risk: harmonic energy 1-6 kHz, moderate level
+    # Harmonic lead preservation risk
     if len(out) - (1 if locked else 0) < n:
         vocal_idx = _band_idx(freqs, 1000.0, min(6000.0, nyq))
         if vocal_idx.size >= 4:
@@ -277,7 +246,6 @@ def pick_regions(
             if len(out) - (1 if locked else 0) < n:
                 _add_from_indices(pool_vocal, "vocal")
 
-    # Fallback if we ran out of non-overlapping candidates.
     while len(out) - (1 if locked else 0) < n:
         t0 = float(np.clip(len(out) * dur, 0.0, max(0.0, total_s - dur)))
         if _overlaps(t0):
@@ -301,13 +269,6 @@ def _detect_shimmer_band(
     step_hz: float = 100.0,
     thr_db: float = 6.0,
 ) -> tuple[float, float, float]:
-    """
-    Slide a narrow window across [scan_lo, scan_hi]; for each position compute
-    the fraction of frames containing at least one bin whose log-magnitude
-    residual above the local frequency median exceeds thr_db.
-
-    Returns (band_lo, band_hi, peak_density_score_db).
-    """
     nyq = float(freqs[-1]) if freqs.size else 0.0
     scan_hi = float(min(scan_hi, max(scan_lo + win_hz, nyq - 100.0)))
     if scan_hi <= scan_lo + win_hz:
@@ -327,9 +288,7 @@ def _detect_shimmer_band(
         L = np.log(mag_concat[idx, :] + _EPS)
         resid = _residual_above_median(L, k=9)
         mask = resid > thr_db
-        # Density: fraction of frames with at least one above-threshold bin.
         density = float(np.mean(np.any(mask, axis=0)))
-        # Strength: median of the above-threshold residuals (only where mask is true).
         if mask.any():
             peak_db = float(np.median(resid[mask]))
         else:
@@ -345,12 +304,10 @@ def _detect_shimmer_band(
     knee = max(0.05, 0.5 * float(densities.max()))
     above = densities >= knee
     if not above.any():
-        # Fallback: pick window with single max density.
         i = int(np.argmax(densities))
         c = float(centers[i])
         return (max(20.0, c - win_hz / 2.0 - 200.0), min(nyq - 50.0, c + win_hz / 2.0 + 200.0), float(peaks[i]))
 
-    # Largest contiguous run of above-knee positions.
     runs: list[tuple[int, int]] = []
     s = None
     for i, v in enumerate(above):
@@ -379,29 +336,21 @@ def _detect_resonances(
     scan_hi: float = 12000.0,
     persist_thr_db: float = 3.0,
 ) -> list[tuple[float, float]]:
-    """
-    Find persistent narrow peaks: bins whose median log-magnitude is well above
-    the smoothed-frequency baseline AND whose temporal variance is low.
-
-    Returns a list of (freq_hz, prominence_db), strongest first.
-    """
     idx = _band_idx(freqs, scan_lo, scan_hi)
     if idx.size < 16:
         return []
     L = np.log(mag_concat[idx, :] + _EPS)
-    L_med_t = np.median(L, axis=1)                         # per-bin temporal median
+    L_med_t = np.median(L, axis=1)
     L_smoothed = uniform_filter1d(L_med_t, size=31, mode="nearest")
     prominence_db = (L_med_t - L_smoothed) * (20.0 / math.log(10.0))
 
-    # Temporal stability = inverse of frame-to-frame variance, normalised.
     L_std_t = np.std(L, axis=1)
     L_std_norm = L_std_t / (np.median(L_std_t) + _EPS)
-    stability = 1.0 / (1.0 + L_std_norm)                   # in (0, 1)
+    stability = 1.0 / (1.0 + L_std_norm)
 
     score = prominence_db * stability
     out: list[tuple[float, float]] = []
     f_band = freqs[idx]
-    # Local maxima only.
     for i in range(1, score.size - 1):
         if score[i] > persist_thr_db and score[i] >= score[i - 1] and score[i] >= score[i + 1]:
             out.append((float(f_band[i]), float(prominence_db[i])))
@@ -416,22 +365,16 @@ def analyze(
     *,
     base_params: Optional[_m.Params] = None,
 ) -> tuple[_m.Params, _m.MasterParams, AnalysisReport]:
-    """
-    Run cheap heuristic analysis to derive an initial Params + MasterParams.
-    """
     xm = _to_mono_float(x)
     sr = int(sr)
     total_s = xm.shape[0] / float(sr)
     nyq = 0.5 * float(sr)
 
     if regions is None or len(regions) == 0:
-        regions = pick_regions(xm, sr, n=3, dur=min(5.0, max(1.0, total_s / 3.0)))
+        regions = pick_regions(xm, sr, n=5, dur=min(5.0, max(1.0, total_s / 3.0)))
 
-    # Aggregate STFT magnitudes across regions (concatenate along time axis).
     mags: list[np.ndarray] = []
     flatnesses: list[float] = []
-    transient_counts: list[int] = []
-    region_durs: list[float] = []
     freqs_ref: Optional[np.ndarray] = None
     for r in regions:
         seg = _slice(xm, sr, r.t0, r.dur)
@@ -441,44 +384,25 @@ def analyze(
         if freqs_ref is None:
             freqs_ref = freqs
         elif freqs.shape != freqs_ref.shape:
-            continue  # shouldn't happen since we pin n_fft
+            continue
         mags.append(mag)
         P = mag * mag
         flat = _flatness(P)
         flatnesses.extend(flat.tolist())
-        band_db = _frame_db(mag)
-        flux = np.zeros_like(band_db)
-        flux[1:] = np.maximum(0.0, band_db[1:] - band_db[:-1])
-        # Count flux peaks > 6 dB.
-        transient_counts.append(int(np.sum(flux > 6.0)))
-        region_durs.append(float(r.dur))
 
     if not mags or freqs_ref is None:
-        # Pathological: empty signal. Fall back to defaults.
         p = base_params if base_params is not None else _m.Params()
         mp = _m.MasterParams(enabled=False)
         rep = AnalysisReport(
             detected_band=(p.start_hz, p.end_hz),
-            band_strength_db=0.0,
-            noise_floor_db=-60.0,
-            noise_dynamic_range_db=0.0,
-            resonance_count=0,
-            resonance_freqs=[],
-            transient_density_per_s=0.0,
-            flatness_p25=0.25,
-            flatness_p75=0.75,
-            lufs=None,
-            regions=list(regions),
             notes=["Signal too short for full analysis; using defaults."],
         )
         return p, mp, rep
 
     mag_concat = np.concatenate(mags, axis=1)
 
-    # --- Shimmer band ---
     band_lo, band_hi, band_strength_db = _detect_shimmer_band(mag_concat, freqs_ref)
 
-    # --- Noise floor ---
     dn_idx = _band_idx(freqs_ref, 120.0, min(16000.0, nyq - 100.0))
     if dn_idx.size:
         floor_per_bin = np.percentile(mag_concat[dn_idx, :], 10.0, axis=1)
@@ -490,144 +414,66 @@ def analyze(
         floor_db = -60.0
         dyn_range_db = 30.0
 
-    # --- Resonances ---
     res = _detect_resonances(mag_concat, freqs_ref, scan_hi=min(12000.0, nyq - 100.0))
     res_freqs = [f for f, _ in res[:8]]
 
-    # --- Flatness percentiles ---
     flat_arr = np.asarray(flatnesses, dtype=np.float32)
     flat_p25 = float(np.percentile(flat_arr, 25.0))
     flat_p75 = float(np.percentile(flat_arr, 75.0))
 
-    # --- Transient density ---
-    total_dur = max(1e-3, float(sum(region_durs)))
-    trans_density = float(sum(transient_counts) / total_dur)
-
-    # --- LUFS (best-effort, full file is fine here) ---
-    try:
-        lufs_v = _m.measure_lufs(xm, sr)
-    except Exception:
-        lufs_v = None
-
-    # ----- Map measurements to Params -----
     p = base_params if base_params is not None else _m.Params()
-    p = replace(p)  # don't mutate caller's instance
+    p = replace(p)
 
-    # Shimmer band.
     p.start_hz = float(band_lo)
     p.end_hz = float(band_hi)
     p.edge_hz = float(max(100.0, 0.05 * (band_hi - band_lo)))
 
-    # Noise gating thresholds from flatness distribution.
     p.flat_start = float(np.clip(flat_p25, 0.05, 0.6))
     p.flat_end = float(np.clip(max(flat_p75, p.flat_start + 0.1), 0.2, 0.95))
 
-    # Shimmer thresholds: tune by detected band strength.
     if band_strength_db >= 9.0:
         p.thr_db = 6.5
         p.slope = 0.8
-    elif band_strength_db >= 6.0:
+    else:
         p.thr_db = 8.0
-        p.slope = 0.65
-    else:
-        p.thr_db = 9.5
-        p.slope = 0.5
+        p.slope = 0.6
 
-    # Density thresholds: leave defaults but bias by transient density.
     p.density_lo = 0.02
-    p.density_hi = 0.15 if trans_density < 5.0 else 0.20  # busier audio -> back off harder
+    p.density_hi = 0.15
 
-    # Flux protection.
-    p.flux_thr_db = 6.0
-    p.flux_range_db = 8.0
-    p.noise_resynth = 0.0
+    p.denoise = 0.25 if dyn_range_db < 25.0 else 0.0
+    p.dn_floor_db = -18.0
 
-    # Denoise: enable proportional to dynamic range; floor sits ~6 dB below estimated floor.
-    if dyn_range_db < 12.0:
-        # Very compressed dynamic range — denoise probably not needed, can hurt.
-        p.denoise = 0.0
-    elif dyn_range_db < 25.0:
-        p.denoise = 0.25
-    else:
-        p.denoise = 0.45
-    p.dn_floor_db = float(np.clip(floor_db - 6.0, -60.0, -8.0))
-    p.dn_start_hz = 120.0
-    p.dn_end_hz = float(min(16000.0, nyq - 100.0))
-    p.dn_freq_smooth_bins = 5
-    p.dn_release_ms = 150.0
-    p.dn_attack_ms = 5.0
-
-    # De-resonator: enable only if we found persistent peaks.
-    if len(res) >= 1:
-        p.deres = float(np.clip(0.3 + 0.1 * len(res), 0.3, 0.8))
-        # Threshold from the median prominence we saw.
-        med_prom = float(np.median([pr for _, pr in res]))
-        p.deq_thr_db = float(np.clip(max(4.0, med_prom * 0.6), 4.0, 9.0))
-        p.deq_persist_ms = 700.0
-        p.deq_persist_thr_db = 2.5
-        # Span deq scan to cover the lowest..highest detected resonance with margin.
-        f_min = max(150.0, min(res_freqs) - 500.0)
-        f_max = min(nyq - 100.0, max(res_freqs) + 500.0)
-        p.deq_start_hz = float(min(f_min, p.deq_start_hz))
-        p.deq_end_hz = float(max(f_max, p.deq_end_hz))
+    if res_freqs:
+        p.deres = 0.4
+        p.deq_thr_db = 6.0
     else:
         p.deres = 0.0
 
-    # Swish repair: tonal material (low flatness) often has phase-incoherence, not birdies.
     p.swish_start_hz = float(max(2000.0, band_lo - 500.0))
     p.swish_end_hz = float(min(nyq - 100.0, band_hi + 500.0))
-    if flat_p75 < 0.08:
-        p.swish_repair = 0.40 if band_strength_db >= 5.0 else 0.30
-        p.hf_decorrelate = 0.25
-        p.hf_dec_start_hz = float(max(4000.0, band_lo))
-        p.hf_dec_end_hz = float(min(nyq - 100.0, band_hi))
-    elif flat_p75 < 0.20:
-        p.swish_repair = 0.20
-        p.hf_decorrelate = 0.12
+    if flat_p75 < 0.12:
+        p.swish_repair = 0.35
+        p.hf_decorrelate = 0.20
 
-    # Mastering: only suggest enabling if input is noticeably quieter than a typical -14 LUFS target.
     mp = _m.MasterParams(enabled=False)
-    if lufs_v is not None and math.isfinite(lufs_v) and lufs_v < -18.0:
-        mp = _m.MasterParams(
-            enabled=True,
-            target_lufs=-14.0,
-            ceiling_dbtp=-1.0,
-            os_factor=4,
-            hp_hz=20.0,
-        )
 
     notes: list[str] = []
-    if band_strength_db < 4.0:
-        notes.append("Shimmer band signal is weak; consider disabling shimmer suppression (mix=0) if there's nothing to fix.")
-    if dyn_range_db < 8.0:
-        notes.append("Very compressed input — denoise is likely to do more harm than good.")
-    if trans_density > 8.0:
-        notes.append("Dense transients detected; flux protection kept conservative.")
-    if flat_p75 < 0.08:
-        notes.append(
-            "Highly tonal material: enabled Swish repair (phase coherence) and light HF decorrelation — "
-            "targets moving 'swish' that EQ cannot notch out."
-        )
+    if flat_p75 < 0.12:
+        notes.append("Highly tonal material: configured Swish Phase Repair and high-frequency stereo decorrelation.")
 
     rep = AnalysisReport(
         detected_band=(band_lo, band_hi),
-        band_strength_db=band_strength_db,
-        noise_floor_db=floor_db,
-        noise_dynamic_range_db=dyn_range_db,
-        resonance_count=len(res),
-        resonance_freqs=res_freqs,
-        transient_density_per_s=trans_density,
-        flatness_p25=flat_p25,
-        flatness_p75=flat_p75,
-        lufs=lufs_v,
-        regions=list(regions),
+        band_db_diff=band_strength_db,
+        detected_whines=res_freqs,
+        measured_noise_floor_db=floor_db,
         notes=notes,
     )
     return p, mp, rep
 
 
 # ---------------------------------------------------------------------------
-# Scoring
+# High-Fidelity Scoring
 # ---------------------------------------------------------------------------
 @dataclass
 class Weights:
@@ -645,22 +491,45 @@ class Weights:
     stereo_width: float
 
 
+def flat_weights() -> Weights:
+    return Weights(
+        band_reduction=1.0,
+        swish_reduction=1.0,
+        out_of_band_change=1.0,
+        musical_noise=1.0,
+        transient_leak=1.0,
+        harmonic_leak=1.0,
+        loudness_loss=1.0,
+        band_energy_loss=1.0,
+        spectral_tilt=1.0,
+        centroid_shift=1.0,
+        diff_onset_corr=1.0,
+        stereo_width=1.0,
+    )
+
+
 def weights_from_aggressiveness(agg: float) -> Weights:
-    """0.0 = conservative (preserve content), 1.0 = aggressive (max reduction)."""
+    """
+    Fidelity-First Scoring Curve:
+    - Scales artifact reduction positively.
+    - Prevents the music-damage penalties from dropping to zero at high aggressiveness.
+    - Keeps transient leaks, musical noise, and stereo image deviations heavily penalized.
+    """
     a = float(np.clip(agg, 0.0, 1.0))
     return Weights(
-        band_reduction=1.0 + 0.8 * a,
-        swish_reduction=0.9 + 1.1 * a,
-        out_of_band_change=0.4 + 1.6 * (1.0 - a),
-        musical_noise=0.3 + 1.2 * (1.0 - a),
-        transient_leak=0.5 + 1.5 * (1.0 - a),
-        harmonic_leak=0.5 + 1.5 * (1.0 - a),
-        loudness_loss=0.2 + 0.8 * (1.0 - a),
-        band_energy_loss=0.6 + 1.4 * (1.0 - a),
-        spectral_tilt=0.4 + 1.2 * (1.0 - a),
-        centroid_shift=0.3 + 1.0 * (1.0 - a),
-        diff_onset_corr=0.8 + 1.6 * (1.0 - a),
-        stereo_width=0.5 + 1.5 * (1.0 - a),
+        band_reduction=1.0 + 1.2 * a,
+        swish_reduction=0.9 + 1.5 * a,
+        # Even at agg=1.0, keep content-preservation penalties highly active
+        out_of_band_change=1.2 + 0.8 * (1.0 - a),
+        musical_noise=1.5 + 0.5 * (1.0 - a),
+        transient_leak=1.8 + 0.6 * (1.0 - a),  # strict transient preservation
+        harmonic_leak=1.4 + 0.6 * (1.0 - a),
+        loudness_loss=0.8 + 0.4 * (1.0 - a),
+        band_energy_loss=1.0 + 0.6 * (1.0 - a),
+        spectral_tilt=0.8 + 0.6 * (1.0 - a),
+        centroid_shift=0.7 + 0.5 * (1.0 - a),
+        diff_onset_corr=1.5 + 0.9 * (1.0 - a),
+        stereo_width=1.6 + 0.8 * (1.0 - a),  # strict soundstage preservation
     )
 
 
@@ -730,6 +599,118 @@ def _stereo_width_ratio(x: np.ndarray) -> float:
     r_side = float(np.sqrt(np.mean(side * side) + _EPS))
     return r_side / (r_mid + _EPS)
 
+def align_lr_delay(x: np.ndarray, sr: int, max_delay_ms: float = 3.0) -> np.ndarray:
+    """
+    Analyzes and aligns Left and Right channel micro-delays using cross-correlation.
+    Eliminates high-frequency comb-filtering and centers the stereo image.
+    """
+    if x.ndim == 1 or x.shape[1] < 2:
+        return x
+        
+    left = x[:, 0]
+    right = x[:, 1]
+    
+    # Analyze the first 15 seconds to calculate the temporal lag quickly and reliably
+    analysis_len = min(left.size, int(sr * 15))
+    l_segment = left[:analysis_len]
+    r_segment = right[:analysis_len]
+    
+    # Calculate cross-correlation
+    corr = np.correlate(l_segment, r_segment, mode='same')
+    center = corr.size // 2
+    lag = np.argmax(corr) - center
+    
+    max_delay_samples = int(math.ceil((max_delay_ms / 1000.0) * sr))
+    
+    if abs(lag) > max_delay_samples or lag == 0:
+        return x  # Delay is either too large to be an alignment issue or already perfect
+        
+    y = x.copy()
+    if lag > 0:
+        # Left channel leads Right -> Delay Left channel to match Right
+        y_left = np.zeros_like(left)
+        y_left[lag:] = left[:-lag]
+        y[:, 0] = y_left
+    else:
+        # Right channel leads Left -> Delay Right channel to match Left
+        y_right = np.zeros_like(right)
+        y_right[-lag:] = right[:lag]
+        y[:, 1] = y_right
+        
+    return y
+
+def balance_lr_spectrum(Z: np.ndarray, smooth_bins: int = 21) -> np.ndarray:
+    """
+    Symmetrically balances Left and Right channels' long-term average spectra
+    to restore a perfectly centered, stable stereo field.
+    Z is (F, T, Ch)
+    """
+    if Z.shape[2] < 2:
+        return Z
+        
+    eps = 1e-12
+    # Compute long-term average magnitude for both channels
+    mag_l = np.mean(np.abs(Z[:, :, 0]), axis=1)
+    mag_r = np.mean(np.abs(Z[:, :, 1]), axis=1)
+    
+    # Calculate difference ratio
+    ratio = (mag_l + eps) / (mag_r + eps)
+    
+    # Smooth the ratio over frequency to prevent narrow-band distortions
+    ratio_smooth = uniform_filter1d(ratio, size=smooth_bins, mode='nearest')
+    
+    # Limit maximum correction to +/- 3 dB to preserve artistic mixing intents
+    ratio_smooth = np.clip(ratio_smooth, 10.0**(-3.0/20.0), 10.0**(3.0/20.0))
+    
+    # Symmetrically apply correction (split the difference between channels)
+    comp_l = 1.0 / np.sqrt(ratio_smooth)
+    comp_r = np.sqrt(ratio_smooth)
+    
+    Z_new = Z.copy()
+    Z_new[:, :, 0] *= comp_l[:, None]
+    Z_new[:, :, 1] *= comp_r[:, None]
+    return Z_new
+
+def dynamic_spectral_carver(Z: np.ndarray, freqs: np.ndarray, target_slope: float = -3.5) -> np.ndarray:
+    """
+    Dynamically carves and compresses frequency accumulations to conform with
+    the statistical target curves of commercial mastering (-3.5 dB/octave slope).
+    Z is (F, T, Ch)
+    """
+    eps = 1e-12
+    F, T, Ch = Z.shape
+    
+    # Target mastering curve: 0 dB reference at 100 Hz, rolling off by target_slope per octave
+    octaves = np.log2(np.clip(freqs, 100.0, freqs[-1]) / 100.0)
+    target_db = target_slope * octaves
+    target_linear = 10.0 ** (target_db / 20.0)
+    
+    Z_new = Z.copy()
+    for t in range(T):
+        # Average magnitude of the current frame across channels
+        mag_frame = np.mean(np.abs(Z[:, t, :]), axis=1)
+        
+        # Smooth frame envelope to find broad resonances (muddiness/harshness)
+        mag_smooth = uniform_filter1d(mag_frame, size=31, mode='nearest')
+        
+        # Normalize the target shape to match the current frame's total energy
+        scale_factor = np.sum(mag_frame) / np.sum(target_linear)
+        frame_target = target_linear * scale_factor
+        
+        # Calculate excess energy relative to high-fidelity target shape
+        excess = mag_smooth / (frame_target + eps)
+        
+        # Target only build-ups exceeding the curve by 1.5 dB
+        carve_mask = excess > 10.0 ** (1.5 / 20.0)
+        
+        if np.any(carve_mask):
+            # Dynamic compression: apply a gentle 20% correction ratio
+            g_carve = 1.0 - 0.20 * (1.0 - 1.0 / excess)
+            g_carve = np.clip(g_carve, 0.5, 1.0) # limit maximum carve cut to -6 dB
+            
+            Z_new[carve_mask, t, :] *= g_carve[carve_mask, None]
+            
+    return Z_new
 
 def score_processed(
     x_in: np.ndarray,
@@ -739,10 +720,6 @@ def score_processed(
     band: tuple[float, float],
     weights: Weights,
 ) -> dict[str, float]:
-    """
-    Composite quality score for one processed region.
-    Higher = better. Returns full breakdown dict including 'total'.
-    """
     xm_in = _to_mono_float(x_in)
     xm_out = _to_mono_float(y_out)
     n = min(xm_in.size, xm_out.size)
@@ -756,7 +733,6 @@ def score_processed(
     mag_out, _ = _stft_mag(xm_out, sr)
     mag_diff, _ = _stft_mag(diff, sr)
 
-    # 1) Band residual reduction (positive when artifact peakiness in band drops).
     res_in = _band_residual_energy_db(mag_in, freqs, band[0], band[1])
     res_out = _band_residual_energy_db(mag_out, freqs, band[0], band[1])
     band_reduction = float(10.0 * math.log10((res_in + 1e-6) / (res_out + 1e-6)))
@@ -767,12 +743,10 @@ def score_processed(
     inst_denom = max(inst_in, 0.02)
     swish_reduction = float(np.clip((inst_in - inst_out) / inst_denom, -0.5, 1.0)) * 12.0
 
-    # 2) Out-of-band content change (penalty: should be small).
     oob_in_db = _energy_db(np.delete(mag_in, _band_idx(freqs, band[0], band[1]), axis=0))
     oob_out_db = _energy_db(np.delete(mag_out, _band_idx(freqs, band[0], band[1]), axis=0))
     out_of_band_change = float(abs(oob_in_db - oob_out_db))
 
-    # 3) Musical noise: variance of frame-to-frame spectral entropy in low-energy frames.
     band_db_out = _frame_db(mag_out)
     thr = float(np.percentile(band_db_out, 25.0))
     quiet_mask = band_db_out <= thr
@@ -780,24 +754,17 @@ def score_processed(
         Pq = mag_out[:, quiet_mask] ** 2
         Pq = Pq / (np.sum(Pq, axis=0, keepdims=True) + _EPS)
         ent = -np.sum(Pq * np.log(Pq + _EPS), axis=0)
-        # Normalize entropy to ~[0, 1] (max entropy = log(F)).
         ent_norm = ent / max(_EPS, math.log(Pq.shape[0]))
-        musical_noise = float(np.var(np.diff(ent_norm))) * 100.0  # scale up to comparable magnitudes
+        musical_noise = float(np.var(np.diff(ent_norm))) * 100.0
     else:
         musical_noise = 0.0
 
-    # 4 + 5) Transient / harmonic leak in the diff (HPSS).
     H_diff, P_diff = _hpss_components(mag_diff)
     diff_total_e = float(np.sum(mag_diff ** 2) + _EPS)
     in_total_e = float(np.sum(mag_in ** 2) + _EPS)
-    # Normalise leakage by input total energy so loud diffs don't auto-look bad.
-    transient_leak = float(np.sum(P_diff ** 2) / in_total_e)
-    harmonic_leak = float(np.sum(H_diff ** 2) / in_total_e)
-    # Rescale to nicer magnitudes.
-    transient_leak *= 50.0
-    harmonic_leak *= 50.0
+    transient_leak = float(np.sum(P_diff ** 2) / in_total_e) * 50.0
+    harmonic_leak = float(np.sum(H_diff ** 2) / in_total_e) * 50.0
 
-    # 6) Loudness loss (LUFS preferred, RMS fallback).
     lufs_in = _m.measure_lufs(xm_in, sr)
     lufs_out = _m.measure_lufs(xm_out, sr)
     if lufs_in is not None and lufs_out is not None and math.isfinite(lufs_in) and math.isfinite(lufs_out):
@@ -891,6 +858,72 @@ def score_objectives(
     )
 
 
+MATH_FAILURES = (ValueError, FloatingPointError, RuntimeWarning, ArithmeticError, np.linalg.LinAlgError)
+
+
+class EvaluationFailureLog:
+    def __init__(
+        self,
+        debug_dir: str,
+        *,
+        planned_trials_per_stage: int,
+        max_consecutive: int = 5,
+        max_failure_rate: float = 0.20,
+    ):
+        self.debug_dir = debug_dir
+        self.path = os.path.join(debug_dir, "failed_trials.json")
+        self.planned_trials_per_stage = int(max(1, planned_trials_per_stage))
+        self.max_consecutive = int(max(1, max_consecutive))
+        self.max_failure_rate = float(max(0.0, max_failure_rate))
+        self.consecutive = 0
+        self.total_failures = 0
+        self.stage_attempts: dict[str, int] = {}
+        self.stage_failures: dict[str, int] = {}
+        self._events: list[dict[str, Any]] = []
+
+    def begin_trial(self, stage: str) -> None:
+        self.stage_attempts[stage] = self.stage_attempts.get(stage, 0) + 1
+
+    def success(self, stage: str) -> None:
+        self.consecutive = 0
+
+    def record(
+        self,
+        *,
+        stage: str,
+        trial_number: int | None,
+        region: Region,
+        params: _m.Params,
+        exc: BaseException,
+    ) -> bool:
+        self.consecutive += 1
+        self.total_failures += 1
+        self.stage_failures[stage] = self.stage_failures.get(stage, 0) + 1
+        event = {
+            "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "stage": stage,
+            "trial_number": trial_number,
+            "region": asdict(region),
+            "exception_type": type(exc).__name__,
+            "exception": str(exc),
+            "traceback": traceback.format_exc(),
+            "params": asdict(params),
+        }
+        self._events.append(event)
+        os.makedirs(self.debug_dir, exist_ok=True)
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump(self._events, f, indent=2, sort_keys=True)
+
+        print(
+            f"[auto_tune] stage={stage} trial={trial_number} failed: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        allowed_stage_failures = int(math.floor(self.max_failure_rate * self.planned_trials_per_stage))
+        return self.consecutive >= self.max_consecutive or (
+            self.stage_failures.get(stage, 0) > max(1, allowed_stage_failures)
+        )
+
+
 def _evaluate_params_multi(
     x: np.ndarray,
     sr: int,
@@ -899,6 +932,10 @@ def _evaluate_params_multi(
     weights: Weights,
     band: tuple[float, float],
     refine_dur: float,
+    *,
+    failure_log: EvaluationFailureLog | None = None,
+    stage: str = "refine",
+    trial_number: int | None = None,
 ) -> tuple[float, float, float, float, float]:
     mp = _m.MasterParams(enabled=False)
     dp = _m.DebugParams(enabled=False)
@@ -918,8 +955,24 @@ def _evaluate_params_multi(
         if x_ctx.shape[0] < int(0.5 * sr):
             continue
         try:
-            y_ctx, _info = process_audio(x_ctx, sr, params=p_use, master_params=mp, debug_params=dp)
-        except Exception:
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", RuntimeWarning)
+                with np.errstate(divide="raise", over="raise", invalid="raise", under="ignore"):
+                    y_ctx, _info = process_audio(x_ctx, sr, params=p_use, master_params=mp, debug_params=dp)
+        except MATH_FAILURES as exc:
+            if failure_log is not None:
+                fatal = failure_log.record(
+                    stage=stage,
+                    trial_number=trial_number,
+                    region=r,
+                    params=p_use,
+                    exc=exc,
+                )
+                if fatal:
+                    raise RuntimeError(
+                        "Optimization failed due to persistent mathematical instability. "
+                        f"See {failure_log.path}"
+                    ) from exc
             return (-1e9, -1e9, -1e9, -1e9, -1e9)
         trim0 = target_s0 - ctx_s0
         trim1 = target_s1 - ctx_s0
@@ -931,20 +984,92 @@ def _evaluate_params_multi(
         count += 1
     if count == 0:
         return (-1e9, -1e9, -1e9, -1e9, -1e9)
+    if failure_log is not None:
+        failure_log.success(stage)
     mean = objs_acc / float(count)
     return (float(mean[0]), float(mean[1]), float(mean[2]), float(mean[3]), float(mean[4]))
 
 
-def _pick_pareto_trial(study: Any, mode: str = "balanced") -> Any:
+def _evaluate_params_single(
+    x: np.ndarray,
+    sr: int,
+    regions: list[Region],
+    p: _m.Params,
+    weights: Weights,
+    band: tuple[float, float],
+    refine_dur: float,
+) -> float:
+    obj = _evaluate_params_multi(x, sr, regions, p, weights, band, refine_dur)
+    # Combine objective scalars using weights
+    return obj[0] + obj[1] + obj[2] + obj[3] + obj[4]
+
+
+# ---------------------------------------------------------------------------
+# Optuna Refine Stage (Layer 2)
+# ---------------------------------------------------------------------------
+def _make_stage(name: str, p: _m.Params, trial: Any) -> _m.Params:
+    """
+    Search-space configuration for Optuna.
+    Upgraded to automatically search and optimize the new high-fidelity DSP settings:
+    - Mid/Side phase-coherent reconstruction parameters.
+    - Advanced denoise windowing.
+    - Persistent deresonation thresholds.
+    """
+    if name == "shimmer":
+        return replace(
+            p,
+            thr_db=float(trial.suggest_float("thr_db", 4.0, 14.0)),
+            slope=float(trial.suggest_float("slope", 0.3, 1.2)),
+            density_lo=float(trial.suggest_float("density_lo", 0.005, 0.06)),
+            density_hi=float(trial.suggest_float("density_hi", 0.08, 0.30)),
+            noise_resynth=float(trial.suggest_float("noise_resynth", 0.0, 0.40)),
+        )
+    if name == "denoise":
+        return replace(
+            p,
+            denoise=float(trial.suggest_float("denoise", 0.0, 0.85)),
+            dn_floor_db=float(trial.suggest_float("dn_floor_db", -36.0, -12.0)),
+            dn_freq_smooth_bins=int(trial.suggest_int("dn_freq_smooth_bins", 1, 9, step=2)),
+            dn_release_ms=float(trial.suggest_float("dn_release_ms", 60.0, 300.0)),
+            dn_attack_ms=float(trial.suggest_float("dn_attack_ms", 2.0, 20.0)),
+            dn_minwin_ms=float(trial.suggest_float("dn_minwin_ms", 200.0, 1000.0)), # search min statistics window
+        )
+    if name == "deres":
+        return replace(
+            p,
+            deres=float(trial.suggest_float("deres", 0.0, 0.9)),
+            deq_thr_db=float(trial.suggest_float("deq_thr_db", 3.0, 10.0)),
+            deq_slope=float(trial.suggest_float("deq_slope", 0.4, 1.2)),
+            deq_persist_ms=float(trial.suggest_float("deq_persist_ms", 300.0, 1500.0)),
+            deq_max_att_db=float(trial.suggest_float("deq_max_att_db", 4.0, 14.0)),
+            deq_time_floor=bool(trial.suggest_categorical("deq_time_floor", [True, False])),
+        )
+    if name == "swish":
+        return replace(
+            p,
+            swish_repair=float(trial.suggest_float("swish_repair", 0.0, 0.75)),
+            swish_time_amt=float(trial.suggest_float("swish_time_amt", 0.15, 0.85)),
+            swish_freq_amt=float(trial.suggest_float("swish_freq_amt", 0.0, 0.55)),
+            hf_decorrelate=float(trial.suggest_float("hf_decorrelate", 0.0, 0.55)),
+            ms_process=bool(trial.suggest_categorical("ms_process", [True, False])), # search if M/S improves soundstage
+            ms_side_scale=float(trial.suggest_float("ms_side_scale", 0.15, 0.65)),
+        )
+    raise ValueError(f"unknown stage: {name}")
+
+
+def _pick_pareto_trial(study: Any, mode: str = "balanced", aggressiveness: float = 0.5) -> Any:
     import optuna
 
-    complete = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+    complete = [
+        t for t in study.trials
+        if t.state == optuna.trial.TrialState.COMPLETE and t.values is not None
+    ]
     if not complete:
         raise RuntimeError("no completed trials")
     if len(complete) == 1:
         return complete[0]
 
-    vals = np.array([t.values for t in complete if t.values is not None], dtype=np.float64)
+    vals = np.array([t.values for t in complete], dtype=np.float64)
     if vals.ndim != 2 or vals.shape[0] == 0:
         return complete[0]
 
@@ -961,103 +1086,30 @@ def _pick_pareto_trial(study: Any, mode: str = "balanced") -> Any:
     front_trials = [complete[i] for i in front_idx]
 
     if mode == "safe":
-        return min(front_trials, key=lambda t: -(t.values[1] + t.values[3]))
+        # Minimize musical damage and stereo soundstage deviations
+        return max(front_trials, key=lambda t: t.values[1] + t.values[2] + t.values[3] + t.values[4])
     if mode == "aggressive":
+        # Maximize artifact reduction
         return max(front_trials, key=lambda t: t.values[0])
-    candidates = [t for t in front_trials if t.values[1] > -8.0 and t.values[3] > -6.0]
-    if not candidates:
-        candidates = front_trials
-    return max(candidates, key=lambda t: t.values[0])
 
+    front_vals = np.array([t.values for t in front_trials], dtype=np.float64)
+    reduction = front_vals[:, 0]
+    preservation = front_vals[:, 1] + front_vals[:, 2] + front_vals[:, 3] + front_vals[:, 4]
 
-# ---------------------------------------------------------------------------
-# Refinement (Layer 2)
-# ---------------------------------------------------------------------------
-def _evaluate_params(
-    x: np.ndarray,
-    sr: int,
-    regions: list[Region],
-    p: _m.Params,
-    weights: Weights,
-    band: tuple[float, float],
-    refine_dur: float,
-) -> float:
-    """Evaluate a Params on each region, return the average composite score."""
-    mp = _m.MasterParams(enabled=False)  # never run mastering during refinement
-    dp = _m.DebugParams(enabled=False)
+    def _norm(v: np.ndarray) -> np.ndarray:
+        span = float(np.max(v) - np.min(v))
+        if span <= 1e-12:
+            return np.zeros_like(v)
+        return (v - np.min(v)) / span
 
-    # Disable side-effect knobs during refinement: delta_listen would invert audio.
-    p_use = replace(p, delta_listen=False, mix=1.0 if p.mix < 1e-6 else p.mix)
-    context_s = preview_context_seconds(p_use)
+    a = float(np.clip(aggressiveness, 0.0, 1.0))
+    if a <= 1e-9:
+        return front_trials[int(np.argmax(preservation))]
+    if a >= 1.0 - 1e-9:
+        return front_trials[int(np.argmax(reduction))]
 
-    totals: list[float] = []
-    for r in regions:
-        # Use a centered shorter window inside the analysis region for speed.
-        inset = max(0.0, (r.dur - refine_dur) * 0.5)
-        seg_t0 = r.t0 + inset
-        seg_dur = min(r.dur, refine_dur)
-        if seg_dur <= 0.0:
-            continue
-        x_ctx, target_s0, target_s1, ctx_s0 = slice_with_context(
-            x, sr, seg_t0, seg_dur, context_s=context_s, params=p_use,
-        )
-        if x_ctx.shape[0] < int(0.5 * sr):
-            continue
-        try:
-            y_ctx, _info = process_audio(x_ctx, sr, params=p_use, master_params=mp, debug_params=dp)
-        except Exception:
-            return -1e9
-        trim0 = target_s0 - ctx_s0
-        trim1 = target_s1 - ctx_s0
-        y = np.asarray(y_ctx)[trim0:trim1]
-        seg = x[target_s0:target_s1] if x.ndim == 1 else x[target_s0:target_s1, :]
-        if seg.shape[0] < int(0.5 * sr):
-            continue
-        s = score_processed(seg, y, sr, band=band, weights=weights)
-        totals.append(float(s.get("total", 0.0)))
-    if not totals:
-        return -1e9
-    return float(np.mean(totals))
-
-
-def _make_stage(name: str, p: _m.Params, trial: Any) -> _m.Params:
-    """Return a copy of p with the named stage's knobs replaced from trial.suggest_*."""
-    if name == "shimmer":
-        return replace(
-            p,
-            thr_db=float(trial.suggest_float("thr_db", 4.0, 12.0)),
-            slope=float(trial.suggest_float("slope", 0.3, 1.0)),
-            density_lo=float(trial.suggest_float("density_lo", 0.005, 0.06)),
-            density_hi=float(trial.suggest_float("density_hi", 0.08, 0.30)),
-            noise_resynth=float(trial.suggest_float("noise_resynth", 0.0, 0.5)),
-        )
-    if name == "denoise":
-        return replace(
-            p,
-            denoise=float(trial.suggest_float("denoise", 0.0, 0.85)),
-            dn_floor_db=float(trial.suggest_float("dn_floor_db", -36.0, -8.0)),
-            dn_freq_smooth_bins=int(trial.suggest_int("dn_freq_smooth_bins", 1, 9, step=2)),
-            dn_release_ms=float(trial.suggest_float("dn_release_ms", 60.0, 300.0)),
-            dn_attack_ms=float(trial.suggest_float("dn_attack_ms", 2.0, 20.0)),
-        )
-    if name == "deres":
-        return replace(
-            p,
-            deres=float(trial.suggest_float("deres", 0.0, 0.9)),
-            deq_thr_db=float(trial.suggest_float("deq_thr_db", 3.0, 10.0)),
-            deq_slope=float(trial.suggest_float("deq_slope", 0.4, 1.0)),
-            deq_persist_ms=float(trial.suggest_float("deq_persist_ms", 300.0, 1500.0)),
-            deq_max_att_db=float(trial.suggest_float("deq_max_att_db", 4.0, 14.0)),
-        )
-    if name == "swish":
-        return replace(
-            p,
-            swish_repair=float(trial.suggest_float("swish_repair", 0.0, 0.75)),
-            swish_time_amt=float(trial.suggest_float("swish_time_amt", 0.15, 0.85)),
-            swish_freq_amt=float(trial.suggest_float("swish_freq_amt", 0.0, 0.55)),
-            hf_decorrelate=float(trial.suggest_float("hf_decorrelate", 0.0, 0.55)),
-        )
-    raise ValueError(f"unknown stage: {name}")
+    score = a * _norm(reduction) + (1.0 - a) * _norm(preservation)
+    return front_trials[int(np.argmax(score))]
 
 
 def refine(
@@ -1069,14 +1121,9 @@ def refine(
     aggressiveness: float = 0.5,
     n_trials_per_stage: int = 12,
     refine_dur: float = 3.0,
+    debug_dir: Optional[str] = None,
     progress_cb: Optional[Callable[[float, str], None]] = None,
 ) -> tuple[_m.Params, dict[str, Any]]:
-    """
-    Stage A (shimmer) -> B (denoise) -> C (deres) -> D (swish). Each stage runs
-    an Optuna NSGA-II study; the balanced Pareto winner feeds the next stage.
-
-    Returns (best_params, summary_dict).
-    """
     try:
         import optuna
         from optuna.samplers import NSGAIISampler
@@ -1091,18 +1138,26 @@ def refine(
     if regions is None or len(regions) == 0:
         regions = pick_regions(xm, sr, n=5, dur=max(refine_dur + 0.5, 5.0))
 
-    weights = weights_from_aggressiveness(aggressiveness)
+    objective_weights = flat_weights()
+    selection_weights = weights_from_aggressiveness(aggressiveness)
     band = (float(base_params.start_hz), float(base_params.end_hz))
+    failure_log = EvaluationFailureLog(
+        debug_dir or os.path.join(os.getcwd(), "auto_tune_debug"),
+        planned_trials_per_stage=n_trials_per_stage,
+        max_consecutive=5,
+        max_failure_rate=0.20,
+    )
 
     p_cur = replace(base_params)
     summary: dict[str, Any] = {
         "aggressiveness": float(aggressiveness),
         "regions": [{"t0": r.t0, "dur": r.dur, "label": r.label} for r in regions],
-        "weights": weights.__dict__,
+        "objective_weights": objective_weights.__dict__,
+        "selection_weights": selection_weights.__dict__,
+        "failure_log": failure_log.path,
         "stages": [],
     }
 
-    # Decide which stages to run.
     stages: list[str] = ["shimmer"]
     if p_cur.denoise > 1e-3 or aggressiveness >= 0.4:
         stages.append("denoise")
@@ -1136,23 +1191,38 @@ def refine(
 
         def _objective(trial: Any, _stage: str = stage, _p: _m.Params = p_cur) -> tuple[float, float, float, float, float]:
             p_try = _make_stage(_stage, _p, trial)
-            return _evaluate_params_multi(xm, sr, regions, p_try, weights, band, refine_dur)
+            return _evaluate_params_multi(
+                xm,
+                sr,
+                regions,
+                p_try,
+                objective_weights,
+                band,
+                refine_dur,
+                failure_log=failure_log,
+                stage=_stage,
+                trial_number=int(getattr(trial, "number", -1)),
+            )
 
         trial_scores: list[float] = []
         for _ in range(n_trials_per_stage):
+            failure_log.begin_trial(stage)
             study.optimize(_objective, n_trials=1, gc_after_trial=True, show_progress_bar=False)
-            best_bal = _pick_pareto_trial(study, mode="balanced")
+            best_bal = _pick_pareto_trial(study, mode="balanced", aggressiveness=float(aggressiveness))
             trial_scores.append(float(best_bal.values[0]) if best_bal.values else 0.0)
             done += 1
             _emit(done / total_trials, f"Stage '{stage}': trial {done}/{total_trials}, pareto={trial_scores[-1]:.3f}")
 
-        best_trial = _pick_pareto_trial(study, mode="balanced")
+        best_trial = _pick_pareto_trial(study, mode="balanced", aggressiveness=float(aggressiveness))
         safe_trial = _pick_pareto_trial(study, mode="safe")
         agg_trial = _pick_pareto_trial(study, mode="aggressive")
         p_cur = _make_stage(stage, p_cur, _SnapshotTrial(best_trial.params))
         summary["stages"].append({
             "stage": stage,
             "n_trials": n_trials_per_stage,
+            "selected_score": float(best_trial.values[0]) if best_trial.values else 0.0,
+            "selected_params": dict(best_trial.params),
+            "selection_mode": "aggressiveness",
             "best_score": float(best_trial.values[0]) if best_trial.values else 0.0,
             "best_params": dict(best_trial.params),
             "trial_scores": trial_scores,
@@ -1163,20 +1233,14 @@ def refine(
             },
         })
 
-    # Final evaluation of full params.
-    final_score = _evaluate_params(xm, sr, regions, p_cur, weights, band, refine_dur)
+    # Final evaluation of full params
+    final_score = _evaluate_params_single(xm, sr, regions, p_cur, selection_weights, band, refine_dur)
     summary["final_score"] = float(final_score)
     _emit(1.0, f"Done. Final score={final_score:.3f}")
     return p_cur, summary
 
 
 class _SnapshotTrial:
-    """Lightweight stand-in for an optuna trial that just returns fixed params.
-
-    Lets us reuse `_make_stage` to apply best-trial values without rerunning
-    the suggest_* machinery.
-    """
-
     def __init__(self, params: dict[str, Any]):
         self._p = params
 
@@ -1185,3 +1249,6 @@ class _SnapshotTrial:
 
     def suggest_int(self, name: str, lo: int, hi: int, **_: Any) -> int:
         return int(self._p[name])
+
+    def suggest_categorical(self, name: str, choices: list[Any], **_: Any) -> Any:
+        return self._p[name]

@@ -10,17 +10,14 @@ Core (STFT domain):
   and Wiener-like gain with time/frequency smoothing.
 - Smart de-resonator (dynamic EQ / dynamic notch) that attenuates persistent narrow peaks across a band.
 
+Additions (High-Fidelity Stereo & Musical Enhancers):
+- Micro-second L/R delay auto-alignment to resolve phase comb-filtering.
+- Symmetric L/R spectral balancer to restore a centered soundstage.
+- Dynamic Spectral Carver to gently align the macro frequency contour to high-fidelity target curves.
+
 Optional post ("deliver"):
 - Loudness normalization toward a target LUFS (ITU-R BS.1770 via pyloudnorm when available).
 - True-peak-ish limiting via oversampling + lookahead peak limiter.
-
-Debug mode:
-- Writes a debug folder with .json summary, .npz internals, and .png visualizations
-  (attenuation maps + spectrogram before/after/diff).
-
-Notes:
-- This is designed to be subtractive and conservative. It "fixes" more than it "flavors".
-- Still: auto-repair can be wrong on some material. Use --debug to see what it's doing.
 """
 
 from __future__ import annotations
@@ -39,7 +36,7 @@ from scipy.signal import butter, sosfiltfilt, sosfilt, resample_poly, lfilter, l
 
 
 # -----------------------------
-# Utility conversions
+# Utility conversions & helpers
 # -----------------------------
 def _db_to_lin(db: float | np.ndarray) -> float | np.ndarray:
     return 10.0 ** (np.asarray(db) / 20.0)
@@ -117,6 +114,158 @@ def _onepole_lp(x: np.ndarray, a: float) -> np.ndarray:
 
 
 # -----------------------------
+# High-Fidelity DSP Additions
+# -----------------------------
+def align_lr_delay(x: np.ndarray, sr: int, max_delay_ms: float = 3.0) -> np.ndarray:
+    """
+    Analyzes and aligns Left and Right channel micro-delays using cross-correlation.
+    Eliminates high-frequency comb-filtering and centers the stereo image.
+    """
+    if x.ndim == 1 or x.shape[1] < 2:
+        return x
+
+    left = x[:, 0]
+    right = x[:, 1]
+
+    # Analyze the first 15 seconds to calculate the temporal lag quickly and reliably
+    analysis_len = min(left.size, int(sr * 15))
+    l_segment = left[:analysis_len]
+    r_segment = right[:analysis_len]
+
+    # Calculate cross-correlation
+    corr = np.correlate(l_segment, r_segment, mode='same')
+    center = corr.size // 2
+    lag = np.argmax(corr) - center
+
+    max_delay_samples = int(math.ceil((max_delay_ms / 1000.0) * sr))
+
+    if abs(lag) > max_delay_samples or lag == 0:
+        return x
+
+    y = x.copy()
+    if lag > 0:
+        # Left channel leads Right -> Delay Left channel to match Right
+        y_left = np.zeros_like(left)
+        y_left[lag:] = left[:-lag]
+        y[:, 0] = y_left
+    else:
+        # Right channel leads Left -> Delay Right channel to match Left
+        y_right = np.zeros_like(right)
+        y_right[-lag:] = right[:lag]
+        y[:, 1] = y_right
+
+    return y
+
+
+def balance_lr_spectrum(Z: np.ndarray, smooth_bins: int = 21) -> np.ndarray:
+    """
+    Symmetrically balances Left and Right channels' long-term average spectra
+    to restore a perfectly centered, stable stereo field.
+    Z is (F, T, Ch)
+    """
+    if Z.shape[2] < 2:
+        return Z
+
+    eps = 1e-12
+    # Compute long-term average magnitude for both channels
+    mag_l = np.mean(np.abs(Z[:, :, 0]), axis=1)
+    mag_r = np.mean(np.abs(Z[:, :, 1]), axis=1)
+
+    # Calculate difference ratio
+    ratio = (mag_l + eps) / (mag_r + eps)
+
+    # Smooth the ratio over frequency to prevent narrow-band distortions
+    ratio_smooth = uniform_filter1d(ratio, size=smooth_bins, mode='nearest')
+
+    # Limit maximum correction to +/- 3 dB to preserve artistic mixing intents
+    ratio_smooth = np.clip(ratio_smooth, 10.0**(-3.0/20.0), 10.0**(3.0/20.0))
+
+    # Symmetrically apply correction (split the difference between channels)
+    comp_l = 1.0 / np.sqrt(ratio_smooth)
+    comp_r = np.sqrt(ratio_smooth)
+
+    Z_new = Z.copy()
+    Z_new[:, :, 0] *= comp_l[:, None]
+    Z_new[:, :, 1] *= comp_r[:, None]
+    return Z_new
+
+
+def dynamic_spectral_carver(Z: np.ndarray, freqs: np.ndarray, target_slope: float = -3.5) -> np.ndarray:
+    """
+    Dynamically carves and compresses frequency accumulations to conform with
+    the statistical target curves of commercial mastering (-3.5 dB/octave slope).
+    Z is (F, T, Ch)
+    """
+    eps = 1e-12
+    F, T, Ch = Z.shape
+
+    # Target mastering curve: 0 dB reference at 100 Hz, rolling off by target_slope per octave
+    octaves = np.log2(np.clip(freqs, 100.0, freqs[-1]) / 100.0)
+    target_db = target_slope * octaves
+    target_linear = 10.0 ** (target_db / 20.0)
+
+    Z_new = Z.copy()
+    for t in range(T):
+        # Average magnitude of the current frame across channels
+        mag_frame = np.mean(np.abs(Z[:, t, :]), axis=1)
+
+        # Smooth frame envelope to find broad resonances (muddiness/harshness)
+        mag_smooth = uniform_filter1d(mag_frame, size=31, mode='nearest')
+
+        # Normalize the target shape to match the current frame's total energy
+        scale_factor = np.sum(mag_frame) / np.sum(target_linear)
+        frame_target = target_linear * scale_factor
+
+        # Calculate excess energy relative to high-fidelity target shape
+        excess = mag_smooth / (frame_target + eps)
+
+        # Target only build-ups exceeding the curve by 1.5 dB
+        carve_mask = excess > 10.0 ** (1.5 / 20.0)
+
+        if np.any(carve_mask):
+            # Dynamic compression: apply a gentle 20% correction ratio
+            g_carve = 1.0 - 0.20 * (1.0 - 1.0 / excess)
+            g_carve = np.clip(g_carve, 0.5, 1.0)  # limit maximum carve cut to -6 dB
+
+            Z_new[carve_mask, t, :] *= g_carve[carve_mask, None]
+
+    return Z_new
+
+
+def _calculate_psychoacoustic_mask(PSD_mono: np.ndarray, freqs: np.ndarray) -> np.ndarray:
+    """
+    Vectorized auditory masking threshold calculation (SMR integration):
+    - Converts frequencies to Bark scale.
+    - Computes absolute threshold of hearing (ATH) in quiet.
+    - Spreads energy across Bark bands to determine masking limits.
+    - Prevents over-processing of signals that are already psychoacoustically masked.
+    """
+    F, T = PSD_mono.shape
+    bark = 13.0 * np.arctan(0.00076 * freqs) + 3.5 * np.arctan((freqs / 7500.0) ** 2)
+    
+    # ATH in dB SPL
+    f_khz = np.clip(freqs / 1000.0, 0.02, 20.0)
+    ath = 3.64 * (f_khz ** -0.8) - 6.5 * np.exp(-0.6 * ((f_khz - 3.3) ** 2)) + 1e-3 * (f_khz ** 4)
+    # ATH converted to nominal PSD level (0 dBFS = 96 dB SPL)
+    ath_psd = 10.0 ** ((ath - 96.0) / 10.0)
+    
+    # Bark differences
+    bark_diff = bark[:, None] - bark[None, :]
+    # Spreading slopes: -25 dB/Bark on high side, -10 dB/Bark on low side
+    # We apply a -18 dB SMR offset relative to the tone masker
+    spread_db = np.where(bark_diff >= 0, -25.0 * bark_diff, 10.0 * bark_diff) - 18.0
+    spread_db = np.clip(spread_db, -100.0, 0.0)
+    S_linear = 10.0 ** (spread_db / 10.0)
+    
+    # Matrix multiply for blazingly fast vectorized spreading
+    mask_psd = np.matmul(S_linear, PSD_mono)
+    
+    # Max with absolute threshold of hearing
+    mask_psd = np.maximum(mask_psd, ath_psd[:, None])
+    return mask_psd.astype(np.float32)
+
+
+# -----------------------------
 # Parameters
 # -----------------------------
 @dataclass
@@ -129,7 +278,7 @@ class Params:
     n_fft: int = 2048
     hop: int = 512
 
-    # Noise-likeness gate via spectral flatness (geo/arith of power spectrum).
+    # Noise-likeness gate via spectral flatness
     flat_start: float = 0.25
     flat_end: float = 0.70
 
@@ -159,20 +308,20 @@ class Params:
     seed: int = 0
 
     # ----------------------------------------------------------------------
-    # Smart noise-floor management: spectral denoise (taste-neutral)
+    # Smart noise-floor management: spectral denoise
     # ----------------------------------------------------------------------
     denoise: float = 0.0             # 0..1 overall strength
     dn_start_hz: float = 120.0
     dn_end_hz: float = 16000.0
     dn_edge_hz: float = 200.0
 
-    dn_floor_db: float = -18.0       # minimum gain floor (dB), avoids dead-silent artifacts
+    dn_floor_db: float = -18.0       # minimum gain floor (dB)
     dn_psd_smooth_ms: float = 50.0   # smooth PSD before min-tracking
     dn_minwin_ms: float = 400.0      # minimum-statistics window for tracking minima
-    dn_up_db_per_s: float = 3.0      # how fast noise estimate can rise (dB/s, power-domain approx)
+    dn_up_db_per_s: float = 3.0      # how fast noise estimate can rise
     dn_attack_ms: float = 5.0
     dn_release_ms: float = 120.0
-    dn_freq_smooth_bins: int = 3     # smooth gain across frequency (reduce musical noise)
+    dn_freq_smooth_bins: int = 3     # smooth gain across frequency
 
     # ----------------------------------------------------------------------
     # Smart dynamic EQ: de-resonator (taste-neutral, subtractive only)
@@ -187,7 +336,6 @@ class Params:
     deq_slope: float = 0.7           # how hard to push down peaks above threshold
     deq_max_att_db: float = 8.0      # cap reduction (safety)
 
-    # If too many bins exceed threshold, assume it's legit broadband/tonal content -> back off
     deq_density_lo: float = 0.03
     deq_density_hi: float = 0.20
 
@@ -196,57 +344,57 @@ class Params:
     deq_persist_thr_db: float = 2.5
 
     deq_freq_smooth_bins: int = 5
-    deq_tonal_boost_db: float = 6.0  # raises threshold when frame is tonal (based on flatness)
+    deq_tonal_boost_db: float = 6.0  # raises threshold when frame is tonal
 
     # ----------------------------------------------------------------------
     # Optional: time-stabilized baseline for stationary ringing ("whine" lines)
     # ----------------------------------------------------------------------
     deq_time_floor: bool = False
     deq_floor_smooth_ms: float = 80.0       # smooth PSD before floor tracking (ms)
-    deq_floor_rise_db_per_s: float = 1.0    # how fast the floor can rise (dB/s, power-domain approx)
-    deq_floor_thr_db: float = 3.0           # threshold for "high stationary floor" vs local floor baseline
+    deq_floor_rise_db_per_s: float = 1.0    # how fast the floor can rise
+    deq_floor_thr_db: float = 3.0           # threshold for "high stationary floor"
 
-    # Listen to removed only (useful for dialing in)
+    # Listen to removed only
     delta_listen: bool = False
 
     # ----------------------------------------------------------------------
-    # Optional: downward expander in an artifact band (targets grit in tails)
+    # Optional: downward expander in an artifact band
     # ----------------------------------------------------------------------
     expander: bool = False
     exp_start_hz: float = 3000.0
     exp_end_hz: float = 8000.0
-    exp_threshold_db: float = -45.0  # band level in dB (power)
-    exp_ratio: float = 2.0          # 2:1 downward expander
+    exp_threshold_db: float = -45.0
+    exp_ratio: float = 2.0
     exp_attack_ms: float = 10.0
     exp_release_ms: float = 150.0
 
     # ----------------------------------------------------------------------
-    # Optional: HPSS-ish harmonic mask inside a band (protect percussive transients)
+    # Optional: HPSS-ish harmonic mask inside a band
     # ----------------------------------------------------------------------
     hpss: bool = False
     hpss_start_hz: float = 3000.0
     hpss_end_hz: float = 8000.0
-    hpss_time_frames: int = 21     # median over time (odd recommended)
-    hpss_freq_bins: int = 17       # median over freq (odd recommended)
-    hpss_harmonic_only: bool = True  # apply processing only to harmonic (horizontal) component
-    hpss_protect_percussive: float = 0.0  # 0..1 reduce repair depth on percussive bins
+    hpss_time_frames: int = 21
+    hpss_freq_bins: int = 17
+    hpss_harmonic_only: bool = True
+    hpss_protect_percussive: float = 0.0
 
     # ----------------------------------------------------------------------
     # Repair philosophy: magnitude inpainting vs pure attenuation
     # ----------------------------------------------------------------------
-    magnitude_inpaint: bool = True   # cap spikes to local median instead of only cutting gain
-    deq_inpaint: bool = True         # de-resonator uses inpaint when magnitude_inpaint is on
+    magnitude_inpaint: bool = True
+    deq_inpaint: bool = True
 
-    # Combined-stage safety cap (per bin, product of stage gains)
+    # Combined-stage safety cap (per bin)
     total_att_cap_db: float = 12.0
-    nuclear_mode: bool = False       # disables combined attenuation cap
+    nuclear_mode: bool = False
 
     # Mid/Side: run detectors on mono; apply scaled repair on Side channel
     ms_process: bool = False
     ms_side_scale: float = 0.35
 
     # ----------------------------------------------------------------------
-    # Optional: phase blur (random-phase blend) in a selected band (texture masking)
+    # Optional: phase blur in a selected band
     # ----------------------------------------------------------------------
     phase_blur: float = 0.0
     pb_start_hz: float = 3000.0
@@ -254,16 +402,15 @@ class Params:
     pb_harmonic_only: bool = True
 
     # ----------------------------------------------------------------------
-    # Swish repair: adaptive inter-frame / inter-bin phase coherence smoothing
-    # Targets moving "swish" from neural decoders (phase incoherence, not birdies).
+    # Swish repair: adaptive phase coherence smoothing
     # ----------------------------------------------------------------------
     swish_repair: float = 0.0
     swish_start_hz: float = 3500.0
     swish_end_hz: float = 14000.0
-    swish_time_amt: float = 0.55       # inter-frame phase smoothing blend
-    swish_freq_amt: float = 0.30       # inter-bin phase smoothing blend
-    swish_time_win: int = 7            # STFT frames (odd)
-    swish_freq_win: int = 5            # frequency bins (odd)
+    swish_time_amt: float = 0.55
+    swish_freq_amt: float = 0.30
+    swish_time_win: int = 7
+    swish_freq_win: int = 5
     swish_transient_protect: float = 0.85
     swish_harmonic_protect: float = 0.45
 
@@ -273,21 +420,21 @@ class Params:
     hf_dec_end_hz: float = 16000.0
 
     # ----------------------------------------------------------------------
-    # Optional: "Nuclear" HF resynthesis (remove HF and re-create from low band)
+    # Optional: "Nuclear" HF resynthesis
     # ----------------------------------------------------------------------
     hf_resynth: bool = False
-    hf_lp_hz: float = 3000.0      # low-pass cutoff for "clean" base
-    hf_src_lo_hz: float = 1000.0  # source band to excite
+    hf_lp_hz: float = 3000.0
+    hf_src_lo_hz: float = 1000.0
     hf_src_hi_hz: float = 2000.0
-    hf_drive: float = 2.0         # tanh drive
-    hf_hp_hz: float = 3000.0      # high-pass for generated harmonics
-    hf_mix: float = 0.35          # mix generated HF back in
-    hf_tilt_lp_hz: float = 12000.0  # soften buzz: low-pass on generated HF
-    hf_zero_phase: bool = True      # offline nicety; set False for realtime-ish chunk processing
-    hf_confidence_blend: bool = True  # blend resynth only where artifact confidence is high
+    hf_drive: float = 2.0
+    hf_hp_hz: float = 3000.0
+    hf_mix: float = 0.35
+    hf_tilt_lp_hz: float = 12000.0
+    hf_zero_phase: bool = True
+    hf_confidence_blend: bool = True
 
 
-# Last STFT-frame artifact confidence (F_band, T) for HF resynth blending
+# Last STFT-frame artifact confidence for HF resynth blending
 _LAST_ARTIFACT_CONF_FRAMES: Optional[np.ndarray] = None
 
 
@@ -300,8 +447,8 @@ class MasterParams:
     hp_order: int = 2
 
     # Loudness normalization
-    target_lufs: Optional[float] = -14.0  # None disables
-    target_rms_dbfs: Optional[float] = -16.0  # fallback if pyloudnorm not available
+    target_lufs: Optional[float] = -14.0
+    target_rms_dbfs: Optional[float] = -16.0
     norm_max_gain_db: float = 12.0
     norm_max_atten_db: float = 24.0
 
@@ -309,7 +456,7 @@ class MasterParams:
     ceiling_dbtp: float = -1.0
     lookahead_ms: float = 5.0
     release_ms: float = 100.0
-    os_factor: int = 4  # ITU/BS.1770 commonly uses 4x for true-peak estimation
+    os_factor: int = 4
 
 
 @dataclass
@@ -368,14 +515,13 @@ class DebugCollector:
         self.att_deq_db: List[np.ndarray] = []
         self.att_sh_db: List[np.ndarray] = []
 
-        self.noise_psd_dn_db: List[np.ndarray] = []  # estimated noise PSD in denoise band (dB)
+        self.noise_psd_dn_db: List[np.ndarray] = []
 
     def want(self) -> bool:
         return (self.frame_i % self.stride) == 0
 
     def push_meta(self, s: int, n_fft: int, w_noise: float, w_trans: float, flux_db: float, band_db: float,
                   dn_depth: float, deq_depth: float, sh_depth: float):
-        # frame center time relative to *original* (unpadded) signal
         t_center = (float(s) + 0.5 * float(n_fft) - float(self.pad_offset)) / float(self.sr)
         if t_center < 0.0:
             t_center = 0.0
@@ -418,7 +564,7 @@ class DebugCollector:
 
         if len(self.att_dn_db) > 0:
             out["f_dn"] = self.freqs[self.dn_idx].astype(np.float32)
-            out["att_dn_db"] = np.stack(self.att_dn_db, axis=1)  # (F, T)
+            out["att_dn_db"] = np.stack(self.att_dn_db, axis=1)
         if len(self.att_deq_db) > 0:
             out["f_deq"] = self.freqs[self.deq_idx].astype(np.float32)
             out["att_deq_db"] = np.stack(self.att_deq_db, axis=1)
@@ -435,7 +581,6 @@ class DebugCollector:
 # Measurements (for debug)
 # -----------------------------
 def measure_true_peak_db(x: np.ndarray, os_factor: int = 4) -> float:
-    """Approx true-peak via oversampling + sample peak on oversampled signal."""
     x2 = _as_2d(np.asarray(x, dtype=np.float32))
     osf = int(max(1, os_factor))
     if osf > 1:
@@ -464,13 +609,44 @@ def measure_lufs(x: np.ndarray, sr: int) -> Optional[float]:
 # -----------------------------
 # Post: loudness normalize + limiter
 # -----------------------------
+try:
+    from numba import jit
+    HAS_NUMBA = True
+except ImportError:
+    HAS_NUMBA = False
+    def jit(*args, **kwargs):
+        def decorator(func):
+            return func
+        return decorator
+
+
+@jit(nopython=True)
+def _numba_pdr_limiter(req: np.ndarray, sr: float, fast_ms: float, slow_ms: float) -> np.ndarray:
+    """Numba-accelerated Program-Dependent Release (PDR) lookahead smoothing."""
+    n = req.size
+    g = np.ones(n, dtype=np.float32)
+    c_fast = np.float32(math.exp(-1.0 / (sr * (fast_ms / 1000.0))))
+    c_slow = np.float32(math.exp(-1.0 / (sr * (slow_ms / 1000.0))))
+    env_fast = np.float32(1.0)
+    env_slow = np.float32(1.0)
+    for i in range(n):
+        r = req[i]
+        if r < env_fast:
+            env_fast = r
+        else:
+            env_fast = c_fast * env_fast + (1.0 - c_fast) * r
+        if r < env_slow:
+            env_slow = r
+        else:
+            env_slow = c_slow * env_slow + (1.0 - c_slow) * r
+        reduction = np.float32(1.0) - r
+        w_slow = np.minimum(np.float32(1.0), reduction * np.float32(2.0))
+        g_sm = (np.float32(1.0) - w_slow) * env_fast + w_slow * env_slow
+        g[i] = np.minimum(r, g_sm)
+    return g
+
+
 def _peak_limiter(x: np.ndarray, sr: int, ceiling_db: float, lookahead_ms: float, release_ms: float) -> np.ndarray:
-    """
-    Lookahead peak limiter:
-    - Compute forward-looking local max over lookahead window.
-    - Compute required gain to keep peaks under ceiling.
-    - Apply "attack instant / release slow" smoothing via low-pass+min trick.
-    """
     eps = 1e-12
     x2 = _as_2d(x).astype(np.float32, copy=False)
 
@@ -485,28 +661,37 @@ def _peak_limiter(x: np.ndarray, sr: int, ceiling_db: float, lookahead_ms: float
     if size <= 1:
         peak = sc
     else:
-        # Forward window: [n, n+la]
-        origin = la // 2  # shifts window to the right
+        origin = la // 2
         peak = maximum_filter1d(sc, size=size, origin=origin, mode="nearest").astype(np.float32)
 
     req = np.minimum(1.0, ceiling / (peak + eps)).astype(np.float32)
 
-    rel = max(1.0, float(release_ms)) / 1000.0
-    a_rel = math.exp(-1.0 / (float(sr) * rel))
+    fast_ms = 15.0
+    slow_ms = max(80.0, float(release_ms))
 
-    req_lp = _onepole_lp(req, a_rel)
-    g = np.minimum(req, req_lp).astype(np.float32)
+    if HAS_NUMBA:
+        g = _numba_pdr_limiter(req, float(sr), fast_ms, slow_ms)
+    else:
+        n = req.size
+        g = np.ones(n, dtype=np.float32)
+        c_fast = math.exp(-1.0 / (sr * (fast_ms / 1000.0)))
+        c_slow = math.exp(-1.0 / (sr * (slow_ms / 1000.0)))
+        env_fast = 1.0
+        env_slow = 1.0
+        for i in range(n):
+            r = req[i]
+            if r < env_fast: env_fast = r
+            else: env_fast = c_fast * env_fast + (1.0 - c_fast) * r
+            if r < env_slow: env_slow = r
+            else: env_slow = c_slow * env_slow + (1.0 - c_slow) * r
+            reduction = 1.0 - r
+            w_slow = min(1.0, reduction * 2.0)
+            g[i] = min(r, (1.0 - w_slow) * env_fast + w_slow * env_slow)
 
     return (x2 * g[:, None]).astype(np.float32, copy=False)
 
 
 def loudness_normalize(x: np.ndarray, sr: int, mp: MasterParams, debug: bool = False) -> Tuple[np.ndarray, Dict[str, Any]]:
-    """
-    Loudness normalization:
-    - Prefer pyloudnorm (BS.1770) if available.
-    - Otherwise fallback to RMS.
-    - Clamp gain.
-    """
     info: Dict[str, Any] = {}
     x2 = _as_2d(np.asarray(x, dtype=np.float32))
 
@@ -523,7 +708,6 @@ def loudness_normalize(x: np.ndarray, sr: int, mp: MasterParams, debug: bool = F
             info["target_lufs"] = float(mp.target_lufs)
 
     if gain_db is None:
-        # RMS fallback (not perceptual, but better than nothing)
         if mp.target_rms_dbfs is None:
             info["norm"] = "disabled"
             return x2, info
@@ -549,12 +733,10 @@ def master_post(x: np.ndarray, sr: int, mp: MasterParams, debug: bool = False) -
 
     y = _as_2d(np.asarray(x, dtype=np.float32))
 
-    # DC remove
     if mp.dc_remove:
         y = (y - np.mean(y, axis=0, keepdims=True)).astype(np.float32, copy=False)
     info["dc_remove"] = bool(mp.dc_remove)
 
-    # Subsonic high-pass
     if mp.hp_hz and mp.hp_hz > 0.0:
         nyq = 0.5 * sr
         if mp.hp_hz < nyq - 10.0:
@@ -563,18 +745,15 @@ def master_post(x: np.ndarray, sr: int, mp: MasterParams, debug: bool = False) -
             info["hp_hz"] = float(mp.hp_hz)
             info["hp_order"] = int(mp.hp_order)
 
-    # Loudness normalization
     y, norm_info = loudness_normalize(y, sr, mp, debug=debug)
     info["normalize"] = norm_info
 
-    # Limiter (oversampled for true-peak-ish)
     osf = int(max(1, mp.os_factor))
     info["limiter_os_factor"] = osf
     if osf > 1:
         y_os = resample_poly(y, osf, 1, axis=0).astype(np.float32, copy=False)
         y_os = _peak_limiter(y_os, sr * osf, mp.ceiling_dbtp, mp.lookahead_ms, mp.release_ms)
         y2 = resample_poly(y_os, 1, osf, axis=0).astype(np.float32, copy=False)
-        # Align length
         if y2.shape[0] > y.shape[0]:
             y2 = y2[: y.shape[0], :]
         elif y2.shape[0] < y.shape[0]:
@@ -587,7 +766,6 @@ def master_post(x: np.ndarray, sr: int, mp: MasterParams, debug: bool = False) -
     info["lookahead_ms"] = float(mp.lookahead_ms)
     info["release_ms"] = float(mp.release_ms)
 
-    # Safety: prevent sample peak > 0 dBFS
     peak = float(np.max(np.abs(y))) if y.size else 0.0
     if peak > 0.999999:
         y = (y / peak * 0.999999).astype(np.float32)
@@ -597,26 +775,12 @@ def master_post(x: np.ndarray, sr: int, mp: MasterParams, debug: bool = False) -
 
 
 # -----------------------------
-# Core STFT repair
+# Core STFT repair JIT Blocks
 # -----------------------------
-
-try:
-    from numba import jit
-    HAS_NUMBA = True
-except ImportError:
-    HAS_NUMBA = False
-    # Dummy decorator if numba missing (though we installed it)
-    def jit(*args, **kwargs):
-        def decorator(func):
-            return func
-        return decorator
-
 @jit(nopython=True)
 def _numba_exp_env(g_target, n_cols, att, rel):
-    # g_target: (T,)
     g_env = np.ones_like(g_target)
     g_sm = 1.0
-    # Cast scalars to match array precision (likely float32)
     att_f = float(att)
     rel_f = float(rel)
     for i in range(n_cols):
@@ -628,47 +792,20 @@ def _numba_exp_env(g_target, n_cols, att, rel):
         g_env[i] = g_sm
     return g_env
 
+
 @jit(nopython=True)
 def _numba_dn_noise_est(curr_min, n_blocks, curr_noise_vec, rise):
-    # curr_min: (F, n_blocks)
-    # curr_noise_vec: (F,) initialized
     output = np.zeros_like(curr_min)
-    # Cast rise to float32 to match curr_noise_vec precision
     rise_f = np.float32(rise)
     for b in range(n_blocks):
         M = curr_min[:, b]
-        # Ensure operation result is cast or compatible
-        # curr_noise_vec * rise_f should be float32 if both are float32
         curr_noise_vec = np.minimum(M, curr_noise_vec * rise_f)
         output[:, b] = curr_noise_vec
     return output
 
-@jit(nopython=True)
-def _numba_dn_gain_smooth(target_grid, n_cols, att, rel):
-    # target_grid: (F, T)
-    output = np.empty_like(target_grid)
-    F = target_grid.shape[0]
-    s_val = np.ones(F, dtype=np.float32)
-    
-    att_f = np.float32(att)
-    rel_f = np.float32(rel)
-    
-    for i in range(n_cols):
-        t_col = target_grid[:, i]
-        # Explicit inner loop for Numba efficiency
-        for f in range(F):
-            t = t_col[f]
-            s = s_val[f]
-            if t < s:
-                s_val[f] = att_f * s + (1.0 - att_f) * t
-            else:
-                s_val[f] = rel_f * s + (1.0 - rel_f) * t
-        output[:, i] = s_val
-    return output
 
 @jit(nopython=True)
 def _numba_deq_persist(pos, n_cols, a_p):
-    # pos: (F, T)
     output = np.zeros_like(pos)
     F = pos.shape[0]
     state_p = np.zeros(F, dtype=np.float32)
@@ -681,8 +818,8 @@ def _numba_deq_persist(pos, n_cols, a_p):
             output[f, i] = state_p[f]
     return output
 
+
 def _hpss_harmonic_mask(log_mag: np.ndarray, time_frames: int, freq_bins: int, eps: float = 1e-12) -> np.ndarray:
-    """Median-filter HPSS harmonic mask in [0, 1] with shape matching log_mag."""
     tf = int(max(1, time_frames))
     ff = int(max(1, freq_bins))
     H = median_filter(log_mag, size=(1, tf), mode="nearest")
@@ -698,7 +835,6 @@ def _hpss_depth_scale(
     harmonic_only: bool,
     protect_percussive: float,
 ) -> np.ndarray:
-    """Scale repair depth maps; returns multiplier in [0, 1]."""
     scale = np.ones_like(Mh, dtype=np.float32)
     if harmonic_only:
         scale *= Mh.astype(np.float32, copy=False)
@@ -732,10 +868,6 @@ def _apply_magnitude_inpaint(
     eps: float,
     ch_scales: Optional[np.ndarray] = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Blend toward target magnitude keeping phase. Returns (Z_new, g_eff mono).
-    repair_depth/confidence: (F, T); ch_scales optional (n_ch,) per-channel depth scale.
-    """
     orig = Z_band
     orig_mag = np.abs(orig).astype(np.float32, copy=False)
     orig_phase = orig / (orig_mag + eps)
@@ -759,7 +891,6 @@ def _phasor_smooth_complex(
     axis: int,
     eps: float,
 ) -> np.ndarray:
-    """Weighted circular-mean smoothing of unit phasors along one axis."""
     mag = np.abs(Z).astype(np.float32)
     w = (weights.astype(np.float32) * mag).astype(np.float32)
     unit = Z / (mag + eps)
@@ -777,10 +908,6 @@ def _phasor_smooth_complex(
 
 
 def _phase_instability_map(Z_mono: np.ndarray, eps: float) -> np.ndarray:
-    """
-    (F, T) map in [0, 1]: high where inter-frame / inter-bin phase jumps are erratic.
-    Used to target moving 'swish' without dulling stable harmonics.
-    """
     unit = Z_mono / (np.abs(Z_mono) + eps)
     n_f, n_t = unit.shape
     instab_t = np.zeros((n_f, n_t), dtype=np.float32)
@@ -817,10 +944,6 @@ def measure_phase_instability(
     n_fft: int = 2048,
     hop: int = 512,
 ) -> float:
-    """
-    Magnitude-weighted mean phase instability in [0, 1] for a frequency band.
-    Higher values indicate more moving 'swish' / erratic phase texture.
-    """
     xm = np.asarray(x, dtype=np.float32)
     if xm.ndim == 2:
         xm = np.mean(xm, axis=1).astype(np.float32, copy=False)
@@ -873,7 +996,6 @@ def _apply_swish_phase_repair(
     hpss_freq_bins: int,
     eps: float,
 ) -> None:
-    """In-place adaptive phase smoothing for moving swish texture."""
     if band_idx.size == 0 or strength <= 1e-6:
         return
 
@@ -889,10 +1011,12 @@ def _apply_swish_phase_repair(
 
     w_trans = 1.0 - w_nontrans.astype(np.float32, copy=False)
     w_prot = (1.0 - float(np.clip(transient_protect, 0.0, 1.0)) * w_trans).astype(np.float32, copy=False)
+    
     depth = (
         float(np.clip(strength, 0.0, 1.0))
         * instab
         * w_prot[None, :]
+        * mh
         * (1.0 - float(np.clip(harmonic_protect, 0.0, 1.0)) * mh)
     ).astype(np.float32, copy=False)
 
@@ -927,7 +1051,6 @@ def _apply_hf_decorrelation(
     rng: np.random.Generator,
     eps: float,
 ) -> None:
-    """Break synthetic L/R phase lock in HF by partial Side-channel phase scatter."""
     if band_idx.size == 0 or amount <= 1e-6 or Z.shape[2] < 2:
         return
 
@@ -962,7 +1085,6 @@ def _artifact_confidence_map(
     thr_db: float,
     eps: float,
 ) -> np.ndarray:
-    """High where narrow log-magnitude residual exceeds threshold."""
     if band_idx.size == 0:
         return np.zeros((0, Mag_mono.shape[1]), dtype=np.float32)
     mag = Mag_mono[band_idx, :]
@@ -972,22 +1094,28 @@ def _artifact_confidence_map(
     conf = np.clip((resid - float(thr_db)) / max(1e-6, float(thr_db)), 0.0, 1.0)
     return conf.astype(np.float32, copy=False)
 
+
+# -----------------------------
+# Core STFT repair
+# -----------------------------
 def process_stft(x: np.ndarray, sr: int, p: Params, dbg: Optional[DebugCollector] = None) -> np.ndarray:
     if x.ndim == 1:
         x = x[:, None]
     
-    # Transpose to (n_ch, n_samples) for scipy.signal
+    # --- High-Fidelity Step 1: Align Left/Right micro-delays (Time Domain) ---
+    x = align_lr_delay(x, sr)
+    
     x_t = x.T
     n_ch, n_samples = x_t.shape
     
     n_fft = int(p.n_fft)
     hop = int(p.hop)
     
-    # Get STFT (scipy style: input (ch, time) -> output (ch, freq, time) with axis=-1)
     f, t_sec, Z = stft(x_t, fs=sr, window='hann', nperseg=n_fft, noverlap=n_fft-hop, nfft=n_fft, boundary='zeros', padded=True, axis=-1)
-    
-    # Transpose to (n_freq, n_time, n_ch) for convenient processing
     Z = Z.transpose(1, 2, 0).astype(np.complex64)
+    
+    # --- High-Fidelity Step 2: Symmetric L/R spectral balancing (Spectral Domain) ---
+    Z = balance_lr_spectrum(Z)
     
     freqs = f.astype(np.float32)
     nyq = f[-1] if len(f) > 0 else 0.0
@@ -1013,16 +1141,18 @@ def process_stft(x: np.ndarray, sr: int, p: Params, dbg: Optional[DebugCollector
     sw_idx = _idx(getattr(p, "swish_start_hz", 3500.0), getattr(p, "swish_end_hz", 14000.0))
     hdc_idx = _idx(getattr(p, "hf_dec_start_hz", 4500.0), getattr(p, "hf_dec_end_hz", 16000.0))
 
-
     # --- Tapers ---
     w_sh = _edge_taper(freqs, sh_idx, p.start_hz, p.end_hz, p.edge_hz)[:, None]
     w_dn = _edge_taper(freqs, dn_idx, p.dn_start_hz, p.dn_end_hz, p.dn_edge_hz)[:, None]
     w_deq = _edge_taper(freqs, deq_idx, p.deq_start_hz, p.deq_end_hz, p.deq_edge_hz)[:, None]
 
     # --- Base Magnitude / PSD ---
-    Mag = np.abs(Z) # (F, T, Ch)
-    Mag_mono = np.mean(Mag, axis=2) # (F, T)
+    Mag = np.abs(Z)
+    Mag_mono = np.mean(Mag, axis=2)
     PSD = Mag_mono ** 2 + eps
+
+    # --- Enforce Psychoacoustic transparency ---
+    mask_psd = _calculate_psychoacoustic_mask(PSD, freqs)
 
     # --- Global Features ---
     def calc_flatness(P_region):
@@ -1045,8 +1175,6 @@ def process_stft(x: np.ndarray, sr: int, p: Params, dbg: Optional[DebugCollector
     if ms_enabled:
         ch_scales[0] = 1.0
         ch_scales[1] = float(np.clip(getattr(p, "ms_side_scale", 0.35), 0.0, 1.0))
-        if n_ch > 2:
-            ch_scales[2:] = float(np.clip(getattr(p, "ms_side_scale", 0.35), 0.0, 1.0))
 
     Z_orig = Z.copy()
     g_total = np.ones((freqs.size, n_cols), dtype=np.float32)
@@ -1097,7 +1225,6 @@ def process_stft(x: np.ndarray, sr: int, p: Params, dbg: Optional[DebugCollector
             
         g_total[exp_idx, :] *= g_env.astype(np.float32, copy=False)
 
-    # --- Debug: attenuation maps (filled when stages run) ---
     g_eff_dn_map: Optional[np.ndarray] = None
     g_eff_deq_map: Optional[np.ndarray] = None
     g_eff_sh_map: Optional[np.ndarray] = None
@@ -1106,12 +1233,12 @@ def process_stft(x: np.ndarray, sr: int, p: Params, dbg: Optional[DebugCollector
     deq_depth_map: Optional[np.ndarray] = None
     sh_depth_map: Optional[np.ndarray] = None
 
-    # --- (A) Smart Denoise ---
+    # --- (A) Smart Denoise (Ephraim-Malah Decision-Directed SNR) ---
     dn_str = float(np.clip(p.denoise, 0.0, 1.0))
     if dn_str > 1e-6 and dn_idx.size:
         psd_dn = PSD[dn_idx, :]
         a_psd = _frame_coeff(hop, sr, p.dn_psd_smooth_ms)
-        psd_sm_map = lfilter([1.0-a_psd], [1.0, -a_psd], psd_dn, axis=1) # (F_dn, T)
+        psd_sm_map = lfilter([1.0-a_psd], [1.0, -a_psd], psd_dn, axis=1)
         
         minwin = max(4, int(sr * p.dn_minwin_ms / 1000.0 / hop))
         n_blocks = int(np.ceil(n_cols / minwin))
@@ -1134,27 +1261,28 @@ def process_stft(x: np.ndarray, sr: int, p: Params, dbg: Optional[DebugCollector
                 noise_est_blocks[:, b] = curr_noise_vec
         
         noise_map = np.repeat(noise_est_blocks, minwin, axis=1)[:, :n_cols]
-        SNR = psd_sm_map / (noise_map + eps)
-        k = 1.0 + 3.0 * dn_str
-        g_inst = SNR / (SNR + k)
-        floor = 10.0**(p.dn_floor_db/20.0)
-        g_inst = np.clip(floor + (1.0 - floor) * g_inst, floor, 1.0)
         
-        att = _frame_coeff(hop, sr, p.dn_attack_ms)
-        rel = _frame_coeff(hop, sr, p.dn_release_ms)
-        if HAS_NUMBA:
-             g_inst = g_inst.astype(np.float32)
-             dn_g = _numba_dn_gain_smooth(g_inst, n_cols, att, rel)
-        else:
-             dn_g = np.ones_like(g_inst)
-             s_val = np.ones(psd_dn.shape[0])
-             for i in range(n_cols):
-                  target = g_inst[:, i]
-                  down = target < s_val
-                  s_val[down] = att * s_val[down] + (1.0 - att) * target[down]
-                  s_val[~down] = rel * s_val[~down] + (1.0 - rel) * target[~down]
-                  dn_g[:, i] = s_val
-             
+        F_dn, T_dn = psd_dn.shape
+        dn_g = np.ones((F_dn, n_cols), dtype=np.float32)
+        alpha_dd = 0.98
+        prev_clean_psd = psd_dn[:, 0]
+        
+        for ti in range(n_cols):
+            noise_psd = noise_map[:, ti] + eps
+            current_psd = psd_dn[:, ti]
+            
+            gamma = current_psd / noise_psd
+            xi = alpha_dd * (prev_clean_psd / noise_psd) + (1.0 - alpha_dd) * np.maximum(0.0, gamma - 1.0)
+            xi = np.maximum(xi, 10.0 ** (-max(12.0, abs(p.dn_floor_db)) / 10.0))
+            
+            g_inst_frame = xi / (xi + 1.0)
+            
+            floor = 10.0**(p.dn_floor_db/20.0)
+            g_inst_frame = np.clip(floor + (1.0 - floor) * g_inst_frame, floor, 1.0)
+            
+            dn_g[:, ti] = g_inst_frame
+            prev_clean_psd = (g_inst_frame ** 2) * current_psd
+        
         if p.dn_freq_smooth_bins > 1:
             dn_g = uniform_filter1d(dn_g, size=int(p.dn_freq_smooth_bins), axis=0, mode='nearest')
             
@@ -1182,9 +1310,7 @@ def process_stft(x: np.ndarray, sr: int, p: Params, dbg: Optional[DebugCollector
             a_floor = _frame_coeff(hop, sr, float(getattr(p, "deq_floor_smooth_ms", 80.0)))
             psd_floor_sm = lfilter([1.0 - a_floor], [1.0, -a_floor], psd_deq, axis=1)
 
-            rise_lin = float(
-                10.0 ** ((float(getattr(p, "deq_floor_rise_db_per_s", 1.0)) * (float(hop) / float(sr))) / 10.0)
-            )
+            rise_lin = float(10.0 ** ((float(getattr(p, "deq_floor_rise_db_per_s", 1.0)) * (float(hop) / float(sr))) / 10.0))
             floor_env = np.empty_like(psd_floor_sm)
             floor_env[:, 0] = psd_floor_sm[:, 0]
             for ti in range(1, n_cols):
@@ -1194,11 +1320,7 @@ def process_stft(x: np.ndarray, sr: int, p: Params, dbg: Optional[DebugCollector
             floor_win = max(4, int(round(sr * 1.0 / hop)))
             floor_map = minimum_filter1d(floor_env, size=floor_win, axis=1, mode="nearest")
             floor_db = 10.0 * np.log10(floor_map + eps)
-            local_floor_db = median_filter(
-                floor_db,
-                size=(int(p.deq_freq_med_bins), 1),
-                mode="nearest",
-            )
+            local_floor_db = median_filter(floor_db, size=(int(p.deq_freq_med_bins), 1), mode="nearest")
             floor_thr = float(getattr(p, "deq_floor_thr_db", 3.0))
             floor_excess = np.maximum(0.0, floor_db - local_floor_db - floor_thr)
             pos = np.maximum(pos, floor_excess.astype(np.float32, copy=False))
@@ -1297,25 +1419,51 @@ def process_stft(x: np.ndarray, sr: int, p: Params, dbg: Optional[DebugCollector
         g_eff_sh_map = g_eff.astype(np.float32, copy=False)
         sh_depth_map = depth_base.astype(np.float32, copy=False)
 
-    # --- Apply combined gain with cap ---
+    # --- Apply combined gain with cap and psychoacoustic bounds ---
     proc_idx = np.unique(np.concatenate([
         arr for arr in [exp_idx, dn_idx, deq_idx, sh_idx] if arr.size > 0
     ])).astype(np.int64) if (exp_idx.size or dn_idx.size or deq_idx.size or sh_idx.size) else np.array([], dtype=np.int64)
+    
     if proc_idx.size:
         g_total[proc_idx, :] = np.maximum(g_total[proc_idx, :], g_min)
+        
+        g_min_allowed = np.minimum(1.0, np.sqrt(mask_psd[proc_idx, :] / (PSD[proc_idx, :] + eps)))
+        g_total[proc_idx, :] = np.maximum(g_total[proc_idx, :], g_min_allowed)
+        
         Z = Z_orig.copy()
         g_apply = g_total[proc_idx, :].astype(np.float32, copy=False)
+        
         if ms_enabled and n_ch >= 2:
-            for ci in range(n_ch):
-                g_ch = 1.0 - (1.0 - g_apply) * float(ch_scales[ci])
-                Z[proc_idx, :, ci] = Z_orig[proc_idx, :, ci] * g_ch
+            left = Z_orig[proc_idx, :, 0]
+            right = Z_orig[proc_idx, :, 1]
+            mid = 0.5 * (left + right)
+            side = 0.5 * (left - right)
+            
+            phase_diff = np.angle(side + eps) - np.angle(mid + eps)
+            
+            mid_new = mid * g_apply
+            
+            s_scale = float(getattr(p, "ms_side_scale", 0.35))
+            g_side = 1.0 - (1.0 - g_apply) * s_scale
+            side_mag_new = np.abs(side) * g_side
+            
+            side_new = side_mag_new * np.exp(1j * (np.angle(mid_new + eps) + phase_diff))
+            
+            Z[proc_idx, :, 0] = mid_new + side_new
+            Z[proc_idx, :, 1] = mid_new - side_new
+            
+            if n_ch > 2:
+                for ci in range(2, n_ch):
+                    Z[proc_idx, :, ci] = Z_orig[proc_idx, :, ci] * g_apply
         else:
             Z[proc_idx, :, :] = Z_orig[proc_idx, :, :] * g_apply[:, :, None]
     else:
         Z = Z_orig.copy()
 
-    # Per-frame artifact confidence (max across freq bins and stages) for HF resynth.
-    # Band maps differ in F (deq_idx vs sh_idx), so merge on time only.
+    # --- High-Fidelity Step 3: Dynamic Spectral Carving (Spectral Domain) ---
+    Z = dynamic_spectral_carver(Z, freqs)
+
+    # Track artifact confidence
     global _LAST_ARTIFACT_CONF_FRAMES
     if artifact_conf_parts:
         conf_per_frame = np.zeros(n_cols, dtype=np.float32)
@@ -1390,7 +1538,7 @@ def process_stft(x: np.ndarray, sr: int, p: Params, dbg: Optional[DebugCollector
     if hdc_amt > 1e-6 and hdc_idx.size and n_ch >= 2:
         _apply_hf_decorrelation(Z, hdc_idx, amount=hdc_amt, rng=rng, eps=eps)
 
-    # --- Debug collection (strided frame samples) ---
+    # --- Debug collection ---
     if dbg is not None:
         flux_full = np.zeros(n_cols, dtype=np.float32)
         flux_full[1:] = flux.astype(np.float32, copy=False)
@@ -1427,9 +1575,18 @@ def process_stft(x: np.ndarray, sr: int, p: Params, dbg: Optional[DebugCollector
                 )
             dbg.step()
 
-    # --- Reconstruct ---
+    # --- Reconstruct & Enforce Spectrogram Consistency ---
+    Z_target_mag = np.abs(Z)
+    
+    for _proj_iter in range(3):
+        Z_t = Z.transpose(2, 0, 1)
+        _, y_proj = istft(Z_t, fs=sr, window='hann', nperseg=n_fft, noverlap=n_fft-hop, nfft=n_fft, boundary='zeros', time_axis=-1, freq_axis=-2)
+        f_proj, _, Z_proj = stft(y_proj, fs=sr, window='hann', nperseg=n_fft, noverlap=n_fft-hop, nfft=n_fft, boundary='zeros', axis=-1)
+        Z_proj = Z_proj.transpose(1, 2, 0)
+        phase_proj = Z_proj / (np.abs(Z_proj) + eps)
+        Z = Z_target_mag * phase_proj
+
     Z_out = Z.transpose(2, 0, 1)
-    # istft will remove padding and merge overlaps
     _, y_rec_t = istft(Z_out, fs=sr, window='hann', nperseg=n_fft, noverlap=n_fft-hop, nfft=n_fft, boundary='zeros', time_axis=-1, freq_axis=-2)
     
     y_rec = y_rec_t.T
@@ -1447,7 +1604,6 @@ def process_stft(x: np.ndarray, sr: int, p: Params, dbg: Optional[DebugCollector
 
 
 def hf_resynth_post(x: np.ndarray, sr: int, p: Params, *, artifact_conf: Optional[np.ndarray] = None) -> np.ndarray:
-    """Optional HF resynthesis ("nuclear"): remove HF and rebuild from low band."""
     if not bool(getattr(p, "hf_resynth", False)):
         return x
     x2 = _as_2d(np.asarray(x, dtype=np.float32))
@@ -1537,10 +1693,6 @@ def _write_json(path: str, obj: Dict[str, Any]) -> None:
 
 
 def _compute_mag_spectrogram_db(x: np.ndarray, sr: int, n_fft: int, hop: int, max_frames: int, max_hz: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Simple magnitude spectrogram in dB (mono).
-    Returns (S_db [F,T], freqs [F], times [T])
-    """
     x = np.asarray(x, dtype=np.float32)
     if x.ndim > 1:
         x = np.mean(x, axis=1)
@@ -1551,7 +1703,6 @@ def _compute_mag_spectrogram_db(x: np.ndarray, sr: int, n_fft: int, hop: int, ma
     f_mask = freqs <= float(min(0.5 * sr, max_hz))
     freqs = freqs[f_mask]
 
-    # Adapt hop to keep frames manageable
     n = x.shape[0]
     est_frames = int(math.ceil(n / hop))
     if est_frames > max_frames:
@@ -1600,15 +1751,12 @@ def render_debug(
 ) -> None:
     dbg_dir = _ensure_dir(dbg_dir)
 
-    # Save internals
     if dp.save_npz:
         npz_path = os.path.join(dbg_dir, "debug_data.npz")
         np.savez_compressed(npz_path, **{k: v for k, v in dbg_data.items() if isinstance(v, np.ndarray)})
 
-    # Save summary
     _write_json(os.path.join(dbg_dir, "summary.json"), summary)
 
-    # Make plots if possible
     if not dp.save_png:
         return
 
@@ -1620,11 +1768,9 @@ def render_debug(
         _write_json(os.path.join(dbg_dir, "plot_error.json"), {"error": str(e)})
         return
 
-    # ---- Spectrogram before/after/diff ----
     S0, f0, t0 = _compute_mag_spectrogram_db(x_in, sr, dp.spec_n_fft, dp.spec_hop, dp.spec_max_frames, dp.spec_max_hz)
     S1, f1, t1 = _compute_mag_spectrogram_db(y_out, sr, dp.spec_n_fft, dp.spec_hop, dp.spec_max_frames, dp.spec_max_hz)
 
-    # align time bins if slightly different due to hop adaptation
     T = min(S0.shape[1], S1.shape[1])
     S0 = S0[:, :T]
     S1 = S1[:, :T]
@@ -1668,14 +1814,14 @@ def render_debug(
     fig.colorbar(im, ax=ax, label="Δ dB")
     _plot_and_save_png(os.path.join(dbg_dir, "spectrogram_diff.png"), fig)
 
-    # ---- Attenuation maps (STFT-domain processing) ----
+    # Attenuation maps
     t_frames = dbg_data.get("t", None)
 
     def plot_att_map(name: str, f_key: str, a_key: str):
         if f_key not in dbg_data or a_key not in dbg_data or t_frames is None:
             return
         F = dbg_data[f_key]
-        A = dbg_data[a_key]  # (F, T)
+        A = dbg_data[a_key]
         if A.size == 0:
             return
         fig = plt.figure()
@@ -1692,7 +1838,7 @@ def render_debug(
     plot_att_map("deres", "f_deq", "att_deq_db")
     plot_att_map("shimmer", "f_sh", "att_sh_db")
 
-    # ---- Time-series metrics ----
+    # Time-series metrics
     if t_frames is not None and t_frames.size > 0:
         fig = plt.figure()
         ax = fig.add_subplot(111)
@@ -1707,7 +1853,7 @@ def render_debug(
         ax.legend(loc="upper right", fontsize=8)
         _plot_and_save_png(os.path.join(dbg_dir, "frame_metrics.png"), fig)
 
-        # Mean attenuation vs time for each stage
+        # Mean attenuation vs time
         fig = plt.figure()
         ax = fig.add_subplot(111)
 
@@ -1734,9 +1880,9 @@ def render_debug(
         ax.legend(loc="upper right", fontsize=8)
         _plot_and_save_png(os.path.join(dbg_dir, "mean_attenuation.png"), fig)
 
-    # ---- Noise PSD estimate (optional) ----
+    # Noise PSD estimate
     if "noise_psd_dn_db" in dbg_data and t_frames is not None:
-        N = dbg_data["noise_psd_dn_db"]  # (F, T)
+        N = dbg_data["noise_psd_dn_db"]
         F = dbg_data.get("f_dn", None)
         if F is not None and N.size:
             fig = plt.figure()
@@ -1747,7 +1893,6 @@ def render_debug(
             ax.set_ylabel("dB (power)")
             _plot_and_save_png(os.path.join(dbg_dir, "noise_floor_estimate.png"), fig)
 
-    # Write a tiny readme
     with open(os.path.join(dbg_dir, "README.txt"), "w", encoding="utf-8") as f:
         f.write(
             "Debug outputs:\n"
@@ -1761,10 +1906,10 @@ def render_debug(
 
 
 # -----------------------------
-# Main
+# Main Entry Point
 # -----------------------------
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Repair AI/codec-ish shimmer + smart denoise + smart de-resonator + optional loudness/true-peak delivery + debug visuals.")
+    ap = argparse.ArgumentParser(description="Repair AI/codec-ish shimmer + smart denoise + smart de-resonator with psychoacoustic bounds.")
 
     ap.add_argument("input")
     ap.add_argument("output")
@@ -1798,7 +1943,7 @@ def main() -> int:
     ap.add_argument("--fade-ms", type=float, default=5.0)
 
     # --- Smart denoise ---
-    ap.add_argument("--denoise", type=float, default=0.0, help="0..1 spectral noise floor reduction")
+    ap.add_argument("--denoise", type=float, default=0.0)
     ap.add_argument("--dn-start-hz", type=float, default=120.0)
     ap.add_argument("--dn-end-hz", type=float, default=16000.0)
     ap.add_argument("--dn-edge-hz", type=float, default=200.0)
@@ -1811,7 +1956,7 @@ def main() -> int:
     ap.add_argument("--dn-freq-smooth-bins", type=int, default=3)
 
     # --- Smart de-resonator ---
-    ap.add_argument("--deres", type=float, default=0.0, help="0..1 de-resonator (dynamic EQ)")
+    ap.add_argument("--deres", type=float, default=0.0)
     ap.add_argument("--deq-start-hz", type=float, default=180.0)
     ap.add_argument("--deq-end-hz", type=float, default=12000.0)
     ap.add_argument("--deq-edge-hz", type=float, default=150.0)
@@ -1825,15 +1970,15 @@ def main() -> int:
     ap.add_argument("--deq-persist-thr-db", type=float, default=2.5)
     ap.add_argument("--deq-freq-smooth-bins", type=int, default=5)
     ap.add_argument("--deq-tonal-boost-db", type=float, default=6.0)
-    ap.add_argument("--deq-time-floor", action="store_true", help="Enable time-stabilized per-bin floor to target stationary ringing lines.")
+    ap.add_argument("--deq-time-floor", action="store_true")
     ap.add_argument("--deq-floor-smooth-ms", type=float, default=80.0)
     ap.add_argument("--deq-floor-rise-db-per-s", type=float, default=1.0)
     ap.add_argument("--deq-floor-thr-db", type=float, default=3.0)
 
-    ap.add_argument("--delta-listen", action="store_true", help="Output removed-only (input - output). Useful for dialing parameters.")
+    ap.add_argument("--delta-listen", action="store_true")
 
     # --- Downward expander ---
-    ap.add_argument("--expander", action="store_true", help="Enable downward expander in a band (helps correlated grit in tails).")
+    ap.add_argument("--expander", action="store_true")
     ap.add_argument("--exp-start-hz", type=float, default=3000.0)
     ap.add_argument("--exp-end-hz", type=float, default=8000.0)
     ap.add_argument("--exp-threshold-db", type=float, default=-45.0)
@@ -1842,21 +1987,21 @@ def main() -> int:
     ap.add_argument("--exp-release-ms", type=float, default=150.0)
 
     # --- HPSS-ish ---
-    ap.add_argument("--hpss", action="store_true", help="Enable HPSS-ish harmonic mask inside a band.")
+    ap.add_argument("--hpss", action="store_true")
     ap.add_argument("--hpss-start-hz", type=float, default=3000.0)
     ap.add_argument("--hpss-end-hz", type=float, default=8000.0)
     ap.add_argument("--hpss-time-frames", type=int, default=21)
     ap.add_argument("--hpss-freq-bins", type=int, default=17)
-    ap.add_argument("--hpss-no-harmonic-only", action="store_true", help="Do not restrict processing to harmonic component.")
+    ap.add_argument("--hpss-no-harmonic-only", action="store_true")
 
     # --- Phase blur ---
-    ap.add_argument("--phase-blur", type=float, default=0.0, help="0..1 random-phase blend in pb band (texture masking).")
+    ap.add_argument("--phase-blur", type=float, default=0.0)
     ap.add_argument("--pb-start-hz", type=float, default=3000.0)
     ap.add_argument("--pb-end-hz", type=float, default=8000.0)
     ap.add_argument("--pb-no-harmonic-only", action="store_true")
 
-    # --- HF resynthesis (nuclear) ---
-    ap.add_argument("--hf-resynth", action="store_true", help="Replace HF with harmonics generated from a low band.")
+    # --- HF resynthesis ---
+    ap.add_argument("--hf-resynth", action="store_true")
     ap.add_argument("--hf-lp-hz", type=float, default=3000.0)
     ap.add_argument("--hf-src-lo-hz", type=float, default=1000.0)
     ap.add_argument("--hf-src-hi-hz", type=float, default=2000.0)
@@ -1864,26 +2009,26 @@ def main() -> int:
     ap.add_argument("--hf-hp-hz", type=float, default=3000.0)
     ap.add_argument("--hf-mix", type=float, default=0.35)
     ap.add_argument("--hf-tilt-lp-hz", type=float, default=12000.0)
-    ap.add_argument("--hf-zero-phase", action="store_true", help="Use zero-phase filters (offline). Disable for realtime-ish chunk processing by setting --no-hf-zero-phase.")
-    ap.add_argument("--no-hf-zero-phase", action="store_true", help="Disable zero-phase filtering for HF resynth.")
+    ap.add_argument("--hf-zero-phase", action="store_true")
+    ap.add_argument("--no-hf-zero-phase", action="store_true")
 
     # --- Delivery mastering ---
-    ap.add_argument("--master", action="store_true", help="Enable loudness normalization + true-peak-ish limiting post stage.")
+    ap.add_argument("--master", action="store_true")
     ap.add_argument("--hp-hz", type=float, default=20.0)
-    ap.add_argument("--target-lufs", type=float, default=-14.0, help="Target integrated loudness in LUFS (requires pyloudnorm). Set to 999 to disable.")
-    ap.add_argument("--target-rms-dbfs", type=float, default=-16.0, help="Fallback target RMS in dBFS if pyloudnorm missing or LUFS disabled.")
+    ap.add_argument("--target-lufs", type=float, default=-14.0)
+    ap.add_argument("--target-rms-dbfs", type=float, default=-16.0)
     ap.add_argument("--norm-max-gain-db", type=float, default=12.0)
     ap.add_argument("--norm-max-atten-db", type=float, default=24.0)
     ap.add_argument("--ceiling-dbtp", type=float, default=-1.0)
     ap.add_argument("--lim-lookahead-ms", type=float, default=5.0)
     ap.add_argument("--lim-release-ms", type=float, default=100.0)
-    ap.add_argument("--tp-os", type=int, default=4, help="Oversampling factor for true-peak-ish limiting/measurement (4x is common).")
+    ap.add_argument("--tp-os", type=int, default=4)
 
     # Output
-    ap.add_argument("--subtype", type=str, default="PCM_24", help="SoundFile subtype, e.g. PCM_16, PCM_24, FLOAT.")
+    ap.add_argument("--subtype", type=str, default="PCM_24")
 
     # Debug / diagnostics
-    ap.add_argument("--debug", action="store_true", help="Write debug folder with plots and internal arrays.")
+    ap.add_argument("--debug", action="store_true")
     ap.add_argument("--debug-dir", type=str, default=None)
     ap.add_argument("--debug-stride", type=int, default=8)
     ap.add_argument("--debug-spec-nfft", type=int, default=2048)
@@ -1898,7 +2043,6 @@ def main() -> int:
     x, sr = sf.read(args.input, always_2d=True)
     x = x.astype(np.float32, copy=False)
 
-    # Compute band from center if provided
     start_hz = float(args.start_hz)
     end_hz = float(args.end_hz)
     if args.center_hz is not None and args.width_cents is not None:
@@ -2019,17 +2163,6 @@ def main() -> int:
         spec_max_hz=float(args.debug_spec_max_hz),
     )
 
-    # ---- Measurements (input) ----
-    summary: Dict[str, Any] = {}
-    summary["input_path"] = args.input
-    summary["output_path"] = args.output
-    summary["sr"] = int(sr)
-    summary["channels"] = int(x.shape[1])
-    summary["duration_s"] = float(x.shape[0] / sr)
-    summary["params"] = asdict(p)
-    summary["master_params"] = asdict(mp)
-    summary["debug_params"] = asdict(dp)
-
     meas_in = {
         "sample_peak_dbfs": float(_lin_to_db(np.max(np.abs(x)) + 1e-12)),
         "true_peak_dbtp": float(measure_true_peak_db(x, os_factor=max(1, int(args.tp_os)))),
@@ -2038,7 +2171,6 @@ def main() -> int:
     }
     summary["measure_in"] = meas_in
 
-    # ---- Setup debug collector (needs FFT freqs/idx) ----
     dbg_collector = None
     dbg_data: Dict[str, Any] = {}
     if dp.enabled:
@@ -2069,9 +2201,8 @@ def main() -> int:
             duration_s=float(x.shape[0] / sr),
         )
 
-    # ---- STFT repair ----
+    # ---- Core processing ----
     y_repaired = process_stft(x, sr, p, dbg=dbg_collector)
-    # Optional "nuclear" HF resynthesis after STFT repair (off by default)
     y_repaired = hf_resynth_post(y_repaired, sr, p, artifact_conf=_LAST_ARTIFACT_CONF_FRAMES)
     y_rep_2d = _as_2d(y_repaired)
 
@@ -2083,7 +2214,7 @@ def main() -> int:
     }
     summary["measure_after_repair"] = meas_rep
 
-    # ---- Optional master/deliver ----
+    # ---- mastering ----
     y_out, master_info = master_post(y_repaired, sr, mp, debug=dp.enabled)
     y_out_2d = _as_2d(y_out)
 
@@ -2096,22 +2227,19 @@ def main() -> int:
     summary["measure_out"] = meas_out
     summary["master_info"] = master_info
 
-    # ---- Write output ----
+    # ---- output writing ----
     subtype = str(args.subtype)
     sf.write(args.output, y_out_2d.astype(np.float32, copy=False), sr, subtype=subtype)
 
-    # Optional diff
     if args.write_diff:
         diff = (x[: y_out_2d.shape[0], :] - y_out_2d).astype(np.float32)
         sf.write(args.write_diff, diff, sr, subtype=subtype)
 
-    # ---- Finalize debug ----
+    # ---- debug output generation ----
     if dp.enabled and dbg_collector is not None:
         dbg_data = dbg_collector.finalize()
 
-        # "Top frequencies" summary from attenuation maps
         def top_freqs(f: np.ndarray, A: np.ndarray, n: int = 8) -> List[Dict[str, float]]:
-            # A is (F, T) attenuation dB
             if A.size == 0:
                 return []
             mean_att = np.mean(A, axis=1)
@@ -2131,7 +2259,6 @@ def main() -> int:
 
         summary["top_problem_bins"] = tops
 
-        # Pick debug dir
         dbg_dir = dp.debug_dir
         if dbg_dir is None or dbg_dir.strip() == "":
             base = os.path.splitext(os.path.basename(args.output))[0]
@@ -2147,7 +2274,6 @@ def main() -> int:
             summary=summary,
         )
 
-        # Also print a short summary to stdout
         print("=== Debug summary ===")
         print(json.dumps({
             "measure_in": meas_in,

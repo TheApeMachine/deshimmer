@@ -30,8 +30,8 @@ import io
 import math
 import os
 import time
-from dataclasses import asdict
-from typing import Any
+from dataclasses import asdict, fields, replace
+from typing import Any, Mapping
 
 import numpy as np
 import soundfile as sf
@@ -179,361 +179,177 @@ def _render_metrics_md(info: dict[str, object]) -> str:
     return "\n".join(lines)
 
 
+PARAM_KNOB_NAMES: tuple[str, ...] = (
+    "start_hz", "end_hz", "edge_hz", "n_fft", "hop",
+    "flat_start", "flat_end", "freq_med_bins", "thr_db", "slope",
+    "density_lo", "density_hi", "flux_thr_db", "flux_range_db",
+    "noise_resynth", "mix", "delta_listen",
+    "denoise", "dn_start_hz", "dn_end_hz", "dn_edge_hz", "dn_floor_db",
+    "dn_psd_smooth_ms", "dn_minwin_ms", "dn_up_db_per_s", "dn_attack_ms",
+    "dn_release_ms", "dn_freq_smooth_bins",
+    "deres", "deq_start_hz", "deq_end_hz", "deq_edge_hz", "deq_freq_med_bins",
+    "deq_thr_db", "deq_slope", "deq_max_att_db", "deq_density_lo",
+    "deq_density_hi", "deq_persist_ms", "deq_persist_thr_db",
+    "deq_freq_smooth_bins", "deq_tonal_boost_db", "deq_time_floor",
+    "deq_floor_smooth_ms", "deq_floor_rise_db_per_s", "deq_floor_thr_db",
+    "expander", "exp_start_hz", "exp_end_hz", "exp_threshold_db",
+    "exp_ratio", "exp_attack_ms", "exp_release_ms",
+    "hpss", "hpss_start_hz", "hpss_end_hz", "hpss_time_frames",
+    "hpss_freq_bins", "hpss_harmonic_only", "hpss_protect_percussive",
+    "magnitude_inpaint", "deq_inpaint", "total_att_cap_db", "nuclear_mode",
+    "ms_process", "ms_side_scale",
+    "phase_blur", "pb_start_hz", "pb_end_hz", "pb_harmonic_only",
+    "swish_repair", "swish_start_hz", "swish_end_hz",
+    "swish_time_amt", "swish_freq_amt",
+    "hf_decorrelate", "hf_dec_start_hz", "hf_dec_end_hz",
+    "hf_resynth", "hf_lp_hz", "hf_src_lo_hz", "hf_src_hi_hz",
+    "hf_drive", "hf_hp_hz", "hf_mix", "hf_confidence_blend",
+    "master_enabled", "hp_hz", "target_lufs", "target_rms_dbfs",
+    "norm_max_gain_db", "norm_max_atten_db", "ceiling_dbtp",
+    "lim_lookahead_ms", "lim_release_ms", "tp_os",
+)
+SPEC_PARAM_NAMES: tuple[str, ...] = ("spec_n_fft", "spec_hop", "spec_max_frames", "spec_max_hz")
+PARAM_STATE_NAMES: tuple[str, ...] = PARAM_KNOB_NAMES + SPEC_PARAM_NAMES
+
+MASTER_TO_UI_NAME = {
+    "enabled": "master_enabled",
+    "lookahead_ms": "lim_lookahead_ms",
+    "release_ms": "lim_release_ms",
+    "os_factor": "tp_os",
+}
+UI_TO_MASTER_NAME = {v: k for k, v in MASTER_TO_UI_NAME.items()}
+
+UI_DEFAULT_OVERRIDES: dict[str, object] = {
+    "spec_n_fft": 2048,
+    "spec_hop": 512,
+    "spec_max_frames": 1200,
+    "spec_max_hz": 20000.0,
+}
+
+
+def _coerce_like(value: object, default: object) -> object:
+    if isinstance(default, bool):
+        return bool(value)
+    if isinstance(default, int) and not isinstance(default, bool):
+        return int(round(float(value)))
+    if isinstance(default, float) or default is None:
+        return float(value)
+    return value
+
+
+def _default_param_state() -> dict[str, object]:
+    p = master.Params()
+    mp = master.MasterParams()
+    state: dict[str, object] = {}
+    p_values = asdict(p)
+    mp_values = asdict(mp)
+    for name in PARAM_KNOB_NAMES:
+        if name in p_values:
+            state[name] = p_values[name]
+            continue
+        master_name = UI_TO_MASTER_NAME.get(name, name)
+        if master_name in mp_values:
+            value = mp_values[master_name]
+            if name == "target_lufs" and value is None:
+                value = 999.0
+            state[name] = value
+    state.update(UI_DEFAULT_OVERRIDES)
+    return state
+
+
+def _merge_param_state(
+    state: Mapping[str, object] | None,
+    updates: Mapping[str, object],
+) -> dict[str, object]:
+    merged = _default_param_state()
+    if isinstance(state, Mapping):
+        for name in PARAM_STATE_NAMES:
+            if name in state:
+                merged[name] = state[name]
+    for name, value in updates.items():
+        if name in PARAM_STATE_NAMES:
+            merged[name] = value
+    return merged
+
+
+def _state_from_dataclasses(
+    p: master.Params,
+    mp: master.MasterParams,
+    dp: master.DebugParams | None = None,
+) -> dict[str, object]:
+    state = _default_param_state()
+    p_values = asdict(p)
+    mp_values = asdict(mp)
+    for name in PARAM_KNOB_NAMES:
+        if name in p_values:
+            state[name] = p_values[name]
+            continue
+        master_name = UI_TO_MASTER_NAME.get(name, name)
+        if master_name in mp_values:
+            value = mp_values[master_name]
+            if name == "target_lufs" and value is None:
+                value = 999.0
+            state[name] = value
+    if dp is not None:
+        dp_values = asdict(dp)
+        for name in SPEC_PARAM_NAMES:
+            field_name = name.removeprefix("spec_")
+            if name in dp_values:
+                state[name] = dp_values[name]
+            elif field_name in dp_values:
+                state[name] = dp_values[field_name]
+    return state
+
+
+def _state_to_component_values(state: Mapping[str, object] | None) -> list[object]:
+    merged = _merge_param_state(state, {})
+    return [merged[name] for name in PARAM_STATE_NAMES]
+
+
 def _build_params(
-    *,
-    # main band
-    start_hz: float,
-    end_hz: float,
-    edge_hz: float,
-    n_fft: int,
-    hop: int,
-    flat_start: float,
-    flat_end: float,
-    freq_med_bins: int,
-    thr_db: float,
-    slope: float,
-    density_lo: float,
-    density_hi: float,
-    flux_thr_db: float,
-    flux_range_db: float,
-    noise_resynth: float,
-    mix: float,
-    delta_listen: bool,
-    # denoise
-    denoise: float,
-    dn_start_hz: float,
-    dn_end_hz: float,
-    dn_edge_hz: float,
-    dn_floor_db: float,
-    dn_psd_smooth_ms: float,
-    dn_minwin_ms: float,
-    dn_up_db_per_s: float,
-    dn_attack_ms: float,
-    dn_release_ms: float,
-    dn_freq_smooth_bins: int,
-    # deres
-    deres: float,
-    deq_start_hz: float,
-    deq_end_hz: float,
-    deq_edge_hz: float,
-    deq_freq_med_bins: int,
-    deq_thr_db: float,
-    deq_slope: float,
-    deq_max_att_db: float,
-    deq_density_lo: float,
-    deq_density_hi: float,
-    deq_persist_ms: float,
-    deq_persist_thr_db: float,
-    deq_freq_smooth_bins: int,
-    deq_tonal_boost_db: float,
-    deq_time_floor: bool,
-    deq_floor_smooth_ms: float,
-    deq_floor_rise_db_per_s: float,
-    deq_floor_thr_db: float,
-    # downward expander
-    expander: bool,
-    exp_start_hz: float,
-    exp_end_hz: float,
-    exp_threshold_db: float,
-    exp_ratio: float,
-    exp_attack_ms: float,
-    exp_release_ms: float,
-    # HPSS-ish
-    hpss: bool,
-    hpss_start_hz: float,
-    hpss_end_hz: float,
-    hpss_time_frames: int,
-    hpss_freq_bins: int,
-    hpss_harmonic_only: bool,
-    hpss_protect_percussive: float,
-    magnitude_inpaint: bool,
-    deq_inpaint: bool,
-    total_att_cap_db: float,
-    nuclear_mode: bool,
-    ms_process: bool,
-    ms_side_scale: float,
-    # phase blur
-    phase_blur: float,
-    pb_start_hz: float,
-    pb_end_hz: float,
-    pb_harmonic_only: bool,
-    # swish repair (phase coherence)
-    swish_repair: float,
-    swish_start_hz: float,
-    swish_end_hz: float,
-    swish_time_amt: float,
-    swish_freq_amt: float,
-    hf_decorrelate: float,
-    hf_dec_start_hz: float,
-    hf_dec_end_hz: float,
-    # nuclear HF resynthesis
-    hf_resynth: bool,
-    hf_lp_hz: float,
-    hf_src_lo_hz: float,
-    hf_src_hi_hz: float,
-    hf_drive: float,
-    hf_hp_hz: float,
-    hf_mix: float,
-    hf_confidence_blend: bool,
-    # mastering
-    master_enabled: bool,
-    hp_hz: float,
-    target_lufs: float,
-    target_rms_dbfs: float,
-    norm_max_gain_db: float,
-    norm_max_atten_db: float,
-    ceiling_dbtp: float,
-    lim_lookahead_ms: float,
-    lim_release_ms: float,
-    tp_os: int,
-    # visuals
-    spec_n_fft: int,
-    spec_hop: int,
-    spec_max_frames: int,
-    spec_max_hz: float,
-) -> Tuple[master.Params, master.MasterParams, master.DebugParams]:
-    p = master.Params(
-        start_hz=float(start_hz),
-        end_hz=float(end_hz),
-        edge_hz=float(edge_hz),
-        n_fft=int(n_fft),
-        hop=int(hop),
-        flat_start=float(flat_start),
-        flat_end=float(flat_end),
-        freq_med_bins=int(freq_med_bins),
-        thr_db=float(thr_db),
-        slope=float(slope),
-        density_lo=float(density_lo),
-        density_hi=float(density_hi),
-        flux_thr_db=float(flux_thr_db),
-        flux_range_db=float(flux_range_db),
-        noise_resynth=float(noise_resynth),
-        mix=float(mix),
-        delta_listen=bool(delta_listen),
-        # keep the preview clean; padding/fade helps boundary clicks
-        pad=True,
-        fade_ms=5.0,
-        seed=0,
-        denoise=float(denoise),
-        dn_start_hz=float(dn_start_hz),
-        dn_end_hz=float(dn_end_hz),
-        dn_edge_hz=float(dn_edge_hz),
-        dn_floor_db=float(dn_floor_db),
-        dn_psd_smooth_ms=float(dn_psd_smooth_ms),
-        dn_minwin_ms=float(dn_minwin_ms),
-        dn_up_db_per_s=float(dn_up_db_per_s),
-        dn_attack_ms=float(dn_attack_ms),
-        dn_release_ms=float(dn_release_ms),
-        dn_freq_smooth_bins=int(dn_freq_smooth_bins),
-        deres=float(deres),
-        deq_start_hz=float(deq_start_hz),
-        deq_end_hz=float(deq_end_hz),
-        deq_edge_hz=float(deq_edge_hz),
-        deq_freq_med_bins=int(deq_freq_med_bins),
-        deq_thr_db=float(deq_thr_db),
-        deq_slope=float(deq_slope),
-        deq_max_att_db=float(deq_max_att_db),
-        deq_density_lo=float(deq_density_lo),
-        deq_density_hi=float(deq_density_hi),
-        deq_persist_ms=float(deq_persist_ms),
-        deq_persist_thr_db=float(deq_persist_thr_db),
-        deq_freq_smooth_bins=int(deq_freq_smooth_bins),
-        deq_tonal_boost_db=float(deq_tonal_boost_db),
-        deq_time_floor=bool(deq_time_floor),
-        deq_floor_smooth_ms=float(deq_floor_smooth_ms),
-        deq_floor_rise_db_per_s=float(deq_floor_rise_db_per_s),
-        deq_floor_thr_db=float(deq_floor_thr_db),
+    param_state: Mapping[str, object] | None,
+) -> tuple[master.Params, master.MasterParams, master.DebugParams]:
+    state = _merge_param_state(param_state, {})
 
-        expander=bool(expander),
-        exp_start_hz=float(exp_start_hz),
-        exp_end_hz=float(exp_end_hz),
-        exp_threshold_db=float(exp_threshold_db),
-        exp_ratio=float(exp_ratio),
-        exp_attack_ms=float(exp_attack_ms),
-        exp_release_ms=float(exp_release_ms),
+    p = master.Params()
+    p_updates: dict[str, object] = {}
+    for f in fields(master.Params):
+        if f.name not in state:
+            continue
+        p_updates[f.name] = _coerce_like(state[f.name], getattr(p, f.name))
+    p_updates.update({"pad": True, "fade_ms": 5.0, "seed": 0})
+    p = replace(p, **p_updates)
 
-        hpss=bool(hpss),
-        hpss_start_hz=float(hpss_start_hz),
-        hpss_end_hz=float(hpss_end_hz),
-        hpss_time_frames=int(hpss_time_frames),
-        hpss_freq_bins=int(hpss_freq_bins),
-        hpss_harmonic_only=bool(hpss_harmonic_only),
-        hpss_protect_percussive=float(hpss_protect_percussive),
+    mp = master.MasterParams()
+    mp_updates: dict[str, object] = {}
+    for f in fields(master.MasterParams):
+        ui_name = MASTER_TO_UI_NAME.get(f.name, f.name)
+        if ui_name not in state:
+            continue
+        if f.name == "target_lufs":
+            raw_lufs = float(state[ui_name])
+            mp_updates[f.name] = None if raw_lufs >= 998.0 else raw_lufs
+        else:
+            mp_updates[f.name] = _coerce_like(state[ui_name], getattr(mp, f.name))
+    mp = replace(mp, **mp_updates)
 
-        magnitude_inpaint=bool(magnitude_inpaint),
-        deq_inpaint=bool(deq_inpaint),
-        total_att_cap_db=float(total_att_cap_db),
-        nuclear_mode=bool(nuclear_mode),
-        ms_process=bool(ms_process),
-        ms_side_scale=float(ms_side_scale),
-
-        phase_blur=float(phase_blur),
-        pb_start_hz=float(pb_start_hz),
-        pb_end_hz=float(pb_end_hz),
-        pb_harmonic_only=bool(pb_harmonic_only),
-
-        swish_repair=float(swish_repair),
-        swish_start_hz=float(swish_start_hz),
-        swish_end_hz=float(swish_end_hz),
-        swish_time_amt=float(swish_time_amt),
-        swish_freq_amt=float(swish_freq_amt),
-        hf_decorrelate=float(hf_decorrelate),
-        hf_dec_start_hz=float(hf_dec_start_hz),
-        hf_dec_end_hz=float(hf_dec_end_hz),
-
-        hf_resynth=bool(hf_resynth),
-        hf_lp_hz=float(hf_lp_hz),
-        hf_src_lo_hz=float(hf_src_lo_hz),
-        hf_src_hi_hz=float(hf_src_hi_hz),
-        hf_drive=float(hf_drive),
-        hf_hp_hz=float(hf_hp_hz),
-        hf_mix=float(hf_mix),
-        hf_confidence_blend=bool(hf_confidence_blend),
-    )
-
-    # LUFS: if user sets huge value, treat as disabled (match CLI convention)
-    target_lufs_opt: Optional[float] = None if float(target_lufs) >= 998.0 else float(target_lufs)
-    mp = master.MasterParams(
-        enabled=bool(master_enabled),
-        hp_hz=float(hp_hz),
-        target_lufs=target_lufs_opt,
-        target_rms_dbfs=float(target_rms_dbfs),
-        norm_max_gain_db=float(norm_max_gain_db),
-        norm_max_atten_db=float(norm_max_atten_db),
-        ceiling_dbtp=float(ceiling_dbtp),
-        lookahead_ms=float(lim_lookahead_ms),
-        release_ms=float(lim_release_ms),
-        os_factor=int(tp_os),
-    )
-
-    # debug disabled for UI runs; we render in-memory
     dp = master.DebugParams(
         enabled=False,
-        spec_n_fft=int(spec_n_fft),
-        spec_hop=int(spec_hop),
-        spec_max_frames=int(spec_max_frames),
-        spec_max_hz=float(spec_max_hz),
+        spec_n_fft=int(state["spec_n_fft"]),
+        spec_hop=int(state["spec_hop"]),
+        spec_max_frames=int(state["spec_max_frames"]),
+        spec_max_hz=float(state["spec_max_hz"]),
     )
     return p, mp, dp
 
 
 def run_once(
     audio_in: tuple[int, np.ndarray] | None,
-    # preview
     preview_t0: float,
     preview_dur: float,
     loop_xfade_ms: float,
     full_song_mode: bool,
-    # main band
-    start_hz: float,
-    end_hz: float,
-    edge_hz: float,
-    n_fft: int,
-    hop: int,
-    flat_start: float,
-    flat_end: float,
-    freq_med_bins: int,
-    thr_db: float,
-    slope: float,
-    density_lo: float,
-    density_hi: float,
-    flux_thr_db: float,
-    flux_range_db: float,
-    noise_resynth: float,
-    mix: float,
-    delta_listen: bool,
-    # denoise
-    denoise: float,
-    dn_start_hz: float,
-    dn_end_hz: float,
-    dn_edge_hz: float,
-    dn_floor_db: float,
-    dn_psd_smooth_ms: float,
-    dn_minwin_ms: float,
-    dn_up_db_per_s: float,
-    dn_attack_ms: float,
-    dn_release_ms: float,
-    dn_freq_smooth_bins: int,
-    # deres
-    deres: float,
-    deq_start_hz: float,
-    deq_end_hz: float,
-    deq_edge_hz: float,
-    deq_freq_med_bins: int,
-    deq_thr_db: float,
-    deq_slope: float,
-    deq_max_att_db: float,
-    deq_density_lo: float,
-    deq_density_hi: float,
-    deq_persist_ms: float,
-    deq_persist_thr_db: float,
-    deq_freq_smooth_bins: int,
-    deq_tonal_boost_db: float,
-    deq_time_floor: bool,
-    deq_floor_smooth_ms: float,
-    deq_floor_rise_db_per_s: float,
-    deq_floor_thr_db: float,
-    # downward expander
-    expander: bool,
-    exp_start_hz: float,
-    exp_end_hz: float,
-    exp_threshold_db: float,
-    exp_ratio: float,
-    exp_attack_ms: float,
-    exp_release_ms: float,
-    # HPSS-ish
-    hpss: bool,
-    hpss_start_hz: float,
-    hpss_end_hz: float,
-    hpss_time_frames: int,
-    hpss_freq_bins: int,
-    hpss_harmonic_only: bool,
-    hpss_protect_percussive: float,
-    magnitude_inpaint: bool,
-    deq_inpaint: bool,
-    total_att_cap_db: float,
-    nuclear_mode: bool,
-    ms_process: bool,
-    ms_side_scale: float,
-    # phase blur
-    phase_blur: float,
-    pb_start_hz: float,
-    pb_end_hz: float,
-    pb_harmonic_only: bool,
-    # swish repair (phase coherence)
-    swish_repair: float,
-    swish_start_hz: float,
-    swish_end_hz: float,
-    swish_time_amt: float,
-    swish_freq_amt: float,
-    hf_decorrelate: float,
-    hf_dec_start_hz: float,
-    hf_dec_end_hz: float,
-    # nuclear HF resynthesis
-    hf_resynth: bool,
-    hf_lp_hz: float,
-    hf_src_lo_hz: float,
-    hf_src_hi_hz: float,
-    hf_drive: float,
-    hf_hp_hz: float,
-    hf_mix: float,
-    hf_confidence_blend: bool,
-    # mastering
-    master_enabled: bool,
-    hp_hz: float,
-    target_lufs: float,
-    target_rms_dbfs: float,
-    norm_max_gain_db: float,
-    norm_max_atten_db: float,
-    ceiling_dbtp: float,
-    lim_lookahead_ms: float,
-    lim_release_ms: float,
-    tp_os: int,
-    # visuals
-    spec_n_fft: int,
-    spec_hop: int,
-    spec_max_frames: int,
-    spec_max_hz: float,
+    param_state: Mapping[str, object] | None,
 ) -> tuple[
     tuple[int, np.ndarray],
     tuple[int, np.ndarray],
@@ -551,115 +367,14 @@ def run_once(
     sr = int(sr)
     x = _to_float_audio(x)
 
-    p, mp, dp = _build_params(
-        start_hz=start_hz,
-        end_hz=end_hz,
-        edge_hz=edge_hz,
-        n_fft=n_fft,
-        hop=hop,
-        flat_start=flat_start,
-        flat_end=flat_end,
-        freq_med_bins=freq_med_bins,
-        thr_db=thr_db,
-        slope=slope,
-        density_lo=density_lo,
-        density_hi=density_hi,
-        flux_thr_db=flux_thr_db,
-        flux_range_db=flux_range_db,
-        noise_resynth=noise_resynth,
-        mix=mix,
-        delta_listen=delta_listen,
-        denoise=denoise,
-        dn_start_hz=dn_start_hz,
-        dn_end_hz=dn_end_hz,
-        dn_edge_hz=dn_edge_hz,
-        dn_floor_db=dn_floor_db,
-        dn_psd_smooth_ms=dn_psd_smooth_ms,
-        dn_minwin_ms=dn_minwin_ms,
-        dn_up_db_per_s=dn_up_db_per_s,
-        dn_attack_ms=dn_attack_ms,
-        dn_release_ms=dn_release_ms,
-        dn_freq_smooth_bins=dn_freq_smooth_bins,
-        deres=deres,
-        deq_start_hz=deq_start_hz,
-        deq_end_hz=deq_end_hz,
-        deq_edge_hz=deq_edge_hz,
-        deq_freq_med_bins=deq_freq_med_bins,
-        deq_thr_db=deq_thr_db,
-        deq_slope=deq_slope,
-        deq_max_att_db=deq_max_att_db,
-        deq_density_lo=deq_density_lo,
-        deq_density_hi=deq_density_hi,
-        deq_persist_ms=deq_persist_ms,
-        deq_persist_thr_db=deq_persist_thr_db,
-        deq_freq_smooth_bins=deq_freq_smooth_bins,
-        deq_tonal_boost_db=deq_tonal_boost_db,
-        deq_time_floor=deq_time_floor,
-        deq_floor_smooth_ms=deq_floor_smooth_ms,
-        deq_floor_rise_db_per_s=deq_floor_rise_db_per_s,
-        deq_floor_thr_db=deq_floor_thr_db,
-        expander=expander,
-        exp_start_hz=exp_start_hz,
-        exp_end_hz=exp_end_hz,
-        exp_threshold_db=exp_threshold_db,
-        exp_ratio=exp_ratio,
-        exp_attack_ms=exp_attack_ms,
-        exp_release_ms=exp_release_ms,
-        hpss=hpss,
-        hpss_start_hz=hpss_start_hz,
-        hpss_end_hz=hpss_end_hz,
-        hpss_time_frames=hpss_time_frames,
-        hpss_freq_bins=hpss_freq_bins,
-        hpss_harmonic_only=hpss_harmonic_only,
-        hpss_protect_percussive=hpss_protect_percussive,
-        magnitude_inpaint=magnitude_inpaint,
-        deq_inpaint=deq_inpaint,
-        total_att_cap_db=total_att_cap_db,
-        nuclear_mode=nuclear_mode,
-        ms_process=ms_process,
-        ms_side_scale=ms_side_scale,
-        phase_blur=phase_blur,
-        pb_start_hz=pb_start_hz,
-        pb_end_hz=pb_end_hz,
-        pb_harmonic_only=pb_harmonic_only,
-        swish_repair=swish_repair,
-        swish_start_hz=swish_start_hz,
-        swish_end_hz=swish_end_hz,
-        swish_time_amt=swish_time_amt,
-        swish_freq_amt=swish_freq_amt,
-        hf_decorrelate=hf_decorrelate,
-        hf_dec_start_hz=hf_dec_start_hz,
-        hf_dec_end_hz=hf_dec_end_hz,
-        hf_resynth=hf_resynth,
-        hf_lp_hz=hf_lp_hz,
-        hf_src_lo_hz=hf_src_lo_hz,
-        hf_src_hi_hz=hf_src_hi_hz,
-        hf_drive=hf_drive,
-        hf_hp_hz=hf_hp_hz,
-        hf_mix=hf_mix,
-        hf_confidence_blend=hf_confidence_blend,
-        master_enabled=master_enabled,
-        hp_hz=hp_hz,
-        target_lufs=target_lufs,
-        target_rms_dbfs=target_rms_dbfs,
-        norm_max_gain_db=norm_max_gain_db,
-        norm_max_atten_db=norm_max_atten_db,
-        ceiling_dbtp=ceiling_dbtp,
-        lim_lookahead_ms=lim_lookahead_ms,
-        lim_release_ms=lim_release_ms,
-        tp_os=tp_os,
-        spec_n_fft=spec_n_fft,
-        spec_hop=spec_hop,
-        spec_max_frames=spec_max_frames,
-        spec_max_hz=spec_max_hz,
-    )
+    p, mp, dp = _build_params(param_state)
 
     if full_song_mode:
         y, info = process_audio(x, sr, params=p, master_params=mp, debug_params=dp)
         y2 = _to_float_audio(y)
         n = min(x.shape[0], y2.shape[0])
         x_seg = x[:n, :]
-        if bool(delta_listen):
+        if bool(p.delta_listen):
             removed = y2[:n, :]
             processed = _to_float_audio(x_seg - removed)
             out_sig = removed
@@ -687,7 +402,7 @@ def run_once(
         y = np.asarray(y_ctx)[trim0:trim1]
         y2 = _to_float_audio(y)
 
-        if bool(delta_listen):
+        if bool(p.delta_listen):
             removed = y2
             processed = _to_float_audio(x_seg[: removed.shape[0], :] - removed)
             out_sig = removed
@@ -704,9 +419,9 @@ def run_once(
         mode_note = ""
 
     # Spectrograms
-    in_png = _spectrogram_png_bytes(x_seg, sr, n_fft=int(spec_n_fft), hop=int(spec_hop), max_frames=int(spec_max_frames), max_hz=float(spec_max_hz))
-    out_png = _spectrogram_png_bytes(out_sig, sr, n_fft=int(spec_n_fft), hop=int(spec_hop), max_frames=int(spec_max_frames), max_hz=float(spec_max_hz))
-    diff_png = _spectrogram_png_bytes(aux_sig, sr, n_fft=int(spec_n_fft), hop=int(spec_hop), max_frames=int(spec_max_frames), max_hz=float(spec_max_hz))
+    in_png = _spectrogram_png_bytes(x_seg, sr, n_fft=dp.spec_n_fft, hop=dp.spec_hop, max_frames=dp.spec_max_frames, max_hz=dp.spec_max_hz)
+    out_png = _spectrogram_png_bytes(out_sig, sr, n_fft=dp.spec_n_fft, hop=dp.spec_hop, max_frames=dp.spec_max_frames, max_hz=dp.spec_max_hz)
+    diff_png = _spectrogram_png_bytes(aux_sig, sr, n_fft=dp.spec_n_fft, hop=dp.spec_hop, max_frames=dp.spec_max_frames, max_hz=dp.spec_max_hz)
 
     metrics_md = _render_metrics_md(info) + mode_note
     params_json: dict[str, object] = {"params": asdict(p), "master_params": asdict(mp)}
@@ -725,113 +440,7 @@ def run_once(
 
 def render_full_to_files(
     audio_in: tuple[int, np.ndarray] | None,
-    # all settings (same as run_once, minus preview t0/dur)
-    start_hz: float,
-    end_hz: float,
-    edge_hz: float,
-    n_fft: int,
-    hop: int,
-    flat_start: float,
-    flat_end: float,
-    freq_med_bins: int,
-    thr_db: float,
-    slope: float,
-    density_lo: float,
-    density_hi: float,
-    flux_thr_db: float,
-    flux_range_db: float,
-    noise_resynth: float,
-    mix: float,
-    delta_listen: bool,
-    denoise: float,
-    dn_start_hz: float,
-    dn_end_hz: float,
-    dn_edge_hz: float,
-    dn_floor_db: float,
-    dn_psd_smooth_ms: float,
-    dn_minwin_ms: float,
-    dn_up_db_per_s: float,
-    dn_attack_ms: float,
-    dn_release_ms: float,
-    dn_freq_smooth_bins: int,
-    deres: float,
-    deq_start_hz: float,
-    deq_end_hz: float,
-    deq_edge_hz: float,
-    deq_freq_med_bins: int,
-    deq_thr_db: float,
-    deq_slope: float,
-    deq_max_att_db: float,
-    deq_density_lo: float,
-    deq_density_hi: float,
-    deq_persist_ms: float,
-    deq_persist_thr_db: float,
-    deq_freq_smooth_bins: int,
-    deq_tonal_boost_db: float,
-    deq_time_floor: bool,
-    deq_floor_smooth_ms: float,
-    deq_floor_rise_db_per_s: float,
-    deq_floor_thr_db: float,
-    # downward expander
-    expander: bool,
-    exp_start_hz: float,
-    exp_end_hz: float,
-    exp_threshold_db: float,
-    exp_ratio: float,
-    exp_attack_ms: float,
-    exp_release_ms: float,
-    # HPSS-ish
-    hpss: bool,
-    hpss_start_hz: float,
-    hpss_end_hz: float,
-    hpss_time_frames: int,
-    hpss_freq_bins: int,
-    hpss_harmonic_only: bool,
-    hpss_protect_percussive: float,
-    magnitude_inpaint: bool,
-    deq_inpaint: bool,
-    total_att_cap_db: float,
-    nuclear_mode: bool,
-    ms_process: bool,
-    ms_side_scale: float,
-    # phase blur
-    phase_blur: float,
-    pb_start_hz: float,
-    pb_end_hz: float,
-    pb_harmonic_only: bool,
-    # swish repair (phase coherence)
-    swish_repair: float,
-    swish_start_hz: float,
-    swish_end_hz: float,
-    swish_time_amt: float,
-    swish_freq_amt: float,
-    hf_decorrelate: float,
-    hf_dec_start_hz: float,
-    hf_dec_end_hz: float,
-    # nuclear HF resynthesis
-    hf_resynth: bool,
-    hf_lp_hz: float,
-    hf_src_lo_hz: float,
-    hf_src_hi_hz: float,
-    hf_drive: float,
-    hf_hp_hz: float,
-    hf_mix: float,
-    hf_confidence_blend: bool,
-    master_enabled: bool,
-    hp_hz: float,
-    target_lufs: float,
-    target_rms_dbfs: float,
-    norm_max_gain_db: float,
-    norm_max_atten_db: float,
-    ceiling_dbtp: float,
-    lim_lookahead_ms: float,
-    lim_release_ms: float,
-    tp_os: int,
-    # visuals params exist but unused for full render
-    spec_n_fft: int,
-    spec_hop: int,
-    spec_max_frames: int,
-    spec_max_hz: float,
+    param_state: Mapping[str, object] | None,
 ) -> tuple[str, str, str]:
     if audio_in is None:
         raise ValueError("Please load an audio file first.")
@@ -840,112 +449,11 @@ def render_full_to_files(
     sr = int(sr)
     x = _to_float_audio(x)
 
-    p, mp, dp = _build_params(
-        start_hz=start_hz,
-        end_hz=end_hz,
-        edge_hz=edge_hz,
-        n_fft=n_fft,
-        hop=hop,
-        flat_start=flat_start,
-        flat_end=flat_end,
-        freq_med_bins=freq_med_bins,
-        thr_db=thr_db,
-        slope=slope,
-        density_lo=density_lo,
-        density_hi=density_hi,
-        flux_thr_db=flux_thr_db,
-        flux_range_db=flux_range_db,
-        noise_resynth=noise_resynth,
-        mix=mix,
-        delta_listen=delta_listen,
-        denoise=denoise,
-        dn_start_hz=dn_start_hz,
-        dn_end_hz=dn_end_hz,
-        dn_edge_hz=dn_edge_hz,
-        dn_floor_db=dn_floor_db,
-        dn_psd_smooth_ms=dn_psd_smooth_ms,
-        dn_minwin_ms=dn_minwin_ms,
-        dn_up_db_per_s=dn_up_db_per_s,
-        dn_attack_ms=dn_attack_ms,
-        dn_release_ms=dn_release_ms,
-        dn_freq_smooth_bins=dn_freq_smooth_bins,
-        deres=deres,
-        deq_start_hz=deq_start_hz,
-        deq_end_hz=deq_end_hz,
-        deq_edge_hz=deq_edge_hz,
-        deq_freq_med_bins=deq_freq_med_bins,
-        deq_thr_db=deq_thr_db,
-        deq_slope=deq_slope,
-        deq_max_att_db=deq_max_att_db,
-        deq_density_lo=deq_density_lo,
-        deq_density_hi=deq_density_hi,
-        deq_persist_ms=deq_persist_ms,
-        deq_persist_thr_db=deq_persist_thr_db,
-        deq_freq_smooth_bins=deq_freq_smooth_bins,
-        deq_tonal_boost_db=deq_tonal_boost_db,
-        deq_time_floor=deq_time_floor,
-        deq_floor_smooth_ms=deq_floor_smooth_ms,
-        deq_floor_rise_db_per_s=deq_floor_rise_db_per_s,
-        deq_floor_thr_db=deq_floor_thr_db,
-        expander=expander,
-        exp_start_hz=exp_start_hz,
-        exp_end_hz=exp_end_hz,
-        exp_threshold_db=exp_threshold_db,
-        exp_ratio=exp_ratio,
-        exp_attack_ms=exp_attack_ms,
-        exp_release_ms=exp_release_ms,
-        hpss=hpss,
-        hpss_start_hz=hpss_start_hz,
-        hpss_end_hz=hpss_end_hz,
-        hpss_time_frames=hpss_time_frames,
-        hpss_freq_bins=hpss_freq_bins,
-        hpss_harmonic_only=hpss_harmonic_only,
-        hpss_protect_percussive=hpss_protect_percussive,
-        magnitude_inpaint=magnitude_inpaint,
-        deq_inpaint=deq_inpaint,
-        total_att_cap_db=total_att_cap_db,
-        nuclear_mode=nuclear_mode,
-        ms_process=ms_process,
-        ms_side_scale=ms_side_scale,
-        phase_blur=phase_blur,
-        pb_start_hz=pb_start_hz,
-        pb_end_hz=pb_end_hz,
-        pb_harmonic_only=pb_harmonic_only,
-        swish_repair=swish_repair,
-        swish_start_hz=swish_start_hz,
-        swish_end_hz=swish_end_hz,
-        swish_time_amt=swish_time_amt,
-        swish_freq_amt=swish_freq_amt,
-        hf_decorrelate=hf_decorrelate,
-        hf_dec_start_hz=hf_dec_start_hz,
-        hf_dec_end_hz=hf_dec_end_hz,
-        hf_resynth=hf_resynth,
-        hf_lp_hz=hf_lp_hz,
-        hf_src_lo_hz=hf_src_lo_hz,
-        hf_src_hi_hz=hf_src_hi_hz,
-        hf_drive=hf_drive,
-        hf_hp_hz=hf_hp_hz,
-        hf_mix=hf_mix,
-        hf_confidence_blend=hf_confidence_blend,
-        master_enabled=master_enabled,
-        hp_hz=hp_hz,
-        target_lufs=target_lufs,
-        target_rms_dbfs=target_rms_dbfs,
-        norm_max_gain_db=norm_max_gain_db,
-        norm_max_atten_db=norm_max_atten_db,
-        ceiling_dbtp=ceiling_dbtp,
-        lim_lookahead_ms=lim_lookahead_ms,
-        lim_release_ms=lim_release_ms,
-        tp_os=tp_os,
-        spec_n_fft=spec_n_fft,
-        spec_hop=spec_hop,
-        spec_max_frames=spec_max_frames,
-        spec_max_hz=spec_max_hz,
-    )
+    p, mp, dp = _build_params(param_state)
 
     y, _ = process_audio(x, sr, params=p, master_params=mp, debug_params=dp)
     y2 = _to_float_audio(y)
-    if bool(delta_listen):
+    if bool(p.delta_listen):
         removed = y2
         processed = _to_float_audio(x[: removed.shape[0], :] - removed)
         out_audio = removed
@@ -972,65 +480,6 @@ def render_full_to_files(
         json.dump({"params": asdict(p), "master_params": asdict(mp)}, f, indent=2, sort_keys=True)
 
     return out_path, diff_path, params_path
-
-
-def _params_to_slider_tuple(p: master.Params, mp: master.MasterParams) -> tuple[Any, ...]:
-    """
-    Flatten Params + MasterParams into a tuple matching the order of the UI's
-    preset_outputs list (everything *except* the trailing markdown component).
-    Used by both Apply-preset and the Auto-tune Analyze/Refine buttons.
-    """
-    target_lufs_v = 999.0 if mp.target_lufs is None else float(mp.target_lufs)
-    return (
-        float(p.start_hz), float(p.end_hz), float(p.edge_hz),
-        int(p.n_fft), int(p.hop),
-        float(p.flat_start), float(p.flat_end),
-        int(p.freq_med_bins), float(p.thr_db), float(p.slope),
-        float(p.density_lo), float(p.density_hi),
-        float(p.flux_thr_db), float(p.flux_range_db),
-        float(p.noise_resynth), float(p.mix), bool(p.delta_listen),
-        float(p.denoise), float(p.dn_start_hz), float(p.dn_end_hz), float(p.dn_edge_hz),
-        float(p.dn_floor_db), float(p.dn_psd_smooth_ms), float(p.dn_minwin_ms),
-        float(p.dn_up_db_per_s), float(p.dn_attack_ms), float(p.dn_release_ms),
-        int(p.dn_freq_smooth_bins),
-        float(p.deres), float(p.deq_start_hz), float(p.deq_end_hz), float(p.deq_edge_hz),
-        int(p.deq_freq_med_bins), float(p.deq_thr_db), float(p.deq_slope),
-        float(p.deq_max_att_db), float(p.deq_density_lo), float(p.deq_density_hi),
-        float(p.deq_persist_ms), float(p.deq_persist_thr_db),
-        int(p.deq_freq_smooth_bins), float(p.deq_tonal_boost_db),
-        bool(p.deq_time_floor), float(p.deq_floor_smooth_ms),
-        float(p.deq_floor_rise_db_per_s), float(p.deq_floor_thr_db),
-        bool(p.expander), float(p.exp_start_hz), float(p.exp_end_hz),
-        float(p.exp_threshold_db), float(p.exp_ratio),
-        float(p.exp_attack_ms), float(p.exp_release_ms),
-        bool(p.hpss), float(p.hpss_start_hz), float(p.hpss_end_hz),
-        int(p.hpss_time_frames), int(p.hpss_freq_bins), bool(p.hpss_harmonic_only),
-        float(getattr(p, "hpss_protect_percussive", 0.0)),
-        bool(getattr(p, "magnitude_inpaint", True)),
-        bool(getattr(p, "deq_inpaint", True)),
-        float(getattr(p, "total_att_cap_db", 12.0)),
-        bool(getattr(p, "nuclear_mode", False)),
-        bool(getattr(p, "ms_process", False)),
-        float(getattr(p, "ms_side_scale", 0.35)),
-        float(p.phase_blur), float(p.pb_start_hz), float(p.pb_end_hz),
-        bool(p.pb_harmonic_only),
-        float(getattr(p, "swish_repair", 0.0)),
-        float(getattr(p, "swish_start_hz", 3500.0)),
-        float(getattr(p, "swish_end_hz", 14000.0)),
-        float(getattr(p, "swish_time_amt", 0.55)),
-        float(getattr(p, "swish_freq_amt", 0.30)),
-        float(getattr(p, "hf_decorrelate", 0.0)),
-        float(getattr(p, "hf_dec_start_hz", 4500.0)),
-        float(getattr(p, "hf_dec_end_hz", 16000.0)),
-        bool(p.hf_resynth), float(p.hf_lp_hz), float(p.hf_src_lo_hz),
-        float(p.hf_src_hi_hz), float(p.hf_drive), float(p.hf_hp_hz), float(p.hf_mix),
-        bool(getattr(p, "hf_confidence_blend", True)),
-        bool(mp.enabled), float(mp.hp_hz), float(target_lufs_v),
-        float(mp.target_rms_dbfs if mp.target_rms_dbfs is not None else -16.0),
-        float(mp.norm_max_gain_db), float(mp.norm_max_atten_db),
-        float(mp.ceiling_dbtp), float(mp.lookahead_ms), float(mp.release_ms),
-        int(mp.os_factor),
-    )
 
 
 def build_ui() -> Any:
@@ -1869,388 +1318,33 @@ def build_ui() -> Any:
             rt_export = gr.Button("Export knobs to realtime_params.json (for realtime_player.py)", variant="secondary")
             rt_export_status = gr.Markdown()
 
+        params_state = gr.State(_default_param_state())
+        _component_scope = locals()
+        param_components: dict[str, Any] = {
+            name: _component_scope[name] for name in PARAM_STATE_NAMES
+        }
+        param_outputs = [param_components[name] for name in PARAM_STATE_NAMES]
+        result_outputs = [a_in, a_out, a_diff, im_in, im_out, im_diff, metrics, params_json]
+        render_inputs = [audio_in, preview_t0, preview_dur, loop_xfade_ms, full_song_mode, params_state]
+
         def _preset_desc_md(name: str) -> str:
             p = all_presets.get(name, {})
             desc = p.get("desc", "")
             return f"**{name}**  \n{desc}" if desc else f"**{name}**"
 
-        def apply_preset(name: str):
-            p = all_presets.get(name, {})
-            vals = dict(p.get("values", {}))
-            # return updates in the same order as outputs list below
-            def g(key: str, current: object) -> object:
-                return vals.get(key, current)
-
-            return (
-                g("start_hz", start_hz.value),
-                g("end_hz", end_hz.value),
-                g("edge_hz", edge_hz.value),
-                g("n_fft", n_fft.value),
-                g("hop", hop.value),
-                g("flat_start", flat_start.value),
-                g("flat_end", flat_end.value),
-                g("freq_med_bins", freq_med_bins.value),
-                g("thr_db", thr_db.value),
-                g("slope", slope.value),
-                g("density_lo", density_lo.value),
-                g("density_hi", density_hi.value),
-                g("flux_thr_db", flux_thr_db.value),
-                g("flux_range_db", flux_range_db.value),
-                g("noise_resynth", noise_resynth.value),
-                g("mix", mix.value),
-                g("delta_listen", delta_listen.value),
-                g("denoise", denoise.value),
-                g("dn_start_hz", dn_start_hz.value),
-                g("dn_end_hz", dn_end_hz.value),
-                g("dn_edge_hz", dn_edge_hz.value),
-                g("dn_floor_db", dn_floor_db.value),
-                g("dn_psd_smooth_ms", dn_psd_smooth_ms.value),
-                g("dn_minwin_ms", dn_minwin_ms.value),
-                g("dn_up_db_per_s", dn_up_db_per_s.value),
-                g("dn_attack_ms", dn_attack_ms.value),
-                g("dn_release_ms", dn_release_ms.value),
-                g("dn_freq_smooth_bins", dn_freq_smooth_bins.value),
-                g("deres", deres.value),
-                g("deq_start_hz", deq_start_hz.value),
-                g("deq_end_hz", deq_end_hz.value),
-                g("deq_edge_hz", deq_edge_hz.value),
-                g("deq_freq_med_bins", deq_freq_med_bins.value),
-                g("deq_thr_db", deq_thr_db.value),
-                g("deq_slope", deq_slope.value),
-                g("deq_max_att_db", deq_max_att_db.value),
-                g("deq_density_lo", deq_density_lo.value),
-                g("deq_density_hi", deq_density_hi.value),
-                g("deq_persist_ms", deq_persist_ms.value),
-                g("deq_persist_thr_db", deq_persist_thr_db.value),
-                g("deq_freq_smooth_bins", deq_freq_smooth_bins.value),
-                g("deq_tonal_boost_db", deq_tonal_boost_db.value),
-                g("deq_time_floor", deq_time_floor.value),
-                g("deq_floor_smooth_ms", deq_floor_smooth_ms.value),
-                g("deq_floor_rise_db_per_s", deq_floor_rise_db_per_s.value),
-                g("deq_floor_thr_db", deq_floor_thr_db.value),
-                g("expander", expander.value),
-                g("exp_start_hz", exp_start_hz.value),
-                g("exp_end_hz", exp_end_hz.value),
-                g("exp_threshold_db", exp_threshold_db.value),
-                g("exp_ratio", exp_ratio.value),
-                g("exp_attack_ms", exp_attack_ms.value),
-                g("exp_release_ms", exp_release_ms.value),
-                g("hpss", hpss.value),
-                g("hpss_start_hz", hpss_start_hz.value),
-                g("hpss_end_hz", hpss_end_hz.value),
-                g("hpss_time_frames", hpss_time_frames.value),
-                g("hpss_freq_bins", hpss_freq_bins.value),
-                g("hpss_harmonic_only", hpss_harmonic_only.value),
-                g("hpss_protect_percussive", hpss_protect_percussive.value),
-                g("magnitude_inpaint", magnitude_inpaint.value),
-                g("deq_inpaint", deq_inpaint.value),
-                g("total_att_cap_db", total_att_cap_db.value),
-                g("nuclear_mode", nuclear_mode.value),
-                g("ms_process", ms_process.value),
-                g("ms_side_scale", ms_side_scale.value),
-                g("phase_blur", phase_blur.value),
-                g("pb_start_hz", pb_start_hz.value),
-                g("pb_end_hz", pb_end_hz.value),
-                g("pb_harmonic_only", pb_harmonic_only.value),
-                g("swish_repair", swish_repair.value),
-                g("swish_start_hz", swish_start_hz.value),
-                g("swish_end_hz", swish_end_hz.value),
-                g("swish_time_amt", swish_time_amt.value),
-                g("swish_freq_amt", swish_freq_amt.value),
-                g("hf_decorrelate", hf_decorrelate.value),
-                g("hf_dec_start_hz", hf_dec_start_hz.value),
-                g("hf_dec_end_hz", hf_dec_end_hz.value),
-                g("hf_resynth", hf_resynth.value),
-                g("hf_lp_hz", hf_lp_hz.value),
-                g("hf_src_lo_hz", hf_src_lo_hz.value),
-                g("hf_src_hi_hz", hf_src_hi_hz.value),
-                g("hf_drive", hf_drive.value),
-                g("hf_hp_hz", hf_hp_hz.value),
-                g("hf_mix", hf_mix.value),
-                g("hf_confidence_blend", hf_confidence_blend.value),
-                g("master_enabled", master_enabled.value),
-                g("hp_hz", hp_hz.value),
-                g("target_lufs", target_lufs.value),
-                g("target_rms_dbfs", target_rms_dbfs.value),
-                g("norm_max_gain_db", norm_max_gain_db.value),
-                g("norm_max_atten_db", norm_max_atten_db.value),
-                g("ceiling_dbtp", ceiling_dbtp.value),
-                g("lim_lookahead_ms", lim_lookahead_ms.value),
-                g("lim_release_ms", lim_release_ms.value),
-                g("tp_os", tp_os.value),
-                _preset_desc_md(name),
-            )
+        def apply_preset(name: str, state: Mapping[str, object] | None) -> tuple[Any, ...]:
+            preset_data = all_presets.get(name, {})
+            values = preset_data.get("values", {})
+            updates = values if isinstance(values, Mapping) else {}
+            new_state = _merge_param_state(state, updates)
+            return tuple([new_state] + _state_to_component_values(new_state) + [_preset_desc_md(name)])
 
         preset.change(fn=_preset_desc_md, inputs=[preset], outputs=[preset_desc])
-
-        preset_outputs = [
-            start_hz,
-            end_hz,
-            edge_hz,
-            n_fft,
-            hop,
-            flat_start,
-            flat_end,
-            freq_med_bins,
-            thr_db,
-            slope,
-            density_lo,
-            density_hi,
-            flux_thr_db,
-            flux_range_db,
-            noise_resynth,
-            mix,
-            delta_listen,
-            denoise,
-            dn_start_hz,
-            dn_end_hz,
-            dn_edge_hz,
-            dn_floor_db,
-            dn_psd_smooth_ms,
-            dn_minwin_ms,
-            dn_up_db_per_s,
-            dn_attack_ms,
-            dn_release_ms,
-            dn_freq_smooth_bins,
-            deres,
-            deq_start_hz,
-            deq_end_hz,
-            deq_edge_hz,
-            deq_freq_med_bins,
-            deq_thr_db,
-            deq_slope,
-            deq_max_att_db,
-            deq_density_lo,
-            deq_density_hi,
-            deq_persist_ms,
-            deq_persist_thr_db,
-            deq_freq_smooth_bins,
-            deq_tonal_boost_db,
-            deq_time_floor,
-            deq_floor_smooth_ms,
-            deq_floor_rise_db_per_s,
-            deq_floor_thr_db,
-            expander,
-            exp_start_hz,
-            exp_end_hz,
-            exp_threshold_db,
-            exp_ratio,
-            exp_attack_ms,
-            exp_release_ms,
-            hpss,
-            hpss_start_hz,
-            hpss_end_hz,
-            hpss_time_frames,
-            hpss_freq_bins,
-            hpss_harmonic_only,
-            hpss_protect_percussive,
-            magnitude_inpaint,
-            deq_inpaint,
-            total_att_cap_db,
-            nuclear_mode,
-            ms_process,
-            ms_side_scale,
-            phase_blur,
-            pb_start_hz,
-            pb_end_hz,
-            pb_harmonic_only,
-            swish_repair,
-            swish_start_hz,
-            swish_end_hz,
-            swish_time_amt,
-            swish_freq_amt,
-            hf_decorrelate,
-            hf_dec_start_hz,
-            hf_dec_end_hz,
-            hf_resynth,
-            hf_lp_hz,
-            hf_src_lo_hz,
-            hf_src_hi_hz,
-            hf_drive,
-            hf_hp_hz,
-            hf_mix,
-            hf_confidence_blend,
-            master_enabled,
-            hp_hz,
-            target_lufs,
-            target_rms_dbfs,
-            norm_max_gain_db,
-            norm_max_atten_db,
-            ceiling_dbtp,
-            lim_lookahead_ms,
-            lim_release_ms,
-            tp_os,
-            preset_desc,
-        ]
-
-        inputs = [
-            audio_in,
-            preview_t0,
-            preview_dur,
-            loop_xfade_ms,
-            full_song_mode,
-            start_hz,
-            end_hz,
-            edge_hz,
-            n_fft,
-            hop,
-            flat_start,
-            flat_end,
-            freq_med_bins,
-            thr_db,
-            slope,
-            density_lo,
-            density_hi,
-            flux_thr_db,
-            flux_range_db,
-            noise_resynth,
-            mix,
-            delta_listen,
-            denoise,
-            dn_start_hz,
-            dn_end_hz,
-            dn_edge_hz,
-            dn_floor_db,
-            dn_psd_smooth_ms,
-            dn_minwin_ms,
-            dn_up_db_per_s,
-            dn_attack_ms,
-            dn_release_ms,
-            dn_freq_smooth_bins,
-            deres,
-            deq_start_hz,
-            deq_end_hz,
-            deq_edge_hz,
-            deq_freq_med_bins,
-            deq_thr_db,
-            deq_slope,
-            deq_max_att_db,
-            deq_density_lo,
-            deq_density_hi,
-            deq_persist_ms,
-            deq_persist_thr_db,
-            deq_freq_smooth_bins,
-            deq_tonal_boost_db,
-            deq_time_floor,
-            deq_floor_smooth_ms,
-            deq_floor_rise_db_per_s,
-            deq_floor_thr_db,
-            expander,
-            exp_start_hz,
-            exp_end_hz,
-            exp_threshold_db,
-            exp_ratio,
-            exp_attack_ms,
-            exp_release_ms,
-            hpss,
-            hpss_start_hz,
-            hpss_end_hz,
-            hpss_time_frames,
-            hpss_freq_bins,
-            hpss_harmonic_only,
-            hpss_protect_percussive,
-            magnitude_inpaint,
-            deq_inpaint,
-            total_att_cap_db,
-            nuclear_mode,
-            ms_process,
-            ms_side_scale,
-            phase_blur,
-            pb_start_hz,
-            pb_end_hz,
-            pb_harmonic_only,
-            swish_repair,
-            swish_start_hz,
-            swish_end_hz,
-            swish_time_amt,
-            swish_freq_amt,
-            hf_decorrelate,
-            hf_dec_start_hz,
-            hf_dec_end_hz,
-            hf_resynth,
-            hf_lp_hz,
-            hf_src_lo_hz,
-            hf_src_hi_hz,
-            hf_drive,
-            hf_hp_hz,
-            hf_mix,
-            hf_confidence_blend,
-            master_enabled,
-            hp_hz,
-            target_lufs,
-            target_rms_dbfs,
-            norm_max_gain_db,
-            norm_max_atten_db,
-            ceiling_dbtp,
-            lim_lookahead_ms,
-            lim_release_ms,
-            tp_os,
-            spec_n_fft,
-            spec_hop,
-            spec_max_frames,
-            spec_max_hz,
-        ]
-
-        run_btn.click(
-            fn=run_once,
-            inputs=inputs,
-            outputs=[a_in, a_out, a_diff, im_in, im_out, im_diff, metrics, params_json],
-        )
-
-        # Apply preset, then rerender preview (restart output loop)
-        preset_apply.click(fn=apply_preset, inputs=[preset], outputs=preset_outputs).then(
-            fn=run_once,
-            inputs=inputs,
-            outputs=[a_in, a_out, a_diff, im_in, im_out, im_diff, metrics, params_json],
-        )
-
-        # ---- Auto-tune wiring (Analyze + Refine) ----
-        # The "knob inputs" tail is identical for both buttons; we slice it from the existing
-        # `inputs` list so we never have to repeat the 80-element knob enumeration.
-        # `inputs` layout:
-        #   [audio_in, preview_t0, preview_dur, loop_xfade_ms, full_song_mode, ...80 knobs..., spec_*4]
-        knob_inputs = inputs[5:-4]   # drop preview-only prefix and spec-only suffix
-        spec_inputs = inputs[-4:]
-
-        # auto_outputs mirrors preset_outputs exactly, but with the report markdown at the tail.
-        auto_outputs = preset_outputs[:-1] + [auto_report]
-
-        def _build_base_params_from_knobs(knob_vals: list[Any], spec_vals: list[Any]) -> tuple[master.Params, master.MasterParams]:
-            kw: dict[str, Any] = {}
-            knob_names = [
-                "start_hz", "end_hz", "edge_hz", "n_fft", "hop", "flat_start", "flat_end",
-                "freq_med_bins", "thr_db", "slope", "density_lo", "density_hi",
-                "flux_thr_db", "flux_range_db", "noise_resynth", "mix", "delta_listen",
-                "denoise", "dn_start_hz", "dn_end_hz", "dn_edge_hz", "dn_floor_db",
-                "dn_psd_smooth_ms", "dn_minwin_ms", "dn_up_db_per_s", "dn_attack_ms",
-                "dn_release_ms", "dn_freq_smooth_bins",
-                "deres", "deq_start_hz", "deq_end_hz", "deq_edge_hz", "deq_freq_med_bins",
-                "deq_thr_db", "deq_slope", "deq_max_att_db", "deq_density_lo",
-                "deq_density_hi", "deq_persist_ms", "deq_persist_thr_db",
-                "deq_freq_smooth_bins", "deq_tonal_boost_db", "deq_time_floor",
-                "deq_floor_smooth_ms", "deq_floor_rise_db_per_s", "deq_floor_thr_db",
-                "expander", "exp_start_hz", "exp_end_hz", "exp_threshold_db",
-                "exp_ratio", "exp_attack_ms", "exp_release_ms",
-                "hpss", "hpss_start_hz", "hpss_end_hz", "hpss_time_frames",
-                "hpss_freq_bins", "hpss_harmonic_only", "hpss_protect_percussive",
-                "magnitude_inpaint", "deq_inpaint", "total_att_cap_db", "nuclear_mode",
-                "ms_process", "ms_side_scale",
-                "phase_blur", "pb_start_hz", "pb_end_hz", "pb_harmonic_only",
-                "swish_repair", "swish_start_hz", "swish_end_hz", "swish_time_amt", "swish_freq_amt",
-                "hf_decorrelate", "hf_dec_start_hz", "hf_dec_end_hz",
-                "hf_resynth", "hf_lp_hz", "hf_src_lo_hz", "hf_src_hi_hz",
-                "hf_drive", "hf_hp_hz", "hf_mix", "hf_confidence_blend",
-                "master_enabled", "hp_hz", "target_lufs", "target_rms_dbfs",
-                "norm_max_gain_db", "norm_max_atten_db", "ceiling_dbtp",
-                "lim_lookahead_ms", "lim_release_ms", "tp_os",
-            ]
-            for name, val in zip(knob_names, knob_vals):
-                kw[name] = val
-            spec_names = ["spec_n_fft", "spec_hop", "spec_max_frames", "spec_max_hz"]
-            for name, val in zip(spec_names, spec_vals):
-                kw[name] = val
-            p, mp, _dp = _build_params(**kw)
-            return p, mp
+        preset_apply.click(
+            fn=apply_preset,
+            inputs=[preset, params_state],
+            outputs=[params_state] + param_outputs + [preset_desc],
+        ).then(fn=run_once, inputs=render_inputs, outputs=result_outputs)
 
         def do_analyze(
             audio_in_v: tuple[int, np.ndarray] | None,
@@ -2258,22 +1352,17 @@ def build_ui() -> Any:
             preview_dur_v: float,
             use_preview_v: bool,
             n_regions_v: float,
-            *args: Any,
+            state: Mapping[str, object] | None,
         ) -> tuple[Any, ...]:
-            n_knobs_plus_specs = len(knob_inputs) + len(spec_inputs)
-            if len(args) < n_knobs_plus_specs:
-                raise ValueError(f"do_analyze: expected {n_knobs_plus_specs} trailing args, got {len(args)}")
-            knob_vals = list(args[: len(knob_inputs)])
-            spec_vals = list(args[len(knob_inputs):])
+            current_state = _merge_param_state(state, {})
             if audio_in_v is None:
                 report = "**Auto-analyze:** please load an audio file first."
-                return tuple(list(_params_to_slider_tuple(master.Params(), master.MasterParams())) + [report])
+                return tuple([current_state] + _state_to_component_values(current_state) + [report])
 
             sr_v, x_v = audio_in_v
             sr_v = int(sr_v)
             x_v = _to_float_audio(x_v)
-
-            base_p, _base_mp = _build_base_params_from_knobs(knob_vals, spec_vals)
+            base_p, _base_mp, _base_dp = _build_params(current_state)
 
             locked = None
             if bool(use_preview_v):
@@ -2281,7 +1370,8 @@ def build_ui() -> Any:
             n_reg = int(max(1, round(float(n_regions_v))))
             regions = auto_tune.pick_regions(x_v, sr_v, n=n_reg, dur=max(2.0, float(preview_dur_v)), locked=locked)
             new_p, new_mp, report = auto_tune.analyze(x_v, sr_v, regions, base_params=base_p)
-            return tuple(list(_params_to_slider_tuple(new_p, new_mp)) + [report.to_markdown()])
+            new_state = _merge_param_state(current_state, _state_from_dataclasses(new_p, new_mp))
+            return tuple([new_state] + _state_to_component_values(new_state) + [report.to_markdown()])
 
         def do_refine(
             audio_in_v: tuple[int, np.ndarray] | None,
@@ -2292,23 +1382,18 @@ def build_ui() -> Any:
             aggressiveness_v: float,
             n_trials_v: float,
             refine_dur_v: float,
-            *args: Any,
+            state: Mapping[str, object] | None,
             progress: Any = gr.Progress(track_tqdm=False),
         ) -> tuple[Any, ...]:
-            n_knobs_plus_specs = len(knob_inputs) + len(spec_inputs)
-            if len(args) < n_knobs_plus_specs:
-                raise ValueError(f"do_refine: expected {n_knobs_plus_specs} trailing args, got {len(args)}")
-            knob_vals = list(args[: len(knob_inputs)])
-            spec_vals = list(args[len(knob_inputs):])
+            current_state = _merge_param_state(state, {})
             if audio_in_v is None:
                 report = "**Auto-refine:** please load an audio file first."
-                return tuple(list(_params_to_slider_tuple(master.Params(), master.MasterParams())) + [report])
+                return tuple([current_state] + _state_to_component_values(current_state) + [report])
 
             sr_v, x_v = audio_in_v
             sr_v = int(sr_v)
             x_v = _to_float_audio(x_v)
-
-            base_p, base_mp = _build_base_params_from_knobs(knob_vals, spec_vals)
+            base_p, base_mp, _base_dp = _build_params(current_state)
 
             locked = None
             if bool(use_preview_v):
@@ -2323,10 +1408,11 @@ def build_ui() -> Any:
                     progress(float(frac), desc=msg)
                 except Exception:
                     pass
-            progress(0.0, desc="Refining...")
 
+            progress(0.0, desc="Refining...")
             new_p, summary = auto_tune.refine(
-                x_v, sr_v,
+                x_v,
+                sr_v,
                 base_params=base_p,
                 regions=regions,
                 aggressiveness=float(aggressiveness_v),
@@ -2335,12 +1421,14 @@ def build_ui() -> Any:
                 progress_cb=_cb,
             )
 
-            # Build a concise report of the refine outcome.
             stages_md_lines = ["**Auto-refine results**", ""]
-            stages_md_lines.append(f"- Aggressiveness: **{float(aggressiveness_v):.2f}**, trials/stage: **{int(n_trials_v)}**, regions: {len(regions)}")
+            stages_md_lines.append(
+                f"- Aggressiveness: **{float(aggressiveness_v):.2f}**, "
+                f"trials/stage: **{int(n_trials_v)}**, regions: {len(regions)}"
+            )
             stages_md_lines.append(f"- Final composite score: **{summary.get('final_score', 0.0):+.3f}**")
             for s in summary.get("stages", []):
-                stages_md_lines.append(f"- Stage **{s['stage']}**: pareto artifact={s['best_score']:+.3f}")
+                stages_md_lines.append(f"- Stage **{s['stage']}**: selected={s.get('selection_mode', 'balanced')}, score={s.get('selected_score', 0.0):+.3f}")
                 pareto = s.get("pareto", {})
                 if pareto:
                     for mode in ("safe", "balanced", "aggressive"):
@@ -2351,794 +1439,107 @@ def build_ui() -> Any:
                                 f"  - **{mode}**: artifact={vals[0]:+.2f}, "
                                 f"music={-vals[1]:+.2f}, stereo={-vals[3]:+.2f}"
                             )
-                bp = s.get("best_params", {})
+                bp = s.get("selected_params", s.get("best_params", {}))
                 if bp:
                     bp_s = ", ".join(f"`{k}`={v:.3g}" if isinstance(v, float) else f"`{k}`={v}" for k, v in bp.items())
                     stages_md_lines.append(f"  - {bp_s}")
+            failure_log = summary.get("failure_log")
+            if failure_log:
+                stages_md_lines.append(f"- Failed-trial diagnostics: `{failure_log}`")
             stages_md_lines.append("")
-            stages_md_lines.append("_(Pareto NSGA-II: balanced candidate applied to sliders. safe/aggressive listed for reference.)_")
-            return tuple(list(_params_to_slider_tuple(new_p, base_mp)) + ["\n".join(stages_md_lines)])
+            stages_md_lines.append("_(NSGA-II runs with flat objective weights; aggressiveness selects from the Pareto front after search.)_")
 
-        # Build the input lists for the two buttons. Layout:
-        #   analyze: [audio_in, preview_t0, preview_dur, use_preview, n_regions] + knobs + specs
-        #   refine : [audio_in, preview_t0, preview_dur, use_preview, n_regions, aggressiveness, n_trials, refine_dur] + knobs + specs
-        analyze_inputs = [audio_in, preview_t0, preview_dur, auto_use_preview, auto_n_regions] + list(knob_inputs) + list(spec_inputs)
-        refine_inputs = [audio_in, preview_t0, preview_dur, auto_use_preview, auto_n_regions,
-                         auto_aggressiveness, auto_n_trials, auto_refine_dur] + list(knob_inputs) + list(spec_inputs)
+            new_state = _merge_param_state(current_state, _state_from_dataclasses(new_p, base_mp))
+            return tuple([new_state] + _state_to_component_values(new_state) + ["\n".join(stages_md_lines)])
 
-        analyze_btn.click(fn=do_analyze, inputs=analyze_inputs, outputs=auto_outputs).then(
-            fn=run_once,
-            inputs=inputs,
-            outputs=[a_in, a_out, a_diff, im_in, im_out, im_diff, metrics, params_json],
-        )
+        analyze_btn.click(
+            fn=do_analyze,
+            inputs=[audio_in, preview_t0, preview_dur, auto_use_preview, auto_n_regions, params_state],
+            outputs=[params_state] + param_outputs + [auto_report],
+        ).then(fn=run_once, inputs=render_inputs, outputs=result_outputs)
 
-        refine_btn.click(fn=do_refine, inputs=refine_inputs, outputs=auto_outputs).then(
-            fn=run_once,
-            inputs=inputs,
-            outputs=[a_in, a_out, a_diff, im_in, im_out, im_diff, metrics, params_json],
-        )
+        refine_btn.click(
+            fn=do_refine,
+            inputs=[
+                audio_in,
+                preview_t0,
+                preview_dur,
+                auto_use_preview,
+                auto_n_regions,
+                auto_aggressiveness,
+                auto_n_trials,
+                auto_refine_dur,
+                params_state,
+            ],
+            outputs=[params_state] + param_outputs + [auto_report],
+        ).then(fn=run_once, inputs=render_inputs, outputs=result_outputs)
 
-        # Initialize preset description
         demo.load(fn=_preset_desc_md, inputs=[preset], outputs=[preset_desc])
+        run_btn.click(fn=run_once, inputs=render_inputs, outputs=result_outputs)
+        full_btn.click(fn=render_full_to_files, inputs=[audio_in, params_state], outputs=[dl_out, dl_diff, dl_params])
 
-        # Auto re-render + restart loop on knob release/change.
-        def _bind_auto(comp):
-            # Prefer .release for sliders (avoid rerender while dragging); fallback to .change.
+        def _bind_preview_auto(comp: Any) -> None:
             handler = getattr(comp, "release", None)
             if callable(handler):
-                handler(fn=run_once, inputs=inputs, outputs=[a_in, a_out, a_diff, im_in, im_out, im_diff, metrics, params_json])
+                handler(fn=run_once, inputs=render_inputs, outputs=result_outputs)
                 return
-            comp.change(fn=run_once, inputs=inputs, outputs=[a_in, a_out, a_diff, im_in, im_out, im_diff, metrics, params_json])
+            comp.change(fn=run_once, inputs=render_inputs, outputs=result_outputs)
 
-        # Preview controls
-        _bind_auto(preview_t0)
-        _bind_auto(preview_dur)
-        _bind_auto(loop_xfade_ms)
-        _bind_auto(full_song_mode)
+        def _make_state_updater(key: str):
+            def _update(value: object, state: Mapping[str, object] | None) -> dict[str, object]:
+                return _merge_param_state(state, {key: value})
+            return _update
 
-        # Most knobs
-        for c in [
-            start_hz,
-            end_hz,
-            edge_hz,
-            n_fft,
-            hop,
-            flat_start,
-            flat_end,
-            freq_med_bins,
-            thr_db,
-            slope,
-            density_lo,
-            density_hi,
-            flux_thr_db,
-            flux_range_db,
-            noise_resynth,
-            mix,
-            delta_listen,
-            denoise,
-            dn_start_hz,
-            dn_end_hz,
-            dn_edge_hz,
-            dn_floor_db,
-            dn_psd_smooth_ms,
-            dn_minwin_ms,
-            dn_up_db_per_s,
-            dn_attack_ms,
-            dn_release_ms,
-            dn_freq_smooth_bins,
-            deres,
-            deq_start_hz,
-            deq_end_hz,
-            deq_edge_hz,
-            deq_freq_med_bins,
-            deq_thr_db,
-            deq_slope,
-            deq_max_att_db,
-            deq_density_lo,
-            deq_density_hi,
-            deq_persist_ms,
-            deq_persist_thr_db,
-            deq_freq_smooth_bins,
-            deq_tonal_boost_db,
-            deq_time_floor,
-            deq_floor_smooth_ms,
-            deq_floor_rise_db_per_s,
-            deq_floor_thr_db,
-            expander,
-            exp_start_hz,
-            exp_end_hz,
-            exp_threshold_db,
-            exp_ratio,
-            exp_attack_ms,
-            exp_release_ms,
-            hpss,
-            hpss_start_hz,
-            hpss_end_hz,
-            hpss_time_frames,
-            hpss_freq_bins,
-            hpss_harmonic_only,
-            hpss_protect_percussive,
-            magnitude_inpaint,
-            deq_inpaint,
-            total_att_cap_db,
-            nuclear_mode,
-            ms_process,
-            ms_side_scale,
-            phase_blur,
-            pb_start_hz,
-            pb_end_hz,
-            pb_harmonic_only,
-            swish_repair,
-            swish_start_hz,
-            swish_end_hz,
-            swish_time_amt,
-            swish_freq_amt,
-            hf_decorrelate,
-            hf_dec_start_hz,
-            hf_dec_end_hz,
-            hf_resynth,
-            hf_lp_hz,
-            hf_src_lo_hz,
-            hf_src_hi_hz,
-            hf_drive,
-            hf_hp_hz,
-            hf_mix,
-            hf_confidence_blend,
-            master_enabled,
-            hp_hz,
-            target_lufs,
-            target_rms_dbfs,
-            norm_max_gain_db,
-            norm_max_atten_db,
-            ceiling_dbtp,
-            lim_lookahead_ms,
-            lim_release_ms,
-            tp_os,
-            spec_n_fft,
-            spec_hop,
-            spec_max_frames,
-            spec_max_hz,
-        ]:
-            _bind_auto(c)
+        def _bind_param_auto(key: str, comp: Any) -> None:
+            updater = _make_state_updater(key)
+            handler = getattr(comp, "release", None)
+            if callable(handler):
+                handler(fn=updater, inputs=[comp, params_state], outputs=[params_state]).then(
+                    fn=run_once, inputs=render_inputs, outputs=result_outputs
+                )
+                return
+            comp.change(fn=updater, inputs=[comp, params_state], outputs=[params_state]).then(
+                fn=run_once, inputs=render_inputs, outputs=result_outputs
+            )
 
-        full_inputs = [
-            audio_in,
-            start_hz,
-            end_hz,
-            edge_hz,
-            n_fft,
-            hop,
-            flat_start,
-            flat_end,
-            freq_med_bins,
-            thr_db,
-            slope,
-            density_lo,
-            density_hi,
-            flux_thr_db,
-            flux_range_db,
-            noise_resynth,
-            mix,
-            delta_listen,
-            denoise,
-            dn_start_hz,
-            dn_end_hz,
-            dn_edge_hz,
-            dn_floor_db,
-            dn_psd_smooth_ms,
-            dn_minwin_ms,
-            dn_up_db_per_s,
-            dn_attack_ms,
-            dn_release_ms,
-            dn_freq_smooth_bins,
-            deres,
-            deq_start_hz,
-            deq_end_hz,
-            deq_edge_hz,
-            deq_freq_med_bins,
-            deq_thr_db,
-            deq_slope,
-            deq_max_att_db,
-            deq_density_lo,
-            deq_density_hi,
-            deq_persist_ms,
-            deq_persist_thr_db,
-            deq_freq_smooth_bins,
-            deq_tonal_boost_db,
-            deq_time_floor,
-            deq_floor_smooth_ms,
-            deq_floor_rise_db_per_s,
-            deq_floor_thr_db,
-            expander,
-            exp_start_hz,
-            exp_end_hz,
-            exp_threshold_db,
-            exp_ratio,
-            exp_attack_ms,
-            exp_release_ms,
-            hpss,
-            hpss_start_hz,
-            hpss_end_hz,
-            hpss_time_frames,
-            hpss_freq_bins,
-            hpss_harmonic_only,
-            hpss_protect_percussive,
-            magnitude_inpaint,
-            deq_inpaint,
-            total_att_cap_db,
-            nuclear_mode,
-            ms_process,
-            ms_side_scale,
-            phase_blur,
-            pb_start_hz,
-            pb_end_hz,
-            pb_harmonic_only,
-            swish_repair,
-            swish_start_hz,
-            swish_end_hz,
-            swish_time_amt,
-            swish_freq_amt,
-            hf_decorrelate,
-            hf_dec_start_hz,
-            hf_dec_end_hz,
-            hf_resynth,
-            hf_lp_hz,
-            hf_src_lo_hz,
-            hf_src_hi_hz,
-            hf_drive,
-            hf_hp_hz,
-            hf_mix,
-            hf_confidence_blend,
-            master_enabled,
-            hp_hz,
-            target_lufs,
-            target_rms_dbfs,
-            norm_max_gain_db,
-            norm_max_atten_db,
-            ceiling_dbtp,
-            lim_lookahead_ms,
-            lim_release_ms,
-            tp_os,
-            spec_n_fft,
-            spec_hop,
-            spec_max_frames,
-            spec_max_hz,
-        ]
-        full_btn.click(fn=render_full_to_files, inputs=full_inputs, outputs=[dl_out, dl_diff, dl_params])
+        for comp in (preview_t0, preview_dur, loop_xfade_ms, full_song_mode):
+            _bind_preview_auto(comp)
+        for key, comp in param_components.items():
+            _bind_param_auto(key, comp)
 
-        def save_preset_from_knobs(
-            name: str,
+        def save_preset_from_state(
+            preset_name_v: str,
             desc: str,
-            # values follow: must match keys we store
-            start_hz_v: object,
-            end_hz_v: object,
-            edge_hz_v: object,
-            n_fft_v: object,
-            hop_v: object,
-            flat_start_v: object,
-            flat_end_v: object,
-            freq_med_bins_v: object,
-            thr_db_v: object,
-            slope_v: object,
-            density_lo_v: object,
-            density_hi_v: object,
-            flux_thr_db_v: object,
-            flux_range_db_v: object,
-            noise_resynth_v: object,
-            mix_v: object,
-            delta_listen_v: object,
-            denoise_v: object,
-            dn_start_hz_v: object,
-            dn_end_hz_v: object,
-            dn_edge_hz_v: object,
-            dn_floor_db_v: object,
-            dn_psd_smooth_ms_v: object,
-            dn_minwin_ms_v: object,
-            dn_up_db_per_s_v: object,
-            dn_attack_ms_v: object,
-            dn_release_ms_v: object,
-            dn_freq_smooth_bins_v: object,
-            deres_v: object,
-            deq_start_hz_v: object,
-            deq_end_hz_v: object,
-            deq_edge_hz_v: object,
-            deq_freq_med_bins_v: object,
-            deq_thr_db_v: object,
-            deq_slope_v: object,
-            deq_max_att_db_v: object,
-            deq_density_lo_v: object,
-            deq_density_hi_v: object,
-            deq_persist_ms_v: object,
-            deq_persist_thr_db_v: object,
-            deq_freq_smooth_bins_v: object,
-            deq_tonal_boost_db_v: object,
-            deq_time_floor_v: object,
-            deq_floor_smooth_ms_v: object,
-            deq_floor_rise_db_per_s_v: object,
-            deq_floor_thr_db_v: object,
-            expander_v: object,
-            exp_start_hz_v: object,
-            exp_end_hz_v: object,
-            exp_threshold_db_v: object,
-            exp_ratio_v: object,
-            exp_attack_ms_v: object,
-            exp_release_ms_v: object,
-            hpss_v: object,
-            hpss_start_hz_v: object,
-            hpss_end_hz_v: object,
-            hpss_time_frames_v: object,
-            hpss_freq_bins_v: object,
-            hpss_harmonic_only_v: object,
-            hpss_protect_percussive_v: object,
-            magnitude_inpaint_v: object,
-            deq_inpaint_v: object,
-            total_att_cap_db_v: object,
-            nuclear_mode_v: object,
-            ms_process_v: object,
-            ms_side_scale_v: object,
-            phase_blur_v: object,
-            pb_start_hz_v: object,
-            pb_end_hz_v: object,
-            pb_harmonic_only_v: object,
-            swish_repair_v: object,
-            swish_start_hz_v: object,
-            swish_end_hz_v: object,
-            swish_time_amt_v: object,
-            swish_freq_amt_v: object,
-            hf_decorrelate_v: object,
-            hf_dec_start_hz_v: object,
-            hf_dec_end_hz_v: object,
-            hf_resynth_v: object,
-            hf_lp_hz_v: object,
-            hf_src_lo_hz_v: object,
-            hf_src_hi_hz_v: object,
-            hf_drive_v: object,
-            hf_hp_hz_v: object,
-            hf_mix_v: object,
-            hf_confidence_blend_v: object,
-            master_enabled_v: object,
-            hp_hz_v: object,
-            target_lufs_v: object,
-            target_rms_dbfs_v: object,
-            norm_max_gain_db_v: object,
-            norm_max_atten_db_v: object,
-            ceiling_dbtp_v: object,
-            lim_lookahead_ms_v: object,
-            lim_release_ms_v: object,
-            tp_os_v: object,
-        ):
+            state: Mapping[str, object] | None,
+        ) -> tuple[Any, str]:
             nonlocal all_presets
-            name = (name or "").strip()
-            if not name:
+            clean_name = (preset_name_v or "").strip()
+            if not clean_name:
                 return gr.update(), "Please enter a preset name."
-            desc = (desc or "").strip()
-            values = {
-                "start_hz": float(start_hz_v),
-                "end_hz": float(end_hz_v),
-                "edge_hz": float(edge_hz_v),
-                "n_fft": int(n_fft_v),
-                "hop": int(hop_v),
-                "flat_start": float(flat_start_v),
-                "flat_end": float(flat_end_v),
-                "freq_med_bins": int(freq_med_bins_v),
-                "thr_db": float(thr_db_v),
-                "slope": float(slope_v),
-                "density_lo": float(density_lo_v),
-                "density_hi": float(density_hi_v),
-                "flux_thr_db": float(flux_thr_db_v),
-                "flux_range_db": float(flux_range_db_v),
-                "noise_resynth": float(noise_resynth_v),
-                "mix": float(mix_v),
-                "delta_listen": bool(delta_listen_v),
-                "denoise": float(denoise_v),
-                "dn_start_hz": float(dn_start_hz_v),
-                "dn_end_hz": float(dn_end_hz_v),
-                "dn_edge_hz": float(dn_edge_hz_v),
-                "dn_floor_db": float(dn_floor_db_v),
-                "dn_psd_smooth_ms": float(dn_psd_smooth_ms_v),
-                "dn_minwin_ms": float(dn_minwin_ms_v),
-                "dn_up_db_per_s": float(dn_up_db_per_s_v),
-                "dn_attack_ms": float(dn_attack_ms_v),
-                "dn_release_ms": float(dn_release_ms_v),
-                "dn_freq_smooth_bins": int(dn_freq_smooth_bins_v),
-                "deres": float(deres_v),
-                "deq_start_hz": float(deq_start_hz_v),
-                "deq_end_hz": float(deq_end_hz_v),
-                "deq_edge_hz": float(deq_edge_hz_v),
-                "deq_freq_med_bins": int(deq_freq_med_bins_v),
-                "deq_thr_db": float(deq_thr_db_v),
-                "deq_slope": float(deq_slope_v),
-                "deq_max_att_db": float(deq_max_att_db_v),
-                "deq_density_lo": float(deq_density_lo_v),
-                "deq_density_hi": float(deq_density_hi_v),
-                "deq_persist_ms": float(deq_persist_ms_v),
-                "deq_persist_thr_db": float(deq_persist_thr_db_v),
-                "deq_freq_smooth_bins": int(deq_freq_smooth_bins_v),
-                "deq_tonal_boost_db": float(deq_tonal_boost_db_v),
-                "deq_time_floor": bool(deq_time_floor_v),
-                "deq_floor_smooth_ms": float(deq_floor_smooth_ms_v),
-                "deq_floor_rise_db_per_s": float(deq_floor_rise_db_per_s_v),
-                "deq_floor_thr_db": float(deq_floor_thr_db_v),
-                "expander": bool(expander_v),
-                "exp_start_hz": float(exp_start_hz_v),
-                "exp_end_hz": float(exp_end_hz_v),
-                "exp_threshold_db": float(exp_threshold_db_v),
-                "exp_ratio": float(exp_ratio_v),
-                "exp_attack_ms": float(exp_attack_ms_v),
-                "exp_release_ms": float(exp_release_ms_v),
-                "hpss": bool(hpss_v),
-                "hpss_start_hz": float(hpss_start_hz_v),
-                "hpss_end_hz": float(hpss_end_hz_v),
-                "hpss_time_frames": int(hpss_time_frames_v),
-                "hpss_freq_bins": int(hpss_freq_bins_v),
-                "hpss_harmonic_only": bool(hpss_harmonic_only_v),
-                "hpss_protect_percussive": float(hpss_protect_percussive_v),
-                "magnitude_inpaint": bool(magnitude_inpaint_v),
-                "deq_inpaint": bool(deq_inpaint_v),
-                "total_att_cap_db": float(total_att_cap_db_v),
-                "nuclear_mode": bool(nuclear_mode_v),
-                "ms_process": bool(ms_process_v),
-                "ms_side_scale": float(ms_side_scale_v),
-                "phase_blur": float(phase_blur_v),
-                "pb_start_hz": float(pb_start_hz_v),
-                "pb_end_hz": float(pb_end_hz_v),
-                "pb_harmonic_only": bool(pb_harmonic_only_v),
-                "swish_repair": float(swish_repair_v),
-                "swish_start_hz": float(swish_start_hz_v),
-                "swish_end_hz": float(swish_end_hz_v),
-                "swish_time_amt": float(swish_time_amt_v),
-                "swish_freq_amt": float(swish_freq_amt_v),
-                "hf_decorrelate": float(hf_decorrelate_v),
-                "hf_dec_start_hz": float(hf_dec_start_hz_v),
-                "hf_dec_end_hz": float(hf_dec_end_hz_v),
-                "hf_resynth": bool(hf_resynth_v),
-                "hf_lp_hz": float(hf_lp_hz_v),
-                "hf_src_lo_hz": float(hf_src_lo_hz_v),
-                "hf_src_hi_hz": float(hf_src_hi_hz_v),
-                "hf_drive": float(hf_drive_v),
-                "hf_hp_hz": float(hf_hp_hz_v),
-                "hf_mix": float(hf_mix_v),
-                "hf_confidence_blend": bool(hf_confidence_blend_v),
-                "master_enabled": bool(master_enabled_v),
-                "hp_hz": float(hp_hz_v),
-                "target_lufs": float(target_lufs_v),
-                "target_rms_dbfs": float(target_rms_dbfs_v),
-                "norm_max_gain_db": float(norm_max_gain_db_v),
-                "norm_max_atten_db": float(norm_max_atten_db_v),
-                "ceiling_dbtp": float(ceiling_dbtp_v),
-                "lim_lookahead_ms": float(lim_lookahead_ms_v),
-                "lim_release_ms": float(lim_release_ms_v),
-                "tp_os": int(tp_os_v),
-            }
-            _save_user_preset(USER_PRESETS_PATH, name, desc, values)
+            current_state = _merge_param_state(state, {})
+            values = {key: current_state[key] for key in PARAM_KNOB_NAMES}
+            _save_user_preset(USER_PRESETS_PATH, clean_name, (desc or "").strip(), values)
             all_presets = dict(base_presets)
             all_presets.update(_load_user_presets(USER_PRESETS_PATH))
-            return gr.update(choices=list(all_presets.keys()), value=name), f"Saved preset to `{USER_PRESETS_PATH}`."
+            return gr.update(choices=list(all_presets.keys()), value=clean_name), f"Saved preset to `{USER_PRESETS_PATH}`."
 
-        preset_save_inputs = [
-            preset_name,
-            preset_user_desc,
-            start_hz,
-            end_hz,
-            edge_hz,
-            n_fft,
-            hop,
-            flat_start,
-            flat_end,
-            freq_med_bins,
-            thr_db,
-            slope,
-            density_lo,
-            density_hi,
-            flux_thr_db,
-            flux_range_db,
-            noise_resynth,
-            mix,
-            delta_listen,
-            denoise,
-            dn_start_hz,
-            dn_end_hz,
-            dn_edge_hz,
-            dn_floor_db,
-            dn_psd_smooth_ms,
-            dn_minwin_ms,
-            dn_up_db_per_s,
-            dn_attack_ms,
-            dn_release_ms,
-            dn_freq_smooth_bins,
-            deres,
-            deq_start_hz,
-            deq_end_hz,
-            deq_edge_hz,
-            deq_freq_med_bins,
-            deq_thr_db,
-            deq_slope,
-            deq_max_att_db,
-            deq_density_lo,
-            deq_density_hi,
-            deq_persist_ms,
-            deq_persist_thr_db,
-            deq_freq_smooth_bins,
-            deq_tonal_boost_db,
-            deq_time_floor,
-            deq_floor_smooth_ms,
-            deq_floor_rise_db_per_s,
-            deq_floor_thr_db,
-            expander,
-            exp_start_hz,
-            exp_end_hz,
-            exp_threshold_db,
-            exp_ratio,
-            exp_attack_ms,
-            exp_release_ms,
-            hpss,
-            hpss_start_hz,
-            hpss_end_hz,
-            hpss_time_frames,
-            hpss_freq_bins,
-            hpss_harmonic_only,
-            hpss_protect_percussive,
-            magnitude_inpaint,
-            deq_inpaint,
-            total_att_cap_db,
-            nuclear_mode,
-            ms_process,
-            ms_side_scale,
-            phase_blur,
-            pb_start_hz,
-            pb_end_hz,
-            pb_harmonic_only,
-            swish_repair,
-            swish_start_hz,
-            swish_end_hz,
-            swish_time_amt,
-            swish_freq_amt,
-            hf_decorrelate,
-            hf_dec_start_hz,
-            hf_dec_end_hz,
-            hf_resynth,
-            hf_lp_hz,
-            hf_src_lo_hz,
-            hf_src_hi_hz,
-            hf_drive,
-            hf_hp_hz,
-            hf_mix,
-            hf_confidence_blend,
-            master_enabled,
-            hp_hz,
-            target_lufs,
-            target_rms_dbfs,
-            norm_max_gain_db,
-            norm_max_atten_db,
-            ceiling_dbtp,
-            lim_lookahead_ms,
-            lim_release_ms,
-            tp_os,
-        ]
-        preset_save.click(fn=save_preset_from_knobs, inputs=preset_save_inputs, outputs=[preset, preset_save_status]).then(
-            fn=_preset_desc_md,
-            inputs=[preset],
-            outputs=[preset_desc],
-        )
+        preset_save.click(
+            fn=save_preset_from_state,
+            inputs=[preset_name, preset_user_desc, params_state],
+            outputs=[preset, preset_save_status],
+        ).then(fn=_preset_desc_md, inputs=[preset], outputs=[preset_desc])
 
-        def export_realtime_params(
-            # current knob state (same as save)
-            start_hz_v: object,
-            end_hz_v: object,
-            edge_hz_v: object,
-            n_fft_v: object,
-            hop_v: object,
-            flat_start_v: object,
-            flat_end_v: object,
-            freq_med_bins_v: object,
-            thr_db_v: object,
-            slope_v: object,
-            density_lo_v: object,
-            density_hi_v: object,
-            flux_thr_db_v: object,
-            flux_range_db_v: object,
-            noise_resynth_v: object,
-            mix_v: object,
-            delta_listen_v: object,
-            denoise_v: object,
-            dn_start_hz_v: object,
-            dn_end_hz_v: object,
-            dn_edge_hz_v: object,
-            dn_floor_db_v: object,
-            dn_psd_smooth_ms_v: object,
-            dn_minwin_ms_v: object,
-            dn_up_db_per_s_v: object,
-            dn_attack_ms_v: object,
-            dn_release_ms_v: object,
-            dn_freq_smooth_bins_v: object,
-            deres_v: object,
-            deq_start_hz_v: object,
-            deq_end_hz_v: object,
-            deq_edge_hz_v: object,
-            deq_freq_med_bins_v: object,
-            deq_thr_db_v: object,
-            deq_slope_v: object,
-            deq_max_att_db_v: object,
-            deq_density_lo_v: object,
-            deq_density_hi_v: object,
-            deq_persist_ms_v: object,
-            deq_persist_thr_db_v: object,
-            deq_freq_smooth_bins_v: object,
-            deq_tonal_boost_db_v: object,
-            deq_time_floor_v: object,
-            deq_floor_smooth_ms_v: object,
-            deq_floor_rise_db_per_s_v: object,
-            deq_floor_thr_db_v: object,
-            expander_v: object,
-            exp_start_hz_v: object,
-            exp_end_hz_v: object,
-            exp_threshold_db_v: object,
-            exp_ratio_v: object,
-            exp_attack_ms_v: object,
-            exp_release_ms_v: object,
-            hpss_v: object,
-            hpss_start_hz_v: object,
-            hpss_end_hz_v: object,
-            hpss_time_frames_v: object,
-            hpss_freq_bins_v: object,
-            hpss_harmonic_only_v: object,
-            hpss_protect_percussive_v: object,
-            magnitude_inpaint_v: object,
-            deq_inpaint_v: object,
-            total_att_cap_db_v: object,
-            nuclear_mode_v: object,
-            ms_process_v: object,
-            ms_side_scale_v: object,
-            phase_blur_v: object,
-            pb_start_hz_v: object,
-            pb_end_hz_v: object,
-            pb_harmonic_only_v: object,
-            swish_repair_v: object,
-            swish_start_hz_v: object,
-            swish_end_hz_v: object,
-            swish_time_amt_v: object,
-            swish_freq_amt_v: object,
-            hf_decorrelate_v: object,
-            hf_dec_start_hz_v: object,
-            hf_dec_end_hz_v: object,
-            hf_resynth_v: object,
-            hf_lp_hz_v: object,
-            hf_src_lo_hz_v: object,
-            hf_src_hi_hz_v: object,
-            hf_drive_v: object,
-            hf_hp_hz_v: object,
-            hf_mix_v: object,
-            hf_confidence_blend_v: object,
-            master_enabled_v: object,
-            hp_hz_v: object,
-            target_lufs_v: object,
-            target_rms_dbfs_v: object,
-            norm_max_gain_db_v: object,
-            norm_max_atten_db_v: object,
-            ceiling_dbtp_v: object,
-            lim_lookahead_ms_v: object,
-            lim_release_ms_v: object,
-            tp_os_v: object,
-        ) -> str:
+        def export_realtime_params(state: Mapping[str, object] | None) -> str:
             import json
 
-            # Build a real Params + MasterParams using the existing builder, then dump asdict() (full key set).
-            p, mp, _ = _build_params(
-                start_hz=float(start_hz_v),
-                end_hz=float(end_hz_v),
-                edge_hz=float(edge_hz_v),
-                n_fft=int(n_fft_v),
-                hop=int(hop_v),
-                flat_start=float(flat_start_v),
-                flat_end=float(flat_end_v),
-                freq_med_bins=int(freq_med_bins_v),
-                thr_db=float(thr_db_v),
-                slope=float(slope_v),
-                density_lo=float(density_lo_v),
-                density_hi=float(density_hi_v),
-                flux_thr_db=float(flux_thr_db_v),
-                flux_range_db=float(flux_range_db_v),
-                noise_resynth=float(noise_resynth_v),
-                mix=float(mix_v),
-                delta_listen=bool(delta_listen_v),
-                denoise=float(denoise_v),
-                dn_start_hz=float(dn_start_hz_v),
-                dn_end_hz=float(dn_end_hz_v),
-                dn_edge_hz=float(dn_edge_hz_v),
-                dn_floor_db=float(dn_floor_db_v),
-                dn_psd_smooth_ms=float(dn_psd_smooth_ms_v),
-                dn_minwin_ms=float(dn_minwin_ms_v),
-                dn_up_db_per_s=float(dn_up_db_per_s_v),
-                dn_attack_ms=float(dn_attack_ms_v),
-                dn_release_ms=float(dn_release_ms_v),
-                dn_freq_smooth_bins=int(dn_freq_smooth_bins_v),
-                deres=float(deres_v),
-                deq_start_hz=float(deq_start_hz_v),
-                deq_end_hz=float(deq_end_hz_v),
-                deq_edge_hz=float(deq_edge_hz_v),
-                deq_freq_med_bins=int(deq_freq_med_bins_v),
-                deq_thr_db=float(deq_thr_db_v),
-                deq_slope=float(deq_slope_v),
-                deq_max_att_db=float(deq_max_att_db_v),
-                deq_density_lo=float(deq_density_lo_v),
-                deq_density_hi=float(deq_density_hi_v),
-                deq_persist_ms=float(deq_persist_ms_v),
-                deq_persist_thr_db=float(deq_persist_thr_db_v),
-                deq_freq_smooth_bins=int(deq_freq_smooth_bins_v),
-                deq_tonal_boost_db=float(deq_tonal_boost_db_v),
-                deq_time_floor=bool(deq_time_floor_v),
-                deq_floor_smooth_ms=float(deq_floor_smooth_ms_v),
-                deq_floor_rise_db_per_s=float(deq_floor_rise_db_per_s_v),
-                deq_floor_thr_db=float(deq_floor_thr_db_v),
-                expander=bool(expander_v),
-                exp_start_hz=float(exp_start_hz_v),
-                exp_end_hz=float(exp_end_hz_v),
-                exp_threshold_db=float(exp_threshold_db_v),
-                exp_ratio=float(exp_ratio_v),
-                exp_attack_ms=float(exp_attack_ms_v),
-                exp_release_ms=float(exp_release_ms_v),
-                hpss=bool(hpss_v),
-                hpss_start_hz=float(hpss_start_hz_v),
-                hpss_end_hz=float(hpss_end_hz_v),
-                hpss_time_frames=int(hpss_time_frames_v),
-                hpss_freq_bins=int(hpss_freq_bins_v),
-                hpss_harmonic_only=bool(hpss_harmonic_only_v),
-                hpss_protect_percussive=float(hpss_protect_percussive_v),
-                magnitude_inpaint=bool(magnitude_inpaint_v),
-                deq_inpaint=bool(deq_inpaint_v),
-                total_att_cap_db=float(total_att_cap_db_v),
-                nuclear_mode=bool(nuclear_mode_v),
-                ms_process=bool(ms_process_v),
-                ms_side_scale=float(ms_side_scale_v),
-                phase_blur=float(phase_blur_v),
-                pb_start_hz=float(pb_start_hz_v),
-                pb_end_hz=float(pb_end_hz_v),
-                pb_harmonic_only=bool(pb_harmonic_only_v),
-                swish_repair=float(swish_repair_v),
-                swish_start_hz=float(swish_start_hz_v),
-                swish_end_hz=float(swish_end_hz_v),
-                swish_time_amt=float(swish_time_amt_v),
-                swish_freq_amt=float(swish_freq_amt_v),
-                hf_decorrelate=float(hf_decorrelate_v),
-                hf_dec_start_hz=float(hf_dec_start_hz_v),
-                hf_dec_end_hz=float(hf_dec_end_hz_v),
-                hf_resynth=bool(hf_resynth_v),
-                hf_lp_hz=float(hf_lp_hz_v),
-                hf_src_lo_hz=float(hf_src_lo_hz_v),
-                hf_src_hi_hz=float(hf_src_hi_hz_v),
-                hf_drive=float(hf_drive_v),
-                hf_hp_hz=float(hf_hp_hz_v),
-                hf_mix=float(hf_mix_v),
-                hf_confidence_blend=bool(hf_confidence_blend_v),
-                master_enabled=bool(master_enabled_v),
-                hp_hz=float(hp_hz_v),
-                target_lufs=float(target_lufs_v),
-                target_rms_dbfs=float(target_rms_dbfs_v),
-                norm_max_gain_db=float(norm_max_gain_db_v),
-                norm_max_atten_db=float(norm_max_atten_db_v),
-                ceiling_dbtp=float(ceiling_dbtp_v),
-                lim_lookahead_ms=float(lim_lookahead_ms_v),
-                lim_release_ms=float(lim_release_ms_v),
-                tp_os=int(tp_os_v),
-                spec_n_fft=2048,
-                spec_hop=512,
-                spec_max_frames=1200,
-                spec_max_hz=20000.0,
-            )
-            # Realtime-ish player: prefer causal filters (avoid zero-phase filtfilt in chunked playback).
-            try:
-                p.hf_zero_phase = False
-            except Exception:
-                pass
+            p, mp, _ = _build_params(state)
+            p.hf_zero_phase = False
             path = os.path.join(os.path.dirname(__file__), "realtime_params.json")
             with open(path, "w", encoding="utf-8") as f:
                 json.dump({"params": asdict(p), "master_params": asdict(mp)}, f, indent=2, sort_keys=True)
-            return (
-                f"Wrote `{path}`. Start `python realtime_player.py YOURFILE.wav --params {os.path.basename(path)}`"
-            )
+            return f"Wrote `{path}`. Start `python realtime_player.py YOURFILE.wav --params {os.path.basename(path)}`"
 
-        rt_export_inputs = preset_save_inputs[2:]  # same knob list, without name/desc
-        rt_export.click(fn=export_realtime_params, inputs=rt_export_inputs, outputs=[rt_export_status])
+        rt_export.click(fn=export_realtime_params, inputs=[params_state], outputs=[rt_export_status])
 
         gr.Markdown(
             "### Tip\n"
@@ -3160,5 +1561,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-
