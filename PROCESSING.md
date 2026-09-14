@@ -1,5 +1,13 @@
 # Repair, residuals, and optimizer verification
 
+The normal **Set from audio → Optimize → Render full & generate downloads**
+workflow includes [tonal self-consistency repair](TONAL_REPAIR.md) by default.
+Analysis activates its initial amount; optimization evaluates its coherence
+objective in every stage and searches its amount in a final tonal stage. No
+additional checkbox, preset, or alternate renderer is required.
+New repair stages must follow this workflow contract: participate in the normal
+defaults, analysis, optimization, preview, and export without another enabling step.
+
 `master.process_stft` blends the original input with the complete wet repair,
 including optional HF resynthesis. `mix=0` returns the original samples and a
 zero repair residual without running the DSP. Delivery mastering is separate:
@@ -30,8 +38,8 @@ arrays are omitted from `info` by default. `Params(enhance=False)` or the
 `master.py --repair-only` option disables those three engineering stages in the
 main output itself; delivery mastering remains independently configurable.
 
-Refinement uses five weighted objectives: artifact reduction, music damage,
-diff leakage, stereo damage, and loudness/tilt damage. Every `Weights` term
+Refinement uses six weighted objectives: artifact reduction, music damage,
+diff leakage, stereo damage, loudness/tilt damage, and tonal coherence. Every `Weights` term
 contributes exactly once. Their sum is the same utility used for Pareto selection,
 stage summaries, and final evaluation. Aggressiveness changes these weights and
 retains preservation penalties at its upper endpoint. Musical-noise damage
@@ -48,7 +56,7 @@ Run regression tests with the existing Python environment (standard-library
 `unittest`; no additional test dependency):
 
 ```sh
-.venv/bin/python -m unittest test_master test_auto_tune test_deshimmer_api test_ui_gradio
+.venv/bin/python -m unittest test_master test_auto_tune test_deshimmer_api test_ui_gradio test_tonal_tracking test_harmonic_field test_tonal_repair
 .venv/bin/python test_dynamic_spectral_carver.py
 ```
 
@@ -56,6 +64,7 @@ Time the real pipeline using a stereo WAV:
 
 ```sh
 .venv/bin/python benchmark_pipeline.py YOUR_AUDIO.wav --seconds 3 --repeat 3 --compare-correlation
+.venv/bin/python benchmark_tonal_repair.py --seconds 2 --repeat 3
 ```
 
 The benchmark warms each operation, reports median wall time and processing time

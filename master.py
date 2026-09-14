@@ -34,6 +34,8 @@ import soundfile as sf
 from scipy.ndimage import median_filter, minimum_filter1d, uniform_filter1d, maximum_filter1d
 from scipy.signal import butter, sosfiltfilt, sosfilt, resample_poly, lfilter, lfilter_zi, stft, istft, correlate
 
+from tonal_repair import TonalRepair
+
 
 # -----------------------------
 # Utility conversions & helpers
@@ -301,6 +303,10 @@ class Params:
 
     # Optional engineering stages, separate from artifact repair for residual audits.
     enhance: bool = True
+
+    # Self-referenced harmonic repair is active in the normal processing path.
+    tonal_repair: float = 0.5
+    tonal_max_shift_cents: float = 25.0
 
     # Padding & fade
     pad: bool = True
@@ -1099,7 +1105,8 @@ def _artifact_confidence_map(
 # -----------------------------
 # Core STFT repair
 # -----------------------------
-def process_stft(x: np.ndarray, sr: int, p: Params, dbg: Optional[DebugCollector] = None) -> np.ndarray:
+def process_stft(x: np.ndarray, sr: int, p: Params, dbg: Optional[DebugCollector] = None,
+                 diagnostics: Optional[Dict[str, Any]] = None) -> np.ndarray:
     """Repair the wet signal; mix and delta always reference the original samples."""
     global _LAST_ARTIFACT_CONF_FRAMES
     _LAST_ARTIFACT_CONF_FRAMES = None
@@ -1110,6 +1117,9 @@ def process_stft(x: np.ndarray, sr: int, p: Params, dbg: Optional[DebugCollector
     dry = x
 
     if p.mix == 0.0:
+        if diagnostics is not None:
+            diagnostics["tonal"] = {"enabled": True, "status": "bypassed", "changed_partials": 0}
+
         return (np.zeros_like(dry) if p.delta_listen else dry.copy()).squeeze()
     
     # --- High-Fidelity Step 1: Align Left/Right micro-delays (Time Domain) ---
@@ -1610,6 +1620,13 @@ def process_stft(x: np.ndarray, sr: int, p: Params, dbg: Optional[DebugCollector
         
     # HF resynthesis is part of the wet repair, before mix and delta listening.
     y_rec = _as_2d(hf_resynth_post(y_rec, sr, p, artifact_conf=artifact_conf_frames))
+    y_rec, tonal_info = TonalRepair().process(
+        y_rec, sr, amount=p.tonal_repair, max_shift_cents=p.tonal_max_shift_cents,
+    )
+
+    if diagnostics is not None:
+        diagnostics["tonal"] = tonal_info
+
     mix_p = float(p.mix)
     y_final = mix_p * y_rec + (1.0 - mix_p) * dry
     
@@ -1955,6 +1972,9 @@ def main() -> int:
     ap.add_argument("--mix", type=float, default=1.0)
     ap.add_argument("--repair-only", action="store_true",
                     help="Disable L/R alignment, spectral balancing, and spectral carving")
+    ap.add_argument("--tonal-repair", type=float, default=Params().tonal_repair,
+                    help="Self-referenced partial correction amount (default on)")
+    ap.add_argument("--tonal-max-shift-cents", type=float, default=Params().tonal_max_shift_cents)
 
     ap.add_argument("--no-pad", action="store_true")
     ap.add_argument("--fade-ms", type=float, default=5.0)
@@ -2087,6 +2107,8 @@ def main() -> int:
         noise_resynth=float(args.noise_resynth),
         mix=float(args.mix),
         enhance=not args.repair_only,
+        tonal_repair=float(args.tonal_repair),
+        tonal_max_shift_cents=float(args.tonal_max_shift_cents),
 
         pad=(not args.no_pad),
         fade_ms=float(args.fade_ms),
@@ -2228,7 +2250,7 @@ def main() -> int:
         )
 
     # ---- Core processing ----
-    y_repaired = process_stft(x, sr, replace(p, delta_listen=False), dbg=dbg_collector)
+    y_repaired = process_stft(x, sr, replace(p, delta_listen=False), dbg=dbg_collector, diagnostics=summary)
     y_rep_2d = _as_2d(y_repaired)
 
     meas_rep = {

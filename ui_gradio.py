@@ -176,6 +176,17 @@ def _render_metrics_md(info: dict[str, object]) -> str:
         "- Default diff = input - final output, including engineering and mastering; repair-only diff uses a separate render.",
         "- Preview region is processed with temporal context padding (matches full-track stateful DSP more closely)",
     ]
+    tonal = info.get("tonal", {})
+    before = tonal.get("before", {})
+    after = tonal.get("after", {})
+    lines.extend([
+        "", "### Tonal self-consistency",
+        f"- Status: {before.get('status', tonal.get('status', 'unavailable'))}; corrected partials: {tonal.get('changed_partials', 0)}",
+        f"- Supported families: {before.get('families', 0)} → {after.get('families', 0)}",
+        f"- Ambiguous partials excluded from correction: {before.get('ambiguous_partials', 0)}",
+        f"- 95th-percentile internal disagreement: {fmt(before.get('p95_disagreement_cents'))} → {fmt(after.get('p95_disagreement_cents'))} cents",
+        "- Measurements describe the tonal repair stage before wet/dry blending and delivery mastering.",
+    ])
     return "\n".join(lines)
 
 
@@ -184,6 +195,7 @@ PARAM_KNOB_NAMES: tuple[str, ...] = (
     "flat_start", "flat_end", "freq_med_bins", "thr_db", "slope",
     "density_lo", "density_hi", "flux_thr_db", "flux_range_db",
     "noise_resynth", "mix", "delta_listen",
+    "tonal_repair", "tonal_max_shift_cents",
     "denoise", "dn_start_hz", "dn_end_hz", "dn_edge_hz", "dn_floor_db",
     "dn_psd_smooth_ms", "dn_minwin_ms", "dn_up_db_per_s", "dn_attack_ms",
     "dn_release_ms", "dn_freq_smooth_bins",
@@ -753,9 +765,21 @@ def build_ui() -> Any:
                     info="How many short windows to sample (auto-picks quiet/loud/transient).",
                 )
             with gr.Row():
-                analyze_btn = gr.Button("🔍 Analyze (set defaults from audio)", variant="secondary")
-                refine_btn = gr.Button("⚙️ Refine (multi-objective optimise)", variant="primary")
+                analyze_btn = gr.Button("🔍 Set from audio", variant="secondary")
+                refine_btn = gr.Button("⚙️ Optimize", variant="primary")
             auto_report = gr.Markdown()
+
+        with gr.Accordion("Tonal self-consistency (active by default)", open=False):
+            gr.Markdown("Learns stable partial relationships from this audio. Shared bends and tuning offsets are retained; ambiguous families are left alone.")
+            tonal_repair = gr.Slider(
+                0.0, 1.0, value=master.Params().tonal_repair, step=0.01,
+                label="Tonal repair amount", info="Optimize searches this amount automatically.",
+            )
+            tonal_max_shift_cents = gr.Number(
+                value=master.Params().tonal_max_shift_cents, minimum=0.01,
+                label="Maximum partial correction (cents)",
+                info="Bound on an individual partial's correction before applying the amount.",
+            )
 
         with gr.Accordion("🎯 Shimmer Removal (main tool for AI sparkle/shimmer)", open=True):
             gr.Markdown("*Targets the annoying 'sparkly' or 'shimmery' artifacts common in AI-generated music. Start here!*")
@@ -1432,7 +1456,7 @@ def build_ui() -> Any:
                         if vals:
                             stages_md_lines.append(
                                 f"  - **{mode}**: artifact={vals[0]:+.2f}, "
-                                f"music={-vals[1]:+.2f}, stereo={-vals[3]:+.2f}"
+                                f"music={-vals[1]:+.2f}, stereo={-vals[3]:+.2f}, tonal={vals[5]:+.2f}"
                             )
                 bp = s.get("selected_params", s.get("best_params", {}))
                 if bp:
@@ -1442,7 +1466,7 @@ def build_ui() -> Any:
             if failure_log:
                 stages_md_lines.append(f"- Failed-trial diagnostics: `{failure_log}`")
             stages_md_lines.append("")
-            stages_md_lines.append("_(Aggressiveness weights the five NSGA-II objectives; selection and final score use their total utility. Current settings are retained if proposals score worse.)_")
+            stages_md_lines.append("_(Aggressiveness weights six NSGA-II objectives, including tonal coherence. Selection and final score use their total utility. Current settings are retained if proposals score worse.)_")
 
             new_state = _merge_param_state(current_state, _state_from_dataclasses(new_p, base_mp))
             return tuple([new_state] + _state_to_component_values(new_state) + ["\n".join(stages_md_lines)])

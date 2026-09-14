@@ -28,6 +28,7 @@ class TestWeights(unittest.TestCase):
             "stereo_width": ("stereo_width_delta", 3, -1),
             "loudness_loss": ("loudness_loss_db", 4, -1),
             "spectral_tilt": ("spectral_tilt_delta", 4, -1),
+            "tonal_coherence": ("tonal_coherence_gain", 5, 1),
         }
 
         for weight, (metric, group, sign) in contributions.items():
@@ -35,7 +36,7 @@ class TestWeights(unittest.TestCase):
                 metrics = {entry[0]: 0.0 for entry in contributions.values()}
                 metrics[metric] = 3.0
                 weights = replace(auto_tune.flat_weights(), **{weight: 2.0})
-                expected = np.zeros(5)
+                expected = np.zeros(6)
                 expected[group] = sign * 6.0
                 np.testing.assert_array_equal(weights.objectives(metrics), expected)
 
@@ -176,7 +177,8 @@ class TestAutoTune(unittest.TestCase):
             )
 
         self.assertEqual(selected.mix, 1.0)
-        self.assertEqual(len(summary["stages"]), 4)
+        self.assertEqual(len(summary["stages"]), 5)
+        self.assertEqual(summary["stages"][-1]["stage"], "tonal")
 
         for stage in summary["stages"]:
             with self.subTest(stage=stage["stage"]):

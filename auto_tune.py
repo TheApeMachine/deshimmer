@@ -35,7 +35,14 @@ from scipy.signal import stft as _scipy_stft
 
 import master as _m
 from master import align_lr_delay, balance_lr_spectrum, dynamic_spectral_carver
+from tonal_repair import TonalRepair
 from deshimmer_api import process_audio, preview_context_seconds, slice_with_context
+
+
+OBJECTIVE_NAMES = (
+    "artifact_reduction", "music_preservation", "diff_preservation",
+    "stereo_preservation", "loudness_tilt_preservation", "tonal_coherence",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -56,6 +63,7 @@ class AnalysisReport:
     detected_whines: list[float] = field(default_factory=list)
     measured_noise_floor_db: float = -60.0
     notes: list[str] = field(default_factory=list)
+    tonal_regions: list[dict] = field(default_factory=list)
 
     def to_markdown(self) -> str:
         lines = ["**Auto analysis report**", ""]
@@ -69,6 +77,12 @@ class AnalysisReport:
             lines.append("- Identified stationary whines: none detected")
         for n in self.notes:
             lines.append(f"- {n}")
+
+        for region in self.tonal_regions:
+            disagreement = region["p95_disagreement_cents"]
+            measured = f"{disagreement:.2f} cents p95 disagreement" if disagreement is not None else "insufficient family evidence"
+            lines.append(f"- Tonal region **{region['label']}**: {region['families']} families, {measured}.")
+
         return "\n".join(lines)
 
 
@@ -392,7 +406,8 @@ def analyze(
         flatnesses.extend(flat.tolist())
 
     if not mags or freqs_ref is None:
-        p = base_params if base_params is not None else _m.Params()
+        p = replace(base_params if base_params is not None else _m.Params(),
+                    tonal_repair=_m.Params().tonal_repair)
         mp = _m.MasterParams(enabled=False)
         rep = AnalysisReport(
             detected_band=(p.start_hz, p.end_hz),
@@ -423,7 +438,7 @@ def analyze(
     flat_p75 = float(np.percentile(flat_arr, 75.0))
 
     p = base_params if base_params is not None else _m.Params()
-    p = replace(p)
+    p = replace(p, tonal_repair=_m.Params().tonal_repair)
 
     p.start_hz = float(band_lo)
     p.end_hz = float(band_hi)
@@ -459,7 +474,11 @@ def analyze(
 
     mp = _m.MasterParams(enabled=False)
 
-    notes: list[str] = []
+    tonal_regions = [
+        {"label": region.label, **TonalRepair().analyze(_slice(np.asarray(x), sr, region.t0, region.dur), sr).metrics()}
+        for region in regions
+    ]
+    notes: list[str] = ["Self-referenced tonal repair is active; Optimize includes its coherence objective and stage."]
     if flat_p75 < 0.12:
         notes.append("Highly tonal material: configured Swish Phase Repair and high-frequency stereo decorrelation.")
 
@@ -469,6 +488,7 @@ def analyze(
         detected_whines=res_freqs,
         measured_noise_floor_db=floor_db,
         notes=notes,
+        tonal_regions=tonal_regions,
     )
     return p, mp, rep
 
@@ -490,9 +510,10 @@ class Weights:
     centroid_shift: float
     diff_onset_corr: float
     stereo_width: float
+    tonal_coherence: float = 1.0
 
-    def objectives(self, metrics: dict[str, float]) -> tuple[float, float, float, float, float]:
-        """Partition weighted utility into five objectives, counting each term once."""
+    def objectives(self, metrics: dict[str, float]) -> tuple[float, ...]:
+        """Partition weighted utility into six objectives, counting each term once."""
         return (
             self.band_reduction * metrics["band_reduction_db"]
             + self.swish_reduction * metrics["swish_reduction"],
@@ -506,6 +527,7 @@ class Weights:
             -self.stereo_width * metrics["stereo_width_delta"],
             -(self.loudness_loss * metrics["loudness_loss_db"]
               + self.spectral_tilt * metrics["spectral_tilt_delta"]),
+            self.tonal_coherence * metrics["tonal_coherence_gain"],
         )
 
 
@@ -548,6 +570,7 @@ def weights_from_aggressiveness(agg: float) -> Weights:
         centroid_shift=0.7 + 0.5 * (1.0 - a),
         diff_onset_corr=1.5 + 0.9 * (1.0 - a),
         stereo_width=1.6 + 0.8 * (1.0 - a),  # strict soundstage preservation
+        tonal_coherence=1.0 + 1.2 * a,  # same utility curve as magnitude artifact reduction
     )
 
 
@@ -723,7 +746,14 @@ def score_processed(
     w_out = _stereo_width_ratio(y_out)
     stereo_width_delta = float(abs(w_out - w_in)) * 50.0
 
+    tonal = TonalRepair()
+    input_field = tonal.analyze(x_in, sr)
+    output_field = tonal.analyze(y_out, sr)
+
     metrics = {
+        # Fractional, energy-weighted coherence improvement expressed in percent.
+        "tonal_coherence_gain": 100.0 * input_field.compare(output_field),
+        "tonal_families_in": float(len(input_field.families)),
         "band_reduction_db": band_reduction,
         "swish_reduction": swish_reduction,
         "phase_instability_in": inst_in,
@@ -760,7 +790,7 @@ def score_objectives(
     band: tuple[float, float],
     weights: Weights,
     swish_band: tuple[float, float],
-) -> tuple[float, float, float, float, float]:
+) -> tuple[float, ...]:
     metrics = score_processed(
         x_in, y_out, sr, band=band, swish_band=swish_band, weights=weights,
     )
@@ -845,12 +875,12 @@ def _evaluate_params_multi(
     failure_log: EvaluationFailureLog | None = None,
     stage: str = "refine",
     trial_number: int | None = None,
-) -> tuple[float, float, float, float, float]:
+) -> tuple[float, ...]:
     mp = _m.MasterParams(enabled=False)
     dp = _m.DebugParams(enabled=False)
     p_use = replace(p, delta_listen=False)
     context_s = preview_context_seconds(p_use)
-    objs_acc = np.zeros(5, dtype=np.float64)
+    objs_acc = np.zeros(len(OBJECTIVE_NAMES), dtype=np.float64)
     count = 0
     for r in regions:
         inset = max(0.0, (r.dur - refine_dur) * 0.5)
@@ -911,7 +941,7 @@ def _evaluate_params_multi(
     if failure_log is not None:
         failure_log.success(stage)
     mean = objs_acc / float(count)
-    return (float(mean[0]), float(mean[1]), float(mean[2]), float(mean[3]), float(mean[4]))
+    return tuple(float(value) for value in mean)
 
 
 def _evaluate_params_single(
@@ -939,6 +969,9 @@ def _make_stage(name: str, p: _m.Params, trial: Any) -> _m.Params:
     - Advanced denoise windowing.
     - Persistent deresonation thresholds.
     """
+    if name == "tonal":
+        return replace(p, tonal_repair=float(trial.suggest_float("tonal_repair", 0.0, 1.0)))
+
     if name == "shimmer":
         return replace(
             p,
@@ -992,10 +1025,10 @@ def _pick_pareto_trial(study: Any, mode: str = "balanced") -> Any:
         raise ValueError("Pareto selection requires finite objectives")
 
     if mode == "safe":
-        return max(front_trials, key=lambda trial: sum(trial.values[1:]))
+        return max(front_trials, key=lambda trial: sum(trial.values[1:5]))
 
     if mode == "aggressive":
-        return max(front_trials, key=lambda trial: trial.values[0])
+        return max(front_trials, key=lambda trial: trial.values[0] + sum(trial.values[5:]))
 
     if mode != "balanced":
         raise ValueError(f"unknown Pareto selection mode: {mode}")
@@ -1049,6 +1082,7 @@ def refine(
         "regions": [{"t0": r.t0, "dur": r.dur, "label": r.label} for r in regions],
         "objective_weights": objective_weights.__dict__,
         "selection_weights": selection_weights.__dict__,
+        "objective_names": list(OBJECTIVE_NAMES),
         "failure_log": failure_log.path,
         "stages": [],
     }
@@ -1065,6 +1099,8 @@ def refine(
     ):
         stages.append("swish")
 
+    stages.append("tonal")
+
     total_trials = max(1, n_trials_per_stage * len(stages))
     done = 0
 
@@ -1077,7 +1113,7 @@ def refine(
     for stage in stages:
         sampler = NSGAIISampler(seed=42)
         study = optuna.create_study(
-            directions=["maximize", "maximize", "maximize", "maximize", "maximize"],
+            directions=["maximize"] * len(OBJECTIVE_NAMES),
             sampler=sampler,
         )
 
@@ -1087,7 +1123,7 @@ def refine(
         )
         study.add_trial(optuna.trial.create_trial(values=baseline))
 
-        def _objective(trial: Any, _stage: str = stage, _p: _m.Params = p_cur) -> tuple[float, float, float, float, float]:
+        def _objective(trial: Any, _stage: str = stage, _p: _m.Params = p_cur) -> tuple[float, ...]:
             p_try = _make_stage(_stage, _p, trial)
             return _evaluate_params_multi(
                 xm,

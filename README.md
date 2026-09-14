@@ -147,14 +147,20 @@ A highly efficient, deterministic pass that scans the entire audio file to extra
 ### Layer 2: Staged Multi-Objective Bayesian Optimizer (`refine`)
 A state-of-the-art hyperparameter search using **Optuna's NSGA-II (Non-dominated Sorting Genetic Algorithm II)** sampler. 
 Optimization is done sequentially across stages to isolate variables:
-$$\text{Stage A (Shimmer)} \rightarrow \text{Stage B (Denoise)} \rightarrow \text{Stage C (Deres)} \rightarrow \text{Stage D (Swish)}$$
+$$\text{Shimmer} \rightarrow \text{Denoise} \rightarrow \text{Deres} \rightarrow \text{Swish} \rightarrow \text{Tonal}$$
 
-At each stage, it optimizes **5 competing objectives** concurrently:
+At each stage, it optimizes **6 competing objectives** concurrently:
 1. **Artifact Reduction** (Maximize attenuation of outliers)
 2. **Musical Content Damage** (Minimize changes to out-of-band energy)
 3. **Difference Signal Leakage** (Minimize transient/harmonic leakage into the removed "diff" signal)
 4. **Stereo Image Damage** (Minimize deviation in stereo width delta)
 5. **Spectral Tilt & Loudness Loss** (Minimize overall volume and tonal balance shifts)
+6. **Tonal Coherence** (Improve agreement with the input's learned partial trajectories while penalizing lost partial energy)
+
+[Tonal self-consistency repair](TONAL_REPAIR.md) is active in the normal
+**Set from audio → Optimize → render/download output and diff WAVs** workflow.
+It preserves coherent tuning offsets and shared vibrato; it does not impose a
+note grid. The default diff remains input minus final output.
 
 #### Optimization Profiles:
 - **Safe / Conservative**: Prioritizes preserving the original musical content and avoiding leakage above all else.
@@ -298,4 +304,3 @@ If you discover highly successful parameter recipes for specific styles of AI au
 *Deshimmer is highly effective at reducing high-frequency artifacts, but it is not a magic wand. Highly corrupted low-resolution AI tracks might require a blend of deshimmering, noise-reduction, and master compression to achieve standard audio profiles. Always listen critically.*
 
 *Made with passion, mathematical frustration at AI artifacts, and Python.*
-

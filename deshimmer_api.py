@@ -146,7 +146,7 @@ def process_audio(
         )
 
     # ---- STFT repair ----
-    y_repaired = _m.process_stft(x2, sr, replace(p, delta_listen=False), dbg=dbg_collector)
+    y_repaired = _m.process_stft(x2, sr, replace(p, delta_listen=False), dbg=dbg_collector, diagnostics=info)
     y_rep_2d = _m._as_2d(y_repaired)
     info["measure_after_repair"] = {
         "sample_peak_dbfs": float(_m._lin_to_db(np.max(np.abs(y_rep_2d)) + 1e-12)),
@@ -186,4 +186,3 @@ def process_audio(
         # Note: rendering PNGs is intentionally left to callers (UI can choose).
     result = x2 - y_out_2d if p.delta_listen else y_out_2d
     return result.squeeze(), info
-
