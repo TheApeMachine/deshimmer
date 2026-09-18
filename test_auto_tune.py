@@ -186,3 +186,74 @@ class TestAutoTune(unittest.TestCase):
                 self.assertAlmostEqual(stage["selected_score"], sum(stage["pareto"]["balanced"]["values"]))
 
         self.assertAlmostEqual(summary["final_score"], summary["stages"][-1]["selected_score"])
+
+    def test_build_synthetic_transition(self):
+        """Test extraction and stitching of contrasting loud and quiet regions into a 2s seam."""
+        sr = 44100
+        # Create audio with a quiet start and a loud end
+        audio = np.zeros(sr * 4, dtype=np.float32)
+        audio[:sr * 2] = np.random.default_rng(1).normal(0, 0.01, sr * 2).astype(np.float32)  # quiet
+        audio[sr * 2:] = np.random.default_rng(2).normal(0, 0.20, sr * 2).astype(np.float32)  # loud
+
+        regions = [
+            auto_tune.Region(0.0, 1.5, "quiet"),
+            auto_tune.Region(2.0, 1.5, "loud"),
+        ]
+
+        trans = auto_tune.build_synthetic_transition(audio, sr, regions, transition_dur=0.5)
+        self.assertIsNotNone(trans)
+        synth, seam_idx = trans
+        self.assertEqual(seam_idx, int(0.5 * sr))
+        self.assertEqual(synth.shape[0], int(1.0 * sr))
+
+        # First half should have higher energy (loud tail), second half lower energy (quiet head)
+        rms_pre = np.sqrt(np.mean(synth[:seam_idx] ** 2))
+        rms_post = np.sqrt(np.mean(synth[seam_idx:] ** 2))
+        self.assertGreater(rms_pre, rms_post * 5.0)
+
+    def test_score_transition_boundary(self):
+        """Test boundary scoring for clean pass-through vs artificial pumping/gating."""
+        sr = 44100
+        n_samples = sr * 2
+        seam_idx = sr
+
+        # Create synthetic transition audio: loud -> quiet
+        x_trans = np.zeros(n_samples, dtype=np.float32)
+        x_trans[:seam_idx] = 0.5
+        x_trans[seam_idx:] = 0.05
+
+        # 1. Unchanged pass-through should have 0 boundary step error and 0 pumping
+        clean_scores = auto_tune.score_transition_boundary(x_trans, x_trans, sr, seam_idx)
+        self.assertAlmostEqual(clean_scores["boundary_step_error"], 0.0, places=5)
+        self.assertAlmostEqual(clean_scores["boundary_pumping"], 0.0, places=5)
+
+        # 2. Artificial gating/pumping: quiet section is aggressively over-squashed at start
+        y_trans = x_trans.copy()
+        y_trans[seam_idx:seam_idx + int(0.05 * sr)] *= 0.01  # severe gating at entry
+        pump_scores = auto_tune.score_transition_boundary(x_trans, y_trans, sr, seam_idx)
+        self.assertGreater(pump_scores["boundary_step_error"], 1.0)
+        self.assertGreater(pump_scores["boundary_pumping"], 10.0)
+
+    def test_transition_aware_multi_evaluation(self):
+        """Test that transition_aware=True applies cross-region variance penalty."""
+        sr = 44100
+        audio = np.random.default_rng(33).normal(0, 0.1, sr * 2).astype(np.float32)
+        params = master.Params(n_fft=512, hop=128, swish_repair=0.2)
+        regions = [
+            auto_tune.Region(0.0, 0.6, "quiet"),
+            auto_tune.Region(0.8, 0.6, "loud"),
+        ]
+        weights = auto_tune.weights_from_aggressiveness(0.5)
+        band = (params.start_hz, params.end_hz)
+
+        standard_res = auto_tune._evaluate_params_multi(
+            audio, sr, regions, params, weights, band, 0.5, transition_aware=False,
+        )
+        transition_res = auto_tune._evaluate_params_multi(
+            audio, sr, regions, params, weights, band, 0.5, transition_aware=True, variance_weight=0.2,
+        )
+
+        # Variance is non-negative, so transition-aware scores with variance penalty must be <= standard mean
+        for s_val, t_val in zip(standard_res, transition_res):
+            self.assertLessEqual(t_val, s_val + 1e-6)
+

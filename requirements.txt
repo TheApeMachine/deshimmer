@@ -2,3 +2,12 @@ numpy
 scipy 
 soundfile
 matplotlib
+gradio>=4.0.0
+soundfile
+numpy
+scipy
+matplotlib
+pillow
+optuna>=3.0.0
+numba
+pyloudnorm

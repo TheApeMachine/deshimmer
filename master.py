@@ -23,11 +23,12 @@ Optional post ("deliver"):
 from __future__ import annotations
 
 import argparse
+from abc import ABC, abstractmethod
 import json
 import math
 import os
-from dataclasses import asdict, dataclass, replace
-from typing import Optional, Tuple, Dict, Any, List
+from dataclasses import asdict, dataclass, field, replace
+from typing import Optional, Tuple, Dict, Any, List, Callable
 
 import numpy as np
 import soundfile as sf
@@ -86,19 +87,19 @@ def _frame_coeff(hop: int, sr: int, ms: float) -> float:
     return float(math.exp(-float(hop) / (float(sr) * tau)))
 
 
-def _butter_sos(sr: int, kind: str, cutoff_hz, order: int = 2):
+def _butter_sos(sr: int, kind: str, cutoff_hz, order: int = 2) -> np.ndarray:
     nyq = 0.5 * sr
     if kind in ("lowpass", "highpass"):
         wn = float(cutoff_hz) / nyq
         wn = float(np.clip(wn, 1e-6, 0.999999))
-        return butter(int(order), wn, btype=kind, output="sos")
+        return np.asarray(butter(order, wn, btype=kind, output="sos"))
     if kind == "bandpass":
         lo, hi = cutoff_hz
         lo = float(np.clip(lo / nyq, 1e-6, 0.999999))
         hi = float(np.clip(hi / nyq, 1e-6, 0.999999))
         if hi <= lo:
             raise ValueError("Invalid bandpass cutoffs")
-        return butter(int(order), [lo, hi], btype="bandpass", output="sos")
+        return np.asarray(butter(order, [lo, hi], btype="bandpass", output="sos"))
     raise ValueError("Unknown filter kind")
 
 
@@ -130,7 +131,7 @@ def align_lr_delay(x: np.ndarray, sr: int, max_delay_ms: float = 3.0) -> np.ndar
     right = x[:, 1]
 
     # Analyze the first 15 seconds to calculate the temporal lag quickly and reliably
-    analysis_len = min(left.size, int(sr * 15))
+    analysis_len = min(left.size, (sr * 15))
     l_segment = left[:analysis_len]
     r_segment = right[:analysis_len]
 
@@ -139,7 +140,7 @@ def align_lr_delay(x: np.ndarray, sr: int, max_delay_ms: float = 3.0) -> np.ndar
     center = corr.size // 2
     lag = np.argmax(corr) - center
 
-    max_delay_samples = int(math.ceil((max_delay_ms / 1000.0) * sr))
+    max_delay_samples = math.ceil((max_delay_ms / 1000.0) * sr)
 
     if abs(lag) > max_delay_samples or lag == 0:
         return x
@@ -440,6 +441,13 @@ class Params:
     hf_zero_phase: bool = True
     hf_confidence_blend: bool = True
 
+    # ----------------------------------------------------------------------
+    # Psychoacoustic forward temporal masking
+    # ----------------------------------------------------------------------
+    temporal_masking: bool = True
+    mask_decay_ms: float = 15.0
+    mask_flat_gate: bool = True
+
 
 # Last STFT-frame artifact confidence for HF resynth blending
 _LAST_ARTIFACT_CONF_FRAMES: Optional[np.ndarray] = None
@@ -497,13 +505,13 @@ class DebugCollector:
         pad_offset: int,
         duration_s: float,
     ):
-        self.sr = int(sr)
+        self.sr = sr
         self.freqs = freqs
         self.dn_idx = dn_idx
         self.deq_idx = deq_idx
         self.sh_idx = sh_idx
-        self.stride = int(max(1, stride))
-        self.pad_offset = int(pad_offset)
+        self.stride = max(1, stride)
+        self.pad_offset = pad_offset
         self.duration_s = float(duration_s)
 
         self.frame_i = 0
@@ -589,7 +597,7 @@ class DebugCollector:
 # -----------------------------
 def measure_true_peak_db(x: np.ndarray, os_factor: int = 4) -> float:
     x2 = _as_2d(np.asarray(x, dtype=np.float32))
-    osf = int(max(1, os_factor))
+    osf = max(1, os_factor)
     if osf > 1:
         x_os = resample_poly(x2, osf, 1, axis=0).astype(np.float32, copy=False)
     else:
@@ -607,7 +615,7 @@ def measure_rms_dbfs(x: np.ndarray) -> float:
 def measure_lufs(x: np.ndarray, sr: int) -> Optional[float]:
     try:
         import pyloudnorm as pyln
-        meter = pyln.Meter(int(sr))
+        meter = pyln.Meter(sr)
         return float(meter.integrated_loudness(_as_2d(x)))
     except Exception:
         return None
@@ -734,7 +742,7 @@ def loudness_normalize(x: np.ndarray, sr: int, mp: MasterParams, debug: bool = F
 
 
 def master_post(x: np.ndarray, sr: int, mp: MasterParams, debug: bool = False) -> Tuple[np.ndarray, Dict[str, Any]]:
-    info: Dict[str, Any] = {"enabled": bool(mp.enabled)}
+    info: Dict[str, Any] = {"enabled": mp.enabled}
     if not mp.enabled:
         return x, info
 
@@ -742,20 +750,20 @@ def master_post(x: np.ndarray, sr: int, mp: MasterParams, debug: bool = False) -
 
     if mp.dc_remove:
         y = (y - np.mean(y, axis=0, keepdims=True)).astype(np.float32, copy=False)
-    info["dc_remove"] = bool(mp.dc_remove)
+    info["dc_remove"] = mp.dc_remove
 
     if mp.hp_hz and mp.hp_hz > 0.0:
         nyq = 0.5 * sr
         if mp.hp_hz < nyq - 10.0:
-            sos = _butter_sos(sr, "highpass", float(mp.hp_hz), order=int(max(1, mp.hp_order)))
+            sos = _butter_sos(sr, "highpass", float(mp.hp_hz), order=max(1, mp.hp_order))
             y = sosfiltfilt(sos, y, axis=0).astype(np.float32, copy=False)
             info["hp_hz"] = float(mp.hp_hz)
-            info["hp_order"] = int(mp.hp_order)
+            info["hp_order"] = mp.hp_order
 
     y, norm_info = loudness_normalize(y, sr, mp, debug=debug)
     info["normalize"] = norm_info
 
-    osf = int(max(1, mp.os_factor))
+    osf = max(1, mp.os_factor)
     info["limiter_os_factor"] = osf
     if osf > 1:
         y_os = resample_poly(y, osf, 1, axis=0).astype(np.float32, copy=False)
@@ -826,9 +834,73 @@ def _numba_deq_persist(pos, n_cols, a_p):
     return output
 
 
+@jit(nopython=True)
+def _numba_temporal_mask_decay(mask_psd: np.ndarray, alpha_vec: np.ndarray) -> np.ndarray:
+    """
+    Forward temporal psychoacoustic masking decay (one-pole peak-hold decay).
+    Holds masking threshold high after broadband attacks, modulated by alpha_vec.
+    """
+    F, T = mask_psd.shape
+    out = np.empty((F, T), dtype=np.float32)
+    for f in range(F):
+        out[f, 0] = mask_psd[f, 0]
+    for t in range(1, T):
+        a = alpha_vec[t]
+        for f in range(F):
+            prev = out[f, t - 1] * a
+            curr = mask_psd[f, t]
+            out[f, t] = curr if curr > prev else prev
+    return out
+
+
+def _py_temporal_mask_decay(mask_psd: np.ndarray, alpha_vec: np.ndarray) -> np.ndarray:
+    F, T = mask_psd.shape
+    out = np.empty((F, T), dtype=np.float32)
+    out[:, 0] = mask_psd[:, 0]
+    for t in range(1, T):
+        prev = out[:, t - 1] * alpha_vec[t]
+        curr = mask_psd[:, t]
+        out[:, t] = np.maximum(curr, prev)
+    return out
+
+
+def apply_temporal_masking_decay(
+    mask_psd: np.ndarray,
+    sr: int,
+    hop: int,
+    *,
+    decay_ms: float = 15.0,
+    flatness: Optional[np.ndarray] = None,
+    flat_start: float = 0.25,
+    flat_end: float = 0.70,
+    gated: bool = True,
+) -> np.ndarray:
+    """
+    Applies forward temporal psychoacoustic masking decay across time frames.
+    Gated by spectral flatness: sustains broadband reverb tails while letting
+    tonal codec ringing fall through for suppression.
+    """
+    if mask_psd.shape[1] <= 1:
+        return mask_psd.astype(np.float32, copy=False)
+
+    alpha_base = np.float32(_frame_coeff(hop, sr, max(1.0, float(decay_ms))))
+    T = mask_psd.shape[1]
+
+    if gated and flatness is not None:
+        flat = np.asarray(flatness, dtype=np.float32)
+        gate = np.clip((flat - float(flat_start)) / max(1e-6, float(flat_end) - float(flat_start)), 0.0, 1.0)
+        alpha_vec = (alpha_base * gate).astype(np.float32)
+    else:
+        alpha_vec = np.full(T, alpha_base, dtype=np.float32)
+
+    if HAS_NUMBA:
+        return _numba_temporal_mask_decay(mask_psd.astype(np.float32, copy=False), alpha_vec)
+    return _py_temporal_mask_decay(mask_psd.astype(np.float32, copy=False), alpha_vec)
+
+
 def _hpss_harmonic_mask(log_mag: np.ndarray, time_frames: int, freq_bins: int, eps: float = 1e-12) -> np.ndarray:
-    tf = int(max(1, time_frames))
-    ff = int(max(1, freq_bins))
+    tf = max(1, time_frames)
+    ff = max(1, freq_bins)
     H = median_filter(log_mag, size=(1, tf), mode="nearest")
     P = median_filter(log_mag, size=(ff, 1), mode="nearest")
     Hlin = np.exp(H)
@@ -901,7 +973,7 @@ def _phasor_smooth_complex(
     mag = np.abs(Z).astype(np.float32)
     w = (weights.astype(np.float32) * mag).astype(np.float32)
     unit = Z / (mag + eps)
-    k = max(3, int(size) | 1)
+    k = max(3, size | 1)
 
     def _filt(a: np.ndarray) -> np.ndarray:
         return uniform_filter1d(a.astype(np.float64), size=k, axis=axis, mode="nearest").astype(np.float32)
@@ -962,7 +1034,7 @@ def measure_phase_instability(
     eps = 1e-12
     _, _, Z = stft(
         xm[None, :],
-        fs=int(sr),
+        fs=sr,
         window="hann",
         nperseg=n_fft,
         noverlap=n_fft - hop,
@@ -1010,8 +1082,8 @@ def _apply_swish_phase_repair(
     instab = _phase_instability_map(zm, eps=eps)
 
     log_mag = np.log(Mag_mono[band_idx, :] + eps)
-    t_win = max(3, int(hpss_time_frames) | 1)
-    f_win = max(3, int(hpss_freq_bins) | 1)
+    t_win = max(3, hpss_time_frames | 1)
+    f_win = max(3, hpss_freq_bins | 1)
     h_lin = np.exp(median_filter(log_mag, size=(1, t_win), mode="nearest"))
     p_lin = np.exp(median_filter(log_mag, size=(f_win, 1), mode="nearest"))
     mh = (h_lin ** 2 / (h_lin ** 2 + p_lin ** 2 + eps)).astype(np.float32, copy=False)
@@ -1096,17 +1168,995 @@ def _artifact_confidence_map(
         return np.zeros((0, Mag_mono.shape[1]), dtype=np.float32)
     mag = Mag_mono[band_idx, :]
     L = np.log(mag + eps)
-    L_med = median_filter(L, size=(int(max(3, freq_med_bins)), 1), mode="nearest")
+    L_med = median_filter(L, size=(max(3, freq_med_bins), 1), mode="nearest")
     resid = (L - L_med) * (20.0 / np.log(10.0))
     conf = np.clip((resid - float(thr_db)) / max(1e-6, float(thr_db)), 0.0, 1.0)
     return conf.astype(np.float32, copy=False)
 
 
 # -----------------------------
+# Modular DSP Pipeline Architecture
+# -----------------------------
+@dataclass
+class DSPContext:
+    Z: np.ndarray             # (F, T, C) complex64
+    Z_orig: np.ndarray        # (F, T, C) complex64
+    Mag: np.ndarray           # (F, T, C) float32
+    Mag_mono: np.ndarray      # (F, T) float32
+    PSD: np.ndarray           # (F, T) float32
+    freqs: np.ndarray         # (F,) float32
+    g_total: np.ndarray       # (F, T) float32 preallocated gain array (mutated in place)
+    mask_psd: np.ndarray      # (F, T) float32 psychoacoustic mask
+    flat_full: np.ndarray     # (T,) float32
+    band_db_full: np.ndarray  # (T,) float32
+    w_noise_full: np.ndarray  # (T,) float32
+    flux: np.ndarray          # (T,) float32
+    w_trans: np.ndarray       # (T,) float32
+    w_nontrans: np.ndarray    # (T,) float32
+    sr: int
+    hop: int
+    n_fft: int
+    n_cols: int
+    n_ch: int
+    ms_enabled: bool
+    ch_scales: np.ndarray
+    eps: float = 1e-12
+    rng: np.random.Generator = field(default_factory=lambda: np.random.default_rng(0))
+    artifact_conf_parts: List[np.ndarray] = field(default_factory=list)
+    debug_maps: Dict[str, Any] = field(default_factory=dict)
+    depth_scale_for: Optional[Callable[[np.ndarray], np.ndarray]] = None
+
+    def idx(self, lo_hz: float, hi_hz: float) -> np.ndarray:
+        nyq = float(self.freqs[-1]) if self.freqs.size else 0.5 * float(self.sr)
+        lo = float(max(0.0, lo_hz))
+        hi = float(min(nyq, hi_hz))
+        if hi <= lo:
+            return np.array([], dtype=np.int64)
+        return np.where((self.freqs >= lo) & (self.freqs <= hi))[0]
+
+    def edge_taper(self, band_idx: np.ndarray, lo_hz: float, hi_hz: float, edge_hz: float) -> np.ndarray:
+        return _edge_taper(self.freqs, band_idx, lo_hz, hi_hz, edge_hz)[:, None]
+
+    def depth_scale(self, band_idx: np.ndarray) -> np.ndarray:
+        if self.depth_scale_for is not None:
+            return self.depth_scale_for(band_idx)
+        return np.ones((band_idx.size, self.n_cols), dtype=np.float32)
+
+    @classmethod
+    def create(
+        cls,
+        Z: np.ndarray,
+        sr: int = 44100,
+        hop: int = 512,
+        n_fft: int = 2048,
+        freqs: Optional[np.ndarray] = None,
+        p: Optional[Params] = None,
+        rng: Optional[np.random.Generator] = None,
+    ) -> "DSPContext":
+        if Z.ndim == 2:
+            Z = Z[:, :, None]
+        F, T, C = Z.shape
+        eps = 1e-12
+        if freqs is None:
+            freqs = np.linspace(0.0, 0.5 * sr, F).astype(np.float32)
+        Mag = np.abs(Z)
+        Mag_mono = np.mean(Mag, axis=2)
+        PSD = Mag_mono ** 2 + eps
+        mask_psd = _calculate_psychoacoustic_mask(PSD, freqs)
+
+        log_P = np.log(PSD + eps)
+        flat_full = np.exp(np.mean(log_P, axis=0)) / (np.mean(PSD, axis=0) + eps)
+        band_db_full = 10.0 * np.log10(np.mean(PSD, axis=0) + eps)
+
+        f_start = float(getattr(p, "flat_start", 0.25)) if p else 0.25
+        f_end = float(getattr(p, "flat_end", 0.70)) if p else 0.70
+        fl_thr = float(getattr(p, "flux_thr_db", 6.0)) if p else 6.0
+        fl_range = float(getattr(p, "flux_range_db", 8.0)) if p else 8.0
+
+        w_noise_full = np.clip((flat_full - f_start) / max(1e-6, f_end - f_start), 0.0, 1.0)
+        flux = np.zeros_like(band_db_full)
+        flux[1:] = np.maximum(0.0, band_db_full[1:] - band_db_full[:-1])
+        w_trans = np.clip((flux - fl_thr) / max(1e-6, fl_range), 0.0, 1.0)
+        w_nontrans = 1.0 - w_trans
+
+        if p is not None and getattr(p, "temporal_masking", True):
+            mask_psd = apply_temporal_masking_decay(
+                mask_psd,
+                sr=sr,
+                hop=hop,
+                decay_ms=float(getattr(p, "mask_decay_ms", 15.0)),
+                flatness=flat_full,
+                flat_start=f_start,
+                flat_end=f_end,
+                gated=bool(getattr(p, "mask_flat_gate", True)),
+            )
+
+        ms_enabled = bool(getattr(p, "ms_process", False)) if p else False
+        ch_scales = np.ones(C, dtype=np.float32)
+        if ms_enabled and C >= 2:
+            ch_scales[0] = 1.0
+            ch_scales[1] = float(np.clip(getattr(p, "ms_side_scale", 0.35), 0.0, 1.0))
+
+        if rng is None:
+            rng = np.random.default_rng(int(getattr(p, "seed", 0)) if p else 0)
+
+        g_total = np.ones((F, T), dtype=np.float32)
+        return cls(
+            Z=Z.copy(),
+            Z_orig=Z.copy(),
+            Mag=Mag,
+            Mag_mono=Mag_mono,
+            PSD=PSD,
+            freqs=freqs,
+            g_total=g_total,
+            mask_psd=mask_psd,
+            flat_full=flat_full,
+            band_db_full=band_db_full,
+            w_noise_full=w_noise_full,
+            flux=flux,
+            w_trans=w_trans,
+            w_nontrans=w_nontrans,
+            sr=sr,
+            hop=hop,
+            n_fft=n_fft,
+            n_cols=T,
+            n_ch=C,
+            ms_enabled=ms_enabled,
+            ch_scales=ch_scales,
+            eps=eps,
+            rng=rng,
+        )
+
+
+# Localized Configuration Objects
+@dataclass
+class ExpanderConfig:
+    enabled: bool = False
+    start_hz: float = 3000.0
+    end_hz: float = 8000.0
+    threshold_db: float = -45.0
+    ratio: float = 2.0
+    attack_ms: float = 10.0
+    release_ms: float = 150.0
+
+    @classmethod
+    def from_params(cls, p: Params) -> "ExpanderConfig":
+        return cls(
+            enabled=bool(getattr(p, "expander", False)),
+            start_hz=float(getattr(p, "exp_start_hz", 3000.0)),
+            end_hz=float(getattr(p, "exp_end_hz", 8000.0)),
+            threshold_db=float(getattr(p, "exp_threshold_db", -45.0)),
+            ratio=float(max(1.0, getattr(p, "exp_ratio", 2.0))),
+            attack_ms=float(getattr(p, "exp_attack_ms", 10.0)),
+            release_ms=float(getattr(p, "exp_release_ms", 150.0)),
+        )
+
+
+@dataclass
+class SmartDenoiseConfig:
+    strength: float = 0.0
+    start_hz: float = 120.0
+    end_hz: float = 16000.0
+    edge_hz: float = 200.0
+    floor_db: float = -18.0
+    psd_smooth_ms: float = 50.0
+    minwin_ms: float = 400.0
+    up_db_per_s: float = 3.0
+    freq_smooth_bins: int = 3
+
+    @classmethod
+    def from_params(cls, p: Params) -> "SmartDenoiseConfig":
+        return cls(
+            strength=float(getattr(p, "denoise", 0.0)),
+            start_hz=float(getattr(p, "dn_start_hz", 120.0)),
+            end_hz=float(getattr(p, "dn_end_hz", 16000.0)),
+            edge_hz=float(getattr(p, "dn_edge_hz", 200.0)),
+            floor_db=float(getattr(p, "dn_floor_db", -18.0)),
+            psd_smooth_ms=float(getattr(p, "dn_psd_smooth_ms", 50.0)),
+            minwin_ms=float(getattr(p, "dn_minwin_ms", 400.0)),
+            up_db_per_s=float(getattr(p, "dn_up_db_per_s", 3.0)),
+            freq_smooth_bins=int(getattr(p, "dn_freq_smooth_bins", 3)),
+        )
+
+
+@dataclass
+class DeResonatorConfig:
+    strength: float = 0.0
+    start_hz: float = 180.0
+    end_hz: float = 12000.0
+    edge_hz: float = 150.0
+    freq_med_bins: int = 31
+    thr_db: float = 6.0
+    slope: float = 0.7
+    max_att_db: float = 8.0
+    density_lo: float = 0.03
+    density_hi: float = 0.20
+    persist_ms: float = 600.0
+    persist_thr_db: float = 2.5
+    freq_smooth_bins: int = 5
+    tonal_boost_db: float = 6.0
+    time_floor: bool = False
+    floor_smooth_ms: float = 80.0
+    floor_rise_db_per_s: float = 1.0
+    floor_thr_db: float = 3.0
+    use_inpaint: bool = True
+
+    @classmethod
+    def from_params(cls, p: Params) -> "DeResonatorConfig":
+        use_inpaint = bool(getattr(p, "magnitude_inpaint", True))
+        deq_inpaint = bool(getattr(p, "deq_inpaint", True)) and use_inpaint
+        return cls(
+            strength=float(getattr(p, "deres", 0.0)),
+            start_hz=float(getattr(p, "deq_start_hz", 180.0)),
+            end_hz=float(getattr(p, "deq_end_hz", 12000.0)),
+            edge_hz=float(getattr(p, "deq_edge_hz", 150.0)),
+            freq_med_bins=int(getattr(p, "deq_freq_med_bins", 31)),
+            thr_db=float(getattr(p, "deq_thr_db", 6.0)),
+            slope=float(getattr(p, "deq_slope", 0.7)),
+            max_att_db=float(getattr(p, "deq_max_att_db", 8.0)),
+            density_lo=float(getattr(p, "deq_density_lo", 0.03)),
+            density_hi=float(getattr(p, "deq_density_hi", 0.20)),
+            persist_ms=float(getattr(p, "deq_persist_ms", 600.0)),
+            persist_thr_db=float(getattr(p, "deq_persist_thr_db", 2.5)),
+            freq_smooth_bins=int(getattr(p, "deq_freq_smooth_bins", 5)),
+            tonal_boost_db=float(getattr(p, "deq_tonal_boost_db", 6.0)),
+            time_floor=bool(getattr(p, "deq_time_floor", False)),
+            floor_smooth_ms=float(getattr(p, "deq_floor_smooth_ms", 80.0)),
+            floor_rise_db_per_s=float(getattr(p, "deq_floor_rise_db_per_s", 1.0)),
+            floor_thr_db=float(getattr(p, "deq_floor_thr_db", 3.0)),
+            use_inpaint=deq_inpaint,
+        )
+
+
+@dataclass
+class ShimmerConfig:
+    start_hz: float = 5100.0
+    end_hz: float = 7200.0
+    edge_hz: float = 200.0
+    flat_start: float = 0.25
+    flat_end: float = 0.70
+    freq_med_bins: int = 9
+    thr_db: float = 8.0
+    slope: float = 0.6
+    density_lo: float = 0.02
+    density_hi: float = 0.15
+    use_inpaint: bool = True
+
+    @classmethod
+    def from_params(cls, p: Params) -> "ShimmerConfig":
+        return cls(
+            start_hz=float(getattr(p, "start_hz", 5100.0)),
+            end_hz=float(getattr(p, "end_hz", 7200.0)),
+            edge_hz=float(getattr(p, "edge_hz", 200.0)),
+            flat_start=float(getattr(p, "flat_start", 0.25)),
+            flat_end=float(getattr(p, "flat_end", 0.70)),
+            freq_med_bins=int(getattr(p, "freq_med_bins", 9)),
+            thr_db=float(getattr(p, "thr_db", 8.0)),
+            slope=float(getattr(p, "slope", 0.6)),
+            density_lo=float(getattr(p, "density_lo", 0.02)),
+            density_hi=float(getattr(p, "density_hi", 0.15)),
+            use_inpaint=bool(getattr(p, "magnitude_inpaint", True)),
+        )
+
+
+@dataclass
+class GainApplicationConfig:
+    cap_db: float = 12.0
+    nuclear_mode: bool = False
+    ms_enabled: bool = False
+    ms_side_scale: float = 0.35
+    exp_start_hz: float = 3000.0
+    exp_end_hz: float = 8000.0
+    dn_start_hz: float = 120.0
+    dn_end_hz: float = 16000.0
+    deq_start_hz: float = 180.0
+    deq_end_hz: float = 12000.0
+    sh_start_hz: float = 5100.0
+    sh_end_hz: float = 7200.0
+
+    @classmethod
+    def from_params(cls, p: Params) -> "GainApplicationConfig":
+        cap_db = 48.0 if bool(getattr(p, "nuclear_mode", False)) else float(getattr(p, "total_att_cap_db", 12.0))
+        return cls(
+            cap_db=cap_db,
+            nuclear_mode=bool(getattr(p, "nuclear_mode", False)),
+            ms_enabled=bool(getattr(p, "ms_process", False)),
+            ms_side_scale=float(getattr(p, "ms_side_scale", 0.35)),
+            exp_start_hz=float(getattr(p, "exp_start_hz", 3000.0)),
+            exp_end_hz=float(getattr(p, "exp_end_hz", 8000.0)),
+            dn_start_hz=float(getattr(p, "dn_start_hz", 120.0)),
+            dn_end_hz=float(getattr(p, "dn_end_hz", 16000.0)),
+            deq_start_hz=float(getattr(p, "deq_start_hz", 180.0)),
+            deq_end_hz=float(getattr(p, "deq_end_hz", 12000.0)),
+            sh_start_hz=float(getattr(p, "start_hz", 5100.0)),
+            sh_end_hz=float(getattr(p, "end_hz", 7200.0)),
+        )
+
+
+@dataclass
+class CarverConfig:
+    enhance: bool = True
+
+    @classmethod
+    def from_params(cls, p: Params) -> "CarverConfig":
+        return cls(enhance=bool(getattr(p, "enhance", True)))
+
+
+@dataclass
+class NoiseResynthConfig:
+    strength: float = 0.0
+    start_hz: float = 5100.0
+    end_hz: float = 7200.0
+    edge_hz: float = 200.0
+    flat_start: float = 0.25
+    flat_end: float = 0.70
+    freq_med_bins: int = 9
+    thr_db: float = 8.0
+    density_lo: float = 0.02
+    density_hi: float = 0.15
+
+    @classmethod
+    def from_params(cls, p: Params) -> "NoiseResynthConfig":
+        return cls(
+            strength=float(getattr(p, "noise_resynth", 0.0)),
+            start_hz=float(getattr(p, "start_hz", 5100.0)),
+            end_hz=float(getattr(p, "end_hz", 7200.0)),
+            edge_hz=float(getattr(p, "edge_hz", 200.0)),
+            flat_start=float(getattr(p, "flat_start", 0.25)),
+            flat_end=float(getattr(p, "flat_end", 0.70)),
+            freq_med_bins=int(getattr(p, "freq_med_bins", 9)),
+            thr_db=float(getattr(p, "thr_db", 8.0)),
+            density_lo=float(getattr(p, "density_lo", 0.02)),
+            density_hi=float(getattr(p, "density_hi", 0.15)),
+        )
+
+
+@dataclass
+class PhaseBlurConfig:
+    strength: float = 0.0
+    start_hz: float = 3000.0
+    end_hz: float = 8000.0
+    harmonic_only: bool = True
+    hpss_time_frames: int = 21
+    hpss_freq_bins: int = 17
+
+    @classmethod
+    def from_params(cls, p: Params) -> "PhaseBlurConfig":
+        return cls(
+            strength=float(getattr(p, "phase_blur", 0.0)),
+            start_hz=float(getattr(p, "pb_start_hz", 3000.0)),
+            end_hz=float(getattr(p, "pb_end_hz", 8000.0)),
+            harmonic_only=bool(getattr(p, "pb_harmonic_only", True)),
+            hpss_time_frames=int(getattr(p, "hpss_time_frames", 21)),
+            hpss_freq_bins=int(getattr(p, "hpss_freq_bins", 17)),
+        )
+
+
+@dataclass
+class SwishRepairConfig:
+    strength: float = 0.0
+    start_hz: float = 3500.0
+    end_hz: float = 14000.0
+    time_amt: float = 0.55
+    freq_amt: float = 0.30
+    time_win: int = 7
+    freq_win: int = 5
+    transient_protect: float = 0.85
+    harmonic_protect: float = 0.45
+    hpss_time_frames: int = 21
+    hpss_freq_bins: int = 17
+
+    @classmethod
+    def from_params(cls, p: Params) -> "SwishRepairConfig":
+        return cls(
+            strength=float(getattr(p, "swish_repair", 0.0)),
+            start_hz=float(getattr(p, "swish_start_hz", 3500.0)),
+            end_hz=float(getattr(p, "swish_end_hz", 14000.0)),
+            time_amt=float(getattr(p, "swish_time_amt", 0.55)),
+            freq_amt=float(getattr(p, "swish_freq_amt", 0.30)),
+            time_win=int(getattr(p, "swish_time_win", 7)),
+            freq_win=int(getattr(p, "swish_freq_win", 5)),
+            transient_protect=float(getattr(p, "swish_transient_protect", 0.85)),
+            harmonic_protect=float(getattr(p, "swish_harmonic_protect", 0.45)),
+            hpss_time_frames=int(getattr(p, "hpss_time_frames", 21)),
+            hpss_freq_bins=int(getattr(p, "hpss_freq_bins", 17)),
+        )
+
+
+@dataclass
+class HFDecorrelationConfig:
+    strength: float = 0.0
+    start_hz: float = 4500.0
+    end_hz: float = 16000.0
+
+    @classmethod
+    def from_params(cls, p: Params) -> "HFDecorrelationConfig":
+        return cls(
+            strength=float(getattr(p, "hf_decorrelate", 0.0)),
+            start_hz=float(getattr(p, "hf_dec_start_hz", 4500.0)),
+            end_hz=float(getattr(p, "hf_dec_end_hz", 16000.0)),
+        )
+
+
+# Abstract Base Class for DSP Stages
+class DSPStage(ABC):
+    name: str = "dsp_stage"
+
+    @abstractmethod
+    def is_enabled(self) -> bool:
+        pass
+
+    @abstractmethod
+    def process(self, ctx: DSPContext) -> None:
+        pass
+
+
+class ExpanderStage(DSPStage):
+    name = "expander"
+
+    def __init__(self, config: ExpanderConfig):
+        self.config = config
+
+    @classmethod
+    def from_params(cls, p: Params) -> "ExpanderStage":
+        return cls(ExpanderConfig.from_params(p))
+
+    def is_enabled(self) -> bool:
+        return self.config.enabled
+
+    def process(self, ctx: DSPContext) -> None:
+        exp_idx = ctx.idx(self.config.start_hz, self.config.end_hz)
+        if not (self.config.enabled and exp_idx.size > 0):
+            return
+
+        band_p_exp = np.mean(ctx.PSD[exp_idx, :], axis=0)
+        band_db_exp = 10.0 * np.log10(band_p_exp + ctx.eps)
+        thr = float(self.config.threshold_db)
+        ratio = float(self.config.ratio)
+
+        red_db = np.zeros_like(band_db_exp)
+        mask = band_db_exp < thr
+        red_db[mask] = (thr - band_db_exp[mask]) * (ratio - 1.0)
+        g_target = 10.0 ** (-red_db / 20.0)
+
+        att = _frame_coeff(ctx.hop, ctx.sr, self.config.attack_ms)
+        rel = _frame_coeff(ctx.hop, ctx.sr, self.config.release_ms)
+
+        if HAS_NUMBA:
+            g_target = g_target.astype(np.float32)
+            g_env = _numba_exp_env(g_target, ctx.n_cols, att, rel)
+        else:
+            g_env = np.ones_like(g_target)
+            g_sm = 1.0
+            for i in range(ctx.n_cols):
+                curr = g_target[i]
+                if curr < g_sm:
+                    g_sm = att * g_sm + (1.0 - att) * curr
+                else:
+                    g_sm = rel * g_sm + (1.0 - rel) * curr
+                g_env[i] = g_sm
+
+        ctx.g_total[exp_idx, :] *= g_env.astype(np.float32, copy=False)
+
+
+class SmartDenoiseStage(DSPStage):
+    name = "smart_denoise"
+
+    def __init__(self, config: SmartDenoiseConfig):
+        self.config = config
+
+    @classmethod
+    def from_params(cls, p: Params) -> "SmartDenoiseStage":
+        return cls(SmartDenoiseConfig.from_params(p))
+
+    def is_enabled(self) -> bool:
+        return self.config.strength > 1e-6
+
+    def process(self, ctx: DSPContext) -> None:
+        dn_idx = ctx.idx(self.config.start_hz, self.config.end_hz)
+        dn_str = float(np.clip(self.config.strength, 0.0, 1.0))
+        if dn_str <= 1e-6 or dn_idx.size == 0:
+            return
+
+        psd_dn = ctx.PSD[dn_idx, :]
+        a_psd = _frame_coeff(ctx.hop, ctx.sr, self.config.psd_smooth_ms)
+        psd_sm_map: np.ndarray = np.asarray(lfilter([1.0 - a_psd], [1.0, -a_psd], psd_dn, axis=1))
+
+        minwin = max(4, int(ctx.sr * self.config.minwin_ms / 1000.0 / ctx.hop))
+        n_blocks = int(np.ceil(ctx.n_cols / minwin))
+        pad_t = n_blocks * minwin - ctx.n_cols
+        p_padded = np.pad(psd_sm_map, ((0, 0), (0, pad_t)), constant_values=np.inf)
+        p_reshaped = p_padded.reshape(psd_dn.shape[0], n_blocks, minwin)
+        curr_min = np.min(p_reshaped, axis=2)
+
+        rise = 10.0 ** ((self.config.up_db_per_s * (minwin * ctx.hop / ctx.sr)) / 10.0)
+        curr_noise_vec = psd_dn[:, 0]
+        if HAS_NUMBA:
+            curr_min = curr_min.astype(np.float32)
+            curr_noise_vec = curr_noise_vec.astype(np.float32)
+            noise_est_blocks = _numba_dn_noise_est(curr_min, n_blocks, curr_noise_vec, rise)
+        else:
+            noise_est_blocks = np.zeros_like(curr_min)
+            for b in range(n_blocks):
+                M = curr_min[:, b]
+                curr_noise_vec = np.minimum(M, curr_noise_vec * rise)
+                noise_est_blocks[:, b] = curr_noise_vec
+
+        noise_map = np.repeat(noise_est_blocks, minwin, axis=1)[:, :ctx.n_cols]
+
+        F_dn, T_dn = psd_dn.shape
+        dn_g = np.ones((F_dn, ctx.n_cols), dtype=np.float32)
+        alpha_dd = 0.98
+        prev_clean_psd = psd_dn[:, 0]
+
+        floor = 10.0 ** (self.config.floor_db / 20.0)
+        min_xi = 10.0 ** (-max(12.0, abs(self.config.floor_db)) / 10.0)
+
+        for ti in range(ctx.n_cols):
+            noise_psd = noise_map[:, ti] + ctx.eps
+            current_psd = psd_dn[:, ti]
+
+            gamma = current_psd / noise_psd
+            xi = alpha_dd * (prev_clean_psd / noise_psd) + (1.0 - alpha_dd) * np.maximum(0.0, gamma - 1.0)
+            xi = np.maximum(xi, min_xi)
+
+            g_inst_frame = xi / (xi + 1.0)
+            g_inst_frame = np.clip(floor + (1.0 - floor) * g_inst_frame, floor, 1.0)
+
+            dn_g[:, ti] = g_inst_frame
+            prev_clean_psd = (g_inst_frame ** 2) * current_psd
+
+        if self.config.freq_smooth_bins > 1:
+            dn_g = uniform_filter1d(dn_g, size=self.config.freq_smooth_bins, axis=0, mode='nearest')
+
+        hpss_dn = ctx.depth_scale(dn_idx)
+        w_dn = ctx.edge_taper(dn_idx, self.config.start_hz, self.config.end_hz, self.config.edge_hz)
+        depth_base = dn_str * (0.5 + 0.5 * ctx.w_noise_full) * ctx.w_nontrans
+        depth_map = depth_base[None, :] * w_dn * hpss_dn
+        g_eff = 1.0 - depth_map * (1.0 - dn_g)
+
+        ctx.g_total[dn_idx, :] *= g_eff.astype(np.float32, copy=False)
+        ctx.debug_maps["g_eff_dn_map"] = g_eff.astype(np.float32, copy=False)
+        ctx.debug_maps["dn_depth_map"] = depth_base.astype(np.float32, copy=False)
+        ctx.debug_maps["noise_psd_dn_db_map"] = (10.0 * np.log10(noise_map + ctx.eps)).astype(np.float32, copy=False)
+
+
+class DeResonatorStage(DSPStage):
+    name = "deresonator"
+
+    def __init__(self, config: DeResonatorConfig):
+        self.config = config
+
+    @classmethod
+    def from_params(cls, p: Params) -> "DeResonatorStage":
+        return cls(DeResonatorConfig.from_params(p))
+
+    def is_enabled(self) -> bool:
+        return self.config.strength > 1e-6
+
+    def process(self, ctx: DSPContext) -> None:
+        deq_idx = ctx.idx(self.config.start_hz, self.config.end_hz)
+        deres_str = float(np.clip(self.config.strength, 0.0, 1.0))
+        if deres_str <= 1e-6 or deq_idx.size == 0:
+            return
+
+        L = np.log(ctx.Mag_mono[deq_idx, :] + ctx.eps)
+        L_med = median_filter(L, size=(self.config.freq_med_bins, 1), mode='nearest')
+        resid = (L - L_med) * (20.0 / np.log(10.0))
+
+        thr_eff = self.config.thr_db + self.config.tonal_boost_db * (1.0 - ctx.w_noise_full)
+        pos = np.maximum(0.0, resid - thr_eff[None, :])
+
+        if self.config.time_floor:
+            psd_deq = ctx.PSD[deq_idx, :].astype(np.float32, copy=False)
+            a_floor = _frame_coeff(ctx.hop, ctx.sr, float(self.config.floor_smooth_ms))
+            psd_floor_sm: np.ndarray = np.asarray(lfilter([1.0 - a_floor], [1.0, -a_floor], psd_deq, axis=1))
+
+            rise_lin = float(10.0 ** ((float(self.config.floor_rise_db_per_s) * (float(ctx.hop) / float(ctx.sr))) / 10.0))
+            floor_env = np.empty_like(psd_floor_sm)
+            floor_env[:, 0] = psd_floor_sm[:, 0]
+            for ti in range(1, ctx.n_cols):
+                prev = floor_env[:, ti - 1]
+                floor_env[:, ti] = np.minimum(prev * rise_lin, psd_floor_sm[:, ti])
+
+            floor_win = max(4, round(ctx.sr * 1.0 / ctx.hop))
+            floor_map = minimum_filter1d(floor_env, size=floor_win, axis=1, mode="nearest")
+            floor_db = 10.0 * np.log10(floor_map + ctx.eps)
+            local_floor_db = median_filter(floor_db, size=(self.config.freq_med_bins, 1), mode="nearest")
+            floor_thr = float(self.config.floor_thr_db)
+            floor_excess = np.maximum(0.0, floor_db - local_floor_db - floor_thr)
+            pos = np.maximum(pos, floor_excess.astype(np.float32, copy=False))
+
+        mask = pos > 0.0
+        dens = np.mean(mask, axis=0)
+        if self.config.time_floor:
+            w_narrow = np.ones(ctx.n_cols, dtype=np.float32)
+        else:
+            w_narrow = 1.0 - np.clip(
+                (dens - self.config.density_lo) / max(1e-6, self.config.density_hi - self.config.density_lo),
+                0.0, 1.0,
+            )
+
+        a_p = _frame_coeff(ctx.hop, ctx.sr, self.config.persist_ms)
+        if HAS_NUMBA:
+            pos = pos.astype(np.float32)
+            persist_map = _numba_deq_persist(pos, ctx.n_cols, a_p)
+        else:
+            persist_map = np.zeros_like(pos)
+            state_p = np.zeros(pos.shape[0])
+            for i in range(ctx.n_cols):
+                state_p = a_p * state_p + (1.0 - a_p) * pos[:, i]
+                persist_map[:, i] = state_p
+
+        gate = np.clip(persist_map / max(1e-6, self.config.persist_thr_db), 0.0, 1.0)
+        att_db = np.minimum(self.config.slope * pos * gate, self.config.max_att_db)
+        gain = 10.0 ** (-att_db / 20.0)
+
+        if self.config.freq_smooth_bins > 1:
+            gain = uniform_filter1d(gain, size=self.config.freq_smooth_bins, axis=0, mode='nearest')
+
+        hpss_deq = ctx.depth_scale(deq_idx)
+        w_deq = ctx.edge_taper(deq_idx, self.config.start_hz, self.config.end_hz, self.config.edge_hz)
+        depth_base = deres_str * ctx.w_nontrans * w_narrow
+        depth_map = depth_base[None, :] * w_deq * hpss_deq
+        conf_deq = np.clip(gate, 0.0, 1.0).astype(np.float32, copy=False)
+        ctx.artifact_conf_parts.append(conf_deq)
+
+        if self.config.use_inpaint:
+            thr_lin = float(self.config.thr_db) * (np.log(10.0) / 20.0)
+            target_mag = np.exp(L_med + thr_lin).astype(np.float32)
+            repair_depth = depth_map * conf_deq
+            Z_deq, g_eff = _apply_magnitude_inpaint(
+                ctx.Z_orig[deq_idx, :, :],
+                target_mag=target_mag,
+                repair_depth=repair_depth,
+                confidence=np.ones_like(conf_deq),
+                eps=ctx.eps,
+                ch_scales=ctx.ch_scales if ctx.ms_enabled else None,
+            )
+            ctx.g_total[deq_idx, :] *= g_eff
+        else:
+            g_eff = 1.0 - depth_map * (1.0 - gain)
+            ctx.g_total[deq_idx, :] *= g_eff.astype(np.float32, copy=False)
+
+        ctx.debug_maps["g_eff_deq_map"] = g_eff.astype(np.float32, copy=False)
+        ctx.debug_maps["deq_depth_map"] = depth_base.astype(np.float32, copy=False)
+
+
+class ShimmerStage(DSPStage):
+    name = "shimmer"
+
+    def __init__(self, config: ShimmerConfig):
+        self.config = config
+
+    @classmethod
+    def from_params(cls, p: Params) -> "ShimmerStage":
+        return cls(ShimmerConfig.from_params(p))
+
+    def is_enabled(self) -> bool:
+        return True
+
+    def process(self, ctx: DSPContext) -> None:
+        sh_idx = ctx.idx(self.config.start_hz, self.config.end_hz)
+        if sh_idx.size < 8:
+            return
+
+        mag_sh = ctx.Mag_mono[sh_idx, :]
+        log_P = np.log(mag_sh ** 2 + ctx.eps)
+        flat_sh = np.exp(np.mean(log_P, axis=0)) / (np.mean(mag_sh ** 2, axis=0) + ctx.eps)
+        w_noise_sh = np.clip(
+            (flat_sh - self.config.flat_start) / max(1e-6, self.config.flat_end - self.config.flat_start),
+            0.0, 1.0,
+        )
+
+        L = np.log(mag_sh + ctx.eps)
+        L_med = median_filter(L, size=(self.config.freq_med_bins, 1), mode='nearest')
+        resid = (L - L_med) * (20.0 / np.log(10.0))
+
+        mask = resid > self.config.thr_db
+        dens = np.mean(mask, axis=0)
+        w_narrow = 1.0 - np.clip(
+            (dens - self.config.density_lo) / max(1e-6, self.config.density_hi - self.config.density_lo),
+            0.0, 1.0,
+        )
+
+        att_db = np.zeros_like(resid)
+        m2 = resid > self.config.thr_db
+        att_db[m2] = self.config.slope * (resid[m2] - self.config.thr_db)
+        gain = 10.0 ** (-att_db / 20.0)
+
+        hpss_sh = ctx.depth_scale(sh_idx)
+        w_sh = ctx.edge_taper(sh_idx, self.config.start_hz, self.config.end_hz, self.config.edge_hz)
+        depth_base = w_noise_sh * ctx.w_nontrans * w_narrow
+        depth_map = depth_base[None, :] * w_sh * hpss_sh
+        conf_sh = np.clip(
+            (resid - float(self.config.thr_db)) / max(1e-6, float(self.config.thr_db)),
+            0.0, 1.0,
+        ).astype(np.float32)
+        ctx.artifact_conf_parts.append(conf_sh)
+
+        if self.config.use_inpaint:
+            thr_lin = float(self.config.thr_db) * (np.log(10.0) / 20.0)
+            target_mag = np.exp(L_med + thr_lin).astype(np.float32)
+            repair_depth = depth_map * conf_sh
+            _Z_sh, g_eff = _apply_magnitude_inpaint(
+                ctx.Z_orig[sh_idx, :, :],
+                target_mag=target_mag,
+                repair_depth=repair_depth,
+                confidence=np.ones_like(conf_sh),
+                eps=ctx.eps,
+                ch_scales=ctx.ch_scales if ctx.ms_enabled else None,
+            )
+            ctx.g_total[sh_idx, :] *= g_eff
+        else:
+            g_eff = 1.0 - depth_map * (1.0 - gain)
+            ctx.g_total[sh_idx, :] *= g_eff.astype(np.float32, copy=False)
+
+        ctx.debug_maps["g_eff_sh_map"] = g_eff.astype(np.float32, copy=False)
+        ctx.debug_maps["sh_depth_map"] = depth_base.astype(np.float32, copy=False)
+
+
+class GainApplicationStage(DSPStage):
+    name = "gain_application"
+
+    def __init__(self, config: GainApplicationConfig):
+        self.config = config
+
+    @classmethod
+    def from_params(cls, p: Params) -> "GainApplicationStage":
+        return cls(GainApplicationConfig.from_params(p))
+
+    def is_enabled(self) -> bool:
+        return True
+
+    def process(self, ctx: DSPContext) -> None:
+        exp_idx = ctx.idx(self.config.exp_start_hz, self.config.exp_end_hz)
+        dn_idx = ctx.idx(self.config.dn_start_hz, self.config.dn_end_hz)
+        deq_idx = ctx.idx(self.config.deq_start_hz, self.config.deq_end_hz)
+        sh_idx = ctx.idx(self.config.sh_start_hz, self.config.sh_end_hz)
+
+        proc_idx = np.unique(np.concatenate([
+            arr for arr in [exp_idx, dn_idx, deq_idx, sh_idx] if arr.size > 0
+        ])).astype(np.int64) if (exp_idx.size or dn_idx.size or deq_idx.size or sh_idx.size) else np.array([], dtype=np.int64)
+
+        g_min = float(10.0 ** (-max(0.0, self.config.cap_db) / 20.0))
+
+        if proc_idx.size:
+            ctx.g_total[proc_idx, :] = np.maximum(ctx.g_total[proc_idx, :], g_min)
+
+            g_min_allowed = np.minimum(1.0, np.sqrt(ctx.mask_psd[proc_idx, :] / (ctx.PSD[proc_idx, :] + ctx.eps)))
+            ctx.g_total[proc_idx, :] = np.maximum(ctx.g_total[proc_idx, :], g_min_allowed)
+
+            ctx.Z = ctx.Z_orig.copy()
+            g_apply = ctx.g_total[proc_idx, :].astype(np.float32, copy=False)
+
+            if ctx.ms_enabled and ctx.n_ch >= 2:
+                left = ctx.Z_orig[proc_idx, :, 0]
+                right = ctx.Z_orig[proc_idx, :, 1]
+                mid = 0.5 * (left + right)
+                side = 0.5 * (left - right)
+
+                phase_diff = np.angle(side + ctx.eps) - np.angle(mid + ctx.eps)
+                mid_new = mid * g_apply
+
+                s_scale = float(self.config.ms_side_scale)
+                g_side = 1.0 - (1.0 - g_apply) * s_scale
+                side_mag_new = np.abs(side) * g_side
+
+                side_new = side_mag_new * np.exp(1j * (np.angle(mid_new + ctx.eps) + phase_diff))
+
+                ctx.Z[proc_idx, :, 0] = mid_new + side_new
+                ctx.Z[proc_idx, :, 1] = mid_new - side_new
+
+                if ctx.n_ch > 2:
+                    for ci in range(2, ctx.n_ch):
+                        ctx.Z[proc_idx, :, ci] = ctx.Z_orig[proc_idx, :, ci] * g_apply
+            else:
+                ctx.Z[proc_idx, :, :] = ctx.Z_orig[proc_idx, :, :] * g_apply[:, :, None]
+        else:
+            ctx.Z = ctx.Z_orig.copy()
+
+
+class DynamicCarverStage(DSPStage):
+    name = "dynamic_carver"
+
+    def __init__(self, config: CarverConfig):
+        self.config = config
+
+    @classmethod
+    def from_params(cls, p: Params) -> "DynamicCarverStage":
+        return cls(CarverConfig.from_params(p))
+
+    def is_enabled(self) -> bool:
+        return self.config.enhance
+
+    def process(self, ctx: DSPContext) -> None:
+        if self.config.enhance:
+            ctx.Z = dynamic_spectral_carver(ctx.Z, ctx.freqs)
+
+
+class NoiseResynthStage(DSPStage):
+    name = "noise_resynth"
+
+    def __init__(self, config: NoiseResynthConfig):
+        self.config = config
+
+    @classmethod
+    def from_params(cls, p: Params) -> "NoiseResynthStage":
+        return cls(NoiseResynthConfig.from_params(p))
+
+    def is_enabled(self) -> bool:
+        return self.config.strength > 0.0
+
+    def process(self, ctx: DSPContext) -> None:
+        sh_idx = ctx.idx(self.config.start_hz, self.config.end_hz)
+        if sh_idx.size < 8 or self.config.strength <= 0.0:
+            return
+
+        nr = float(self.config.strength)
+        log_P = np.log(ctx.Mag_mono[sh_idx, :] ** 2 + ctx.eps)
+        flat_sh = np.exp(np.mean(log_P, axis=0)) / (np.mean(ctx.Mag_mono[sh_idx, :] ** 2, axis=0) + ctx.eps)
+        w_noise_sh = np.clip(
+            (flat_sh - self.config.flat_start) / max(1e-6, self.config.flat_end - self.config.flat_start),
+            0.0, 1.0,
+        )
+        L = np.log(ctx.Mag_mono[sh_idx, :] + ctx.eps)
+        L_med = median_filter(L, size=(self.config.freq_med_bins, 1), mode='nearest')
+        resid = (L - L_med) * (20.0 / np.log(10.0))
+        mask = resid > self.config.thr_db
+        dens = np.mean(mask, axis=0)
+        w_narrow = 1.0 - np.clip(
+            (dens - self.config.density_lo) / max(1e-6, self.config.density_hi - self.config.density_lo),
+            0.0, 1.0,
+        )
+        hpss_sh = ctx.depth_scale(sh_idx)
+        w_sh = ctx.edge_taper(sh_idx, self.config.start_hz, self.config.end_hz, self.config.edge_hz)
+        depth_map = (nr * w_noise_sh * ctx.w_nontrans * w_narrow)[None, :] * w_sh * hpss_sh
+
+        phases = ctx.rng.uniform(0.0, 2.0 * np.pi, size=ctx.Z[sh_idx].shape[:2]).astype(np.float32)
+        zph = (np.cos(phases) + 1j * np.sin(phases))[:, :, None]
+        d = depth_map[:, :, None]
+        if ctx.ms_enabled:
+            d = d * ctx.ch_scales.astype(np.float32)[None, None, :]
+        ctx.Z[sh_idx] = (1.0 - d) * ctx.Z[sh_idx] + d * (np.abs(ctx.Z[sh_idx]) * zph)
+
+
+class PhaseBlurStage(DSPStage):
+    name = "phase_blur"
+
+    def __init__(self, config: PhaseBlurConfig):
+        self.config = config
+
+    @classmethod
+    def from_params(cls, p: Params) -> "PhaseBlurStage":
+        return cls(PhaseBlurConfig.from_params(p))
+
+    def is_enabled(self) -> bool:
+        return self.config.strength > 1e-6
+
+    def process(self, ctx: DSPContext) -> None:
+        pb_idx = ctx.idx(self.config.start_hz, self.config.end_hz)
+        pb_amt = float(self.config.strength)
+        if pb_amt <= 1e-6 or pb_idx.size == 0:
+            return
+
+        phases = ctx.rng.uniform(0.0, 2.0 * np.pi, size=ctx.Z[pb_idx].shape[:2]).astype(np.float32)
+        zph = (np.cos(phases) + 1j * np.sin(phases)).astype(np.complex64)[:, :, None]
+        mix_v = pb_amt
+        if self.config.harmonic_only:
+            mag_pb = ctx.Mag_mono[pb_idx, :]
+            L = np.log(mag_pb + ctx.eps)
+            H = median_filter(L, size=(1, self.config.hpss_time_frames), mode='nearest')
+            P = median_filter(L, size=(self.config.hpss_freq_bins, 1), mode='nearest')
+            Hlin = np.exp(H)
+            Plin = np.exp(P)
+            Mh = Hlin ** 2 / (Hlin ** 2 + Plin ** 2 + ctx.eps)
+            mix_v = pb_amt * Mh
+
+        m = np.asarray(mix_v) if np.isscalar(mix_v) else np.asarray(mix_v)[:, :, None]
+        ctx.Z[pb_idx] = (1.0 - m) * ctx.Z[pb_idx] + m * (np.abs(ctx.Z[pb_idx]) * zph)
+
+
+class SwishRepairStage(DSPStage):
+    name = "swish_repair"
+
+    def __init__(self, config: SwishRepairConfig):
+        self.config = config
+
+    @classmethod
+    def from_params(cls, p: Params) -> "SwishRepairStage":
+        return cls(SwishRepairConfig.from_params(p))
+
+    def is_enabled(self) -> bool:
+        return self.config.strength > 1e-6
+
+    def process(self, ctx: DSPContext) -> None:
+        sw_idx = ctx.idx(self.config.start_hz, self.config.end_hz)
+        swish_amt = float(self.config.strength)
+        if swish_amt <= 1e-6 or sw_idx.size == 0:
+            return
+
+        _apply_swish_phase_repair(
+            ctx.Z,
+            sw_idx,
+            strength=swish_amt,
+            time_amt=self.config.time_amt,
+            freq_amt=self.config.freq_amt,
+            time_win=self.config.time_win,
+            freq_win=self.config.freq_win,
+            w_nontrans=ctx.w_nontrans,
+            transient_protect=self.config.transient_protect,
+            harmonic_protect=self.config.harmonic_protect,
+            Mag_mono=ctx.Mag_mono,
+            hpss_time_frames=self.config.hpss_time_frames,
+            hpss_freq_bins=self.config.hpss_freq_bins,
+            eps=ctx.eps,
+        )
+
+
+class HFDecorrelationStage(DSPStage):
+    name = "hf_decorrelation"
+
+    def __init__(self, config: HFDecorrelationConfig):
+        self.config = config
+
+    @classmethod
+    def from_params(cls, p: Params) -> "HFDecorrelationStage":
+        return cls(HFDecorrelationConfig.from_params(p))
+
+    def is_enabled(self) -> bool:
+        return self.config.strength > 1e-6
+
+    def process(self, ctx: DSPContext) -> None:
+        hdc_idx = ctx.idx(self.config.start_hz, self.config.end_hz)
+        hdc_amt = float(self.config.strength)
+        if hdc_amt <= 1e-6 or hdc_idx.size == 0 or ctx.n_ch < 2:
+            return
+
+        _apply_hf_decorrelation(ctx.Z, hdc_idx, amount=hdc_amt, rng=ctx.rng, eps=ctx.eps)
+
+
+class DSPPipeline:
+    def __init__(self, stages: Optional[List[DSPStage]] = None):
+        self.stages: List[DSPStage] = list(stages) if stages is not None else []
+
+    def add_stage(self, stage: DSPStage) -> "DSPPipeline":
+        self.stages.append(stage)
+        return self
+
+    def get_stage(self, name: str) -> Optional[DSPStage]:
+        for s in self.stages:
+            if s.name == name:
+                return s
+        return None
+
+    def process(self, ctx: DSPContext) -> None:
+        for stage in self.stages:
+            if stage.is_enabled():
+                stage.process(ctx)
+
+
+def build_default_pipeline(p: Params) -> DSPPipeline:
+    return DSPPipeline([
+        ExpanderStage.from_params(p),
+        SmartDenoiseStage.from_params(p),
+        DeResonatorStage.from_params(p),
+        ShimmerStage.from_params(p),
+        GainApplicationStage.from_params(p),
+        DynamicCarverStage.from_params(p),
+        NoiseResynthStage.from_params(p),
+        PhaseBlurStage.from_params(p),
+        SwishRepairStage.from_params(p),
+        HFDecorrelationStage.from_params(p),
+    ])
+
+
+# -----------------------------
 # Core STFT repair
 # -----------------------------
 def process_stft(x: np.ndarray, sr: int, p: Params, dbg: Optional[DebugCollector] = None,
-                 diagnostics: Optional[Dict[str, Any]] = None) -> np.ndarray:
+                 diagnostics: Optional[Dict[str, Any]] = None,
+                 *, pipeline: Optional[DSPPipeline] = None) -> np.ndarray:
     """Repair the wet signal; mix and delta always reference the original samples."""
     global _LAST_ARTIFACT_CONF_FRAMES
     _LAST_ARTIFACT_CONF_FRAMES = None
@@ -1121,52 +2171,28 @@ def process_stft(x: np.ndarray, sr: int, p: Params, dbg: Optional[DebugCollector
             diagnostics["tonal"] = {"enabled": True, "status": "bypassed", "changed_partials": 0}
 
         return (np.zeros_like(dry) if p.delta_listen else dry.copy()).squeeze()
-    
+
     # --- High-Fidelity Step 1: Align Left/Right micro-delays (Time Domain) ---
     if p.enhance:
         x = align_lr_delay(x, sr)
-    
+
     x_t = x.T
     n_ch, n_samples = x_t.shape
-    
-    n_fft = int(p.n_fft)
-    hop = int(p.hop)
-    
+
+    n_fft = p.n_fft
+    hop = p.hop
+
     f, t_sec, Z = stft(x_t, fs=sr, window='hann', nperseg=n_fft, noverlap=n_fft-hop, nfft=n_fft, boundary='zeros', padded=True, axis=-1)
     Z = Z.transpose(1, 2, 0).astype(np.complex64)
-    
+
     # --- High-Fidelity Step 2: Symmetric L/R spectral balancing (Spectral Domain) ---
     if p.enhance:
         Z = balance_lr_spectrum(Z)
-    
+
     freqs = f.astype(np.float32)
-    nyq = f[-1] if len(f) > 0 else 0.0
     n_cols = Z.shape[1]
     eps = 1e-12
     rng = np.random.default_rng(int(getattr(p, "seed", 0)))
-
-    # --- Indices helper ---
-    def _idx(lo_hz: float, hi_hz: float) -> np.ndarray:
-        lo = float(max(0.0, lo_hz))
-        hi = float(min(nyq, hi_hz))
-        if hi <= lo:
-            return np.array([], dtype=np.int64)
-        return np.where((freqs >= lo) & (freqs <= hi))[0]
-
-    # --- Pre-calc indices ---
-    sh_idx = _idx(p.start_hz, p.end_hz)
-    dn_idx = _idx(p.dn_start_hz, p.dn_end_hz)
-    deq_idx = _idx(p.deq_start_hz, p.deq_end_hz)
-    exp_idx = _idx(getattr(p, "exp_start_hz", 3000.0), getattr(p, "exp_end_hz", 8000.0))
-    hpss_idx = _idx(getattr(p, "hpss_start_hz", 3000.0), getattr(p, "hpss_end_hz", 8000.0))
-    pb_idx = _idx(getattr(p, "pb_start_hz", 3000.0), getattr(p, "pb_end_hz", 8000.0))
-    sw_idx = _idx(getattr(p, "swish_start_hz", 3500.0), getattr(p, "swish_end_hz", 14000.0))
-    hdc_idx = _idx(getattr(p, "hf_dec_start_hz", 4500.0), getattr(p, "hf_dec_end_hz", 16000.0))
-
-    # --- Tapers ---
-    w_sh = _edge_taper(freqs, sh_idx, p.start_hz, p.end_hz, p.edge_hz)[:, None]
-    w_dn = _edge_taper(freqs, dn_idx, p.dn_start_hz, p.dn_end_hz, p.dn_edge_hz)[:, None]
-    w_deq = _edge_taper(freqs, deq_idx, p.deq_start_hz, p.deq_end_hz, p.deq_edge_hz)[:, None]
 
     # --- Base Magnitude / PSD ---
     Mag = np.abs(Z)
@@ -1177,19 +2203,29 @@ def process_stft(x: np.ndarray, sr: int, p: Params, dbg: Optional[DebugCollector
     mask_psd = _calculate_psychoacoustic_mask(PSD, freqs)
 
     # --- Global Features ---
-    def calc_flatness(P_region):
-        log_P = np.log(P_region + eps)
-        return np.exp(np.mean(log_P, axis=0)) / (np.mean(P_region, axis=0) + eps)
-        
-    flat_full = calc_flatness(PSD)
+    log_P = np.log(PSD + eps)
+    flat_full = np.exp(np.mean(log_P, axis=0)) / (np.mean(PSD, axis=0) + eps)
     band_db_full = 10.0 * np.log10(np.mean(PSD, axis=0) + eps)
-    
+
     w_noise_full = np.clip((flat_full - p.flat_start) / max(1e-6, p.flat_end - p.flat_start), 0.0, 1.0)
-    
+
     flux = np.zeros_like(band_db_full)
     flux[1:] = np.maximum(0.0, band_db_full[1:] - band_db_full[:-1])
     w_trans = np.clip((flux - p.flux_thr_db) / max(1e-6, p.flux_range_db), 0.0, 1.0)
     w_nontrans = 1.0 - w_trans
+
+    # --- Psychoacoustic Forward Temporal Masking Decay ---
+    if getattr(p, "temporal_masking", True):
+        mask_psd = apply_temporal_masking_decay(
+            mask_psd,
+            sr=sr,
+            hop=hop,
+            decay_ms=float(getattr(p, "mask_decay_ms", 15.0)),
+            flatness=flat_full,
+            flat_start=p.flat_start,
+            flat_end=p.flat_end,
+            gated=bool(getattr(p, "mask_flat_gate", True)),
+        )
 
     # Mid/Side channel depth scales (stereo only)
     ms_enabled = bool(getattr(p, "ms_process", False)) and n_ch >= 2
@@ -1198,18 +2234,11 @@ def process_stft(x: np.ndarray, sr: int, p: Params, dbg: Optional[DebugCollector
         ch_scales[0] = 1.0
         ch_scales[1] = float(np.clip(getattr(p, "ms_side_scale", 0.35), 0.0, 1.0))
 
-    Z_orig = Z.copy()
-    g_total = np.ones((freqs.size, n_cols), dtype=np.float32)
-    cap_db = 48.0 if bool(getattr(p, "nuclear_mode", False)) else float(getattr(p, "total_att_cap_db", 12.0))
-    g_min = float(10.0 ** (-max(0.0, cap_db) / 20.0))
-
     hpss_on = bool(getattr(p, "hpss", False))
     hpss_tf = int(getattr(p, "hpss_time_frames", 21))
     hpss_ff = int(getattr(p, "hpss_freq_bins", 17))
     hpss_harm = bool(getattr(p, "hpss_harmonic_only", True))
     hpss_prot = float(getattr(p, "hpss_protect_percussive", 0.0))
-    use_inpaint = bool(getattr(p, "magnitude_inpaint", True))
-    use_deq_inpaint = bool(getattr(p, "deq_inpaint", True)) and use_inpaint
 
     def _depth_scale_for(band_idx: np.ndarray) -> np.ndarray:
         if not hpss_on or band_idx.size == 0:
@@ -1217,350 +2246,50 @@ def process_stft(x: np.ndarray, sr: int, p: Params, dbg: Optional[DebugCollector
         Mh = _hpss_mask_for_band(Mag_mono, band_idx, time_frames=hpss_tf, freq_bins=hpss_ff, eps=eps)
         return _hpss_depth_scale(Mh, harmonic_only=hpss_harm, protect_percussive=hpss_prot)
 
-    artifact_conf_parts: list[np.ndarray] = []
+    g_total = np.ones((freqs.size, n_cols), dtype=np.float32)
 
-    # --- (0) Expander ---
-    if bool(getattr(p, "expander", False)) and exp_idx.size:
-        band_p_exp = np.mean(PSD[exp_idx, :], axis=0)
-        band_db_exp = 10.0 * np.log10(band_p_exp + eps)
-        thr = float(getattr(p, "exp_threshold_db", -45.0))
-        ratio = float(max(1.0, getattr(p, "exp_ratio", 2.0)))
-        
-        red_db = np.zeros_like(band_db_exp)
-        mask = band_db_exp < thr
-        red_db[mask] = (thr - band_db_exp[mask]) * (ratio - 1.0)
-        g_target = 10.0 ** (-red_db / 20.0)
-        
-        att = _frame_coeff(hop, sr, getattr(p, "exp_attack_ms", 10.0))
-        rel = _frame_coeff(hop, sr, getattr(p, "exp_release_ms", 150.0))
-        if HAS_NUMBA:
-            g_target = g_target.astype(np.float32)
-            g_env = _numba_exp_env(g_target, n_cols, att, rel)
-        else:
-            g_env = np.ones_like(g_target)
-            g_sm = 1.0
-            for i in range(n_cols):
-                curr = g_target[i]
-                if curr < g_sm: g_sm = att * g_sm + (1.0 - att) * curr
-                else: g_sm = rel * g_sm + (1.0 - rel) * curr
-                g_env[i] = g_sm
-            
-        g_total[exp_idx, :] *= g_env.astype(np.float32, copy=False)
+    ctx = DSPContext(
+        Z=Z,
+        Z_orig=Z.copy(),
+        Mag=Mag,
+        Mag_mono=Mag_mono,
+        PSD=PSD,
+        freqs=freqs,
+        g_total=g_total,
+        mask_psd=mask_psd,
+        flat_full=flat_full,
+        band_db_full=band_db_full,
+        w_noise_full=w_noise_full,
+        flux=flux,
+        w_trans=w_trans,
+        w_nontrans=w_nontrans,
+        sr=sr,
+        hop=hop,
+        n_fft=n_fft,
+        n_cols=n_cols,
+        n_ch=n_ch,
+        ms_enabled=ms_enabled,
+        ch_scales=ch_scales,
+        eps=eps,
+        rng=rng,
+        depth_scale_for=_depth_scale_for,
+    )
 
-    g_eff_dn_map: Optional[np.ndarray] = None
-    g_eff_deq_map: Optional[np.ndarray] = None
-    g_eff_sh_map: Optional[np.ndarray] = None
-    noise_psd_dn_db_map: Optional[np.ndarray] = None
-    dn_depth_map: Optional[np.ndarray] = None
-    deq_depth_map: Optional[np.ndarray] = None
-    sh_depth_map: Optional[np.ndarray] = None
+    if pipeline is None:
+        pipeline = build_default_pipeline(p)
 
-    # --- (A) Smart Denoise (Ephraim-Malah Decision-Directed SNR) ---
-    dn_str = float(np.clip(p.denoise, 0.0, 1.0))
-    if dn_str > 1e-6 and dn_idx.size:
-        psd_dn = PSD[dn_idx, :]
-        a_psd = _frame_coeff(hop, sr, p.dn_psd_smooth_ms)
-        psd_sm_map = lfilter([1.0-a_psd], [1.0, -a_psd], psd_dn, axis=1)
-        
-        minwin = max(4, int(sr * p.dn_minwin_ms / 1000.0 / hop))
-        n_blocks = int(np.ceil(n_cols / minwin))
-        pad_t = n_blocks * minwin - n_cols
-        p_padded = np.pad(psd_sm_map, ((0,0), (0, pad_t)), constant_values=np.inf)
-        p_reshaped = p_padded.reshape(psd_dn.shape[0], n_blocks, minwin)
-        curr_min = np.min(p_reshaped, axis=2)
-        
-        rise = 10.0 ** ((p.dn_up_db_per_s * (minwin*hop/sr))/10.0)
-        curr_noise_vec = psd_dn[:, 0]
-        if HAS_NUMBA:
-            curr_min = curr_min.astype(np.float32)
-            curr_noise_vec = curr_noise_vec.astype(np.float32)
-            noise_est_blocks = _numba_dn_noise_est(curr_min, n_blocks, curr_noise_vec, rise)
-        else:
-            noise_est_blocks = np.zeros_like(curr_min)
-            for b in range(n_blocks):
-                M = curr_min[:, b]
-                curr_noise_vec = np.minimum(M, curr_noise_vec * rise)
-                noise_est_blocks[:, b] = curr_noise_vec
-        
-        noise_map = np.repeat(noise_est_blocks, minwin, axis=1)[:, :n_cols]
-        
-        F_dn, T_dn = psd_dn.shape
-        dn_g = np.ones((F_dn, n_cols), dtype=np.float32)
-        alpha_dd = 0.98
-        prev_clean_psd = psd_dn[:, 0]
-        
-        for ti in range(n_cols):
-            noise_psd = noise_map[:, ti] + eps
-            current_psd = psd_dn[:, ti]
-            
-            gamma = current_psd / noise_psd
-            xi = alpha_dd * (prev_clean_psd / noise_psd) + (1.0 - alpha_dd) * np.maximum(0.0, gamma - 1.0)
-            xi = np.maximum(xi, 10.0 ** (-max(12.0, abs(p.dn_floor_db)) / 10.0))
-            
-            g_inst_frame = xi / (xi + 1.0)
-            
-            floor = 10.0**(p.dn_floor_db/20.0)
-            g_inst_frame = np.clip(floor + (1.0 - floor) * g_inst_frame, floor, 1.0)
-            
-            dn_g[:, ti] = g_inst_frame
-            prev_clean_psd = (g_inst_frame ** 2) * current_psd
-        
-        if p.dn_freq_smooth_bins > 1:
-            dn_g = uniform_filter1d(dn_g, size=int(p.dn_freq_smooth_bins), axis=0, mode='nearest')
-            
-        hpss_dn = _depth_scale_for(dn_idx)
-        depth_base = dn_str * (0.5 + 0.5 * w_noise_full) * w_nontrans
-        depth_map = depth_base[None, :] * w_dn * hpss_dn
-        g_eff = 1.0 - depth_map * (1.0 - dn_g)
-        g_total[dn_idx, :] *= g_eff.astype(np.float32, copy=False)
-        g_eff_dn_map = g_eff.astype(np.float32, copy=False)
-        dn_depth_map = depth_base.astype(np.float32, copy=False)
-        noise_psd_dn_db_map = (10.0 * np.log10(noise_map + eps)).astype(np.float32, copy=False)
-
-    # --- (B) De-resonator ---
-    deres_str = float(np.clip(p.deres, 0.0, 1.0))
-    if deres_str > 1e-6 and deq_idx.size:
-        L = np.log(Mag_mono[deq_idx, :] + eps)
-        L_med = median_filter(L, size=(int(p.deq_freq_med_bins), 1), mode='nearest')
-        resid = (L - L_med) * (20.0 / np.log(10.0))
-        
-        thr_eff = p.deq_thr_db + p.deq_tonal_boost_db * (1.0 - w_noise_full)
-        pos = np.maximum(0.0, resid - thr_eff[None, :])
-
-        if bool(getattr(p, "deq_time_floor", False)):
-            psd_deq = PSD[deq_idx, :].astype(np.float32, copy=False)
-            a_floor = _frame_coeff(hop, sr, float(getattr(p, "deq_floor_smooth_ms", 80.0)))
-            psd_floor_sm = lfilter([1.0 - a_floor], [1.0, -a_floor], psd_deq, axis=1)
-
-            rise_lin = float(10.0 ** ((float(getattr(p, "deq_floor_rise_db_per_s", 1.0)) * (float(hop) / float(sr))) / 10.0))
-            floor_env = np.empty_like(psd_floor_sm)
-            floor_env[:, 0] = psd_floor_sm[:, 0]
-            for ti in range(1, n_cols):
-                prev = floor_env[:, ti - 1]
-                floor_env[:, ti] = np.minimum(prev * rise_lin, psd_floor_sm[:, ti])
-
-            floor_win = max(4, int(round(sr * 1.0 / hop)))
-            floor_map = minimum_filter1d(floor_env, size=floor_win, axis=1, mode="nearest")
-            floor_db = 10.0 * np.log10(floor_map + eps)
-            local_floor_db = median_filter(floor_db, size=(int(p.deq_freq_med_bins), 1), mode="nearest")
-            floor_thr = float(getattr(p, "deq_floor_thr_db", 3.0))
-            floor_excess = np.maximum(0.0, floor_db - local_floor_db - floor_thr)
-            pos = np.maximum(pos, floor_excess.astype(np.float32, copy=False))
-        
-        mask = pos > 0.0
-        dens = np.mean(mask, axis=0)
-        if bool(getattr(p, "deq_time_floor", False)):
-            w_narrow = np.ones(n_cols, dtype=np.float32)
-        else:
-            w_narrow = 1.0 - np.clip((dens - p.deq_density_lo)/(max(1e-6, p.deq_density_hi - p.deq_density_lo)), 0.0, 1.0)
-        
-        a_p = _frame_coeff(hop, sr, p.deq_persist_ms)
-        if HAS_NUMBA:
-            pos = pos.astype(np.float32)
-            persist_map = _numba_deq_persist(pos, n_cols, a_p)
-        else:
-            persist_map = np.zeros_like(pos)
-            state_p = np.zeros(pos.shape[0])
-            for i in range(n_cols):
-                state_p = a_p * state_p + (1.0 - a_p) * pos[:, i]
-                persist_map[:, i] = state_p
-            
-        gate = np.clip(persist_map / max(1e-6, p.deq_persist_thr_db), 0.0, 1.0)
-        att_db = np.minimum(p.deq_slope * pos * gate, p.deq_max_att_db)
-        gain = 10.0 ** (-att_db / 20.0)
-        
-        if p.deq_freq_smooth_bins > 1:
-            gain = uniform_filter1d(gain, size=int(p.deq_freq_smooth_bins), axis=0, mode='nearest')
-            
-        hpss_deq = _depth_scale_for(deq_idx)
-        depth_base = deres_str * w_nontrans * w_narrow
-        depth_map = depth_base[None, :] * w_deq * hpss_deq
-        conf_deq = np.clip(gate, 0.0, 1.0).astype(np.float32, copy=False)
-        artifact_conf_parts.append(conf_deq)
-
-        if use_deq_inpaint:
-            thr_lin = float(p.deq_thr_db) * (np.log(10.0) / 20.0)
-            target_mag = np.exp(L_med + thr_lin).astype(np.float32)
-            repair_depth = depth_map * conf_deq
-            Z_deq, g_eff = _apply_magnitude_inpaint(
-                Z_orig[deq_idx, :, :],
-                target_mag=target_mag,
-                repair_depth=repair_depth,
-                confidence=np.ones_like(conf_deq),
-                eps=eps,
-                ch_scales=ch_scales if ms_enabled else None,
-            )
-            g_total[deq_idx, :] *= g_eff
-        else:
-            g_eff = 1.0 - depth_map * (1.0 - gain)
-            g_total[deq_idx, :] *= g_eff.astype(np.float32, copy=False)
-        g_eff_deq_map = g_eff.astype(np.float32, copy=False)
-        deq_depth_map = depth_base.astype(np.float32, copy=False)
-
-    # --- (C) Shimmer ---
-    if sh_idx.size >= 8:
-        mag_sh = Mag_mono[sh_idx, :]
-        flat_sh = calc_flatness(mag_sh**2)
-        w_noise_sh = np.clip((flat_sh - p.flat_start)/max(1e-6, p.flat_end - p.flat_start), 0.0, 1.0)
-        
-        L = np.log(mag_sh + eps)
-        L_med = median_filter(L, size=(int(p.freq_med_bins), 1), mode='nearest')
-        resid = (L - L_med) * (20.0 / np.log(10.0))
-        
-        mask = resid > p.thr_db
-        dens = np.mean(mask, axis=0)
-        w_narrow = 1.0 - np.clip((dens - p.density_lo)/max(1e-6, p.density_hi - p.density_lo), 0.0, 1.0)
-
-        att_db = np.zeros_like(resid)
-        m2 = resid > p.thr_db
-        att_db[m2] = p.slope * (resid[m2] - p.thr_db)
-        gain = 10.0 ** (-att_db / 20.0)
-
-        hpss_sh = _depth_scale_for(sh_idx)
-        depth_base = w_noise_sh * w_nontrans * w_narrow
-        depth_map = depth_base[None, :] * w_sh * hpss_sh
-        conf_sh = np.clip((resid - float(p.thr_db)) / max(1e-6, float(p.thr_db)), 0.0, 1.0).astype(np.float32)
-        artifact_conf_parts.append(conf_sh)
-
-        if use_inpaint:
-            thr_lin = float(p.thr_db) * (np.log(10.0) / 20.0)
-            target_mag = np.exp(L_med + thr_lin).astype(np.float32)
-            repair_depth = depth_map * conf_sh
-            _Z_sh, g_eff = _apply_magnitude_inpaint(
-                Z_orig[sh_idx, :, :],
-                target_mag=target_mag,
-                repair_depth=repair_depth,
-                confidence=np.ones_like(conf_sh),
-                eps=eps,
-                ch_scales=ch_scales if ms_enabled else None,
-            )
-            g_total[sh_idx, :] *= g_eff
-        else:
-            g_eff = 1.0 - depth_map * (1.0 - gain)
-            g_total[sh_idx, :] *= g_eff.astype(np.float32, copy=False)
-        g_eff_sh_map = g_eff.astype(np.float32, copy=False)
-        sh_depth_map = depth_base.astype(np.float32, copy=False)
-
-    # --- Apply combined gain with cap and psychoacoustic bounds ---
-    proc_idx = np.unique(np.concatenate([
-        arr for arr in [exp_idx, dn_idx, deq_idx, sh_idx] if arr.size > 0
-    ])).astype(np.int64) if (exp_idx.size or dn_idx.size or deq_idx.size or sh_idx.size) else np.array([], dtype=np.int64)
-    
-    if proc_idx.size:
-        g_total[proc_idx, :] = np.maximum(g_total[proc_idx, :], g_min)
-        
-        g_min_allowed = np.minimum(1.0, np.sqrt(mask_psd[proc_idx, :] / (PSD[proc_idx, :] + eps)))
-        g_total[proc_idx, :] = np.maximum(g_total[proc_idx, :], g_min_allowed)
-        
-        Z = Z_orig.copy()
-        g_apply = g_total[proc_idx, :].astype(np.float32, copy=False)
-        
-        if ms_enabled and n_ch >= 2:
-            left = Z_orig[proc_idx, :, 0]
-            right = Z_orig[proc_idx, :, 1]
-            mid = 0.5 * (left + right)
-            side = 0.5 * (left - right)
-            
-            phase_diff = np.angle(side + eps) - np.angle(mid + eps)
-            
-            mid_new = mid * g_apply
-            
-            s_scale = float(getattr(p, "ms_side_scale", 0.35))
-            g_side = 1.0 - (1.0 - g_apply) * s_scale
-            side_mag_new = np.abs(side) * g_side
-            
-            side_new = side_mag_new * np.exp(1j * (np.angle(mid_new + eps) + phase_diff))
-            
-            Z[proc_idx, :, 0] = mid_new + side_new
-            Z[proc_idx, :, 1] = mid_new - side_new
-            
-            if n_ch > 2:
-                for ci in range(2, n_ch):
-                    Z[proc_idx, :, ci] = Z_orig[proc_idx, :, ci] * g_apply
-        else:
-            Z[proc_idx, :, :] = Z_orig[proc_idx, :, :] * g_apply[:, :, None]
-    else:
-        Z = Z_orig.copy()
-
-    # --- High-Fidelity Step 3: Dynamic Spectral Carving (Spectral Domain) ---
-    if p.enhance:
-        Z = dynamic_spectral_carver(Z, freqs)
+    pipeline.process(ctx)
+    Z = ctx.Z
 
     # Track artifact confidence
     artifact_conf_frames = None
-
-    if artifact_conf_parts:
+    if ctx.artifact_conf_parts:
         conf_per_frame = np.zeros(n_cols, dtype=np.float32)
-        for part in artifact_conf_parts:
+        for part in ctx.artifact_conf_parts:
             conf_per_frame = np.maximum(conf_per_frame, np.max(part, axis=0))
         artifact_conf_frames = conf_per_frame.reshape(1, -1)
 
     _LAST_ARTIFACT_CONF_FRAMES = artifact_conf_frames
-
-    # --- Shimmer noise resynth (post-gain) ---
-    if sh_idx.size >= 8 and float(p.noise_resynth) > 0.0:
-        nr = float(p.noise_resynth)
-        flat_sh = calc_flatness(Mag_mono[sh_idx, :] ** 2)
-        w_noise_sh = np.clip((flat_sh - p.flat_start)/max(1e-6, p.flat_end - p.flat_start), 0.0, 1.0)
-        L = np.log(Mag_mono[sh_idx, :] + eps)
-        L_med = median_filter(L, size=(int(p.freq_med_bins), 1), mode='nearest')
-        resid = (L - L_med) * (20.0 / np.log(10.0))
-        mask = resid > p.thr_db
-        dens = np.mean(mask, axis=0)
-        w_narrow = 1.0 - np.clip((dens - p.density_lo)/max(1e-6, p.density_hi - p.density_lo), 0.0, 1.0)
-        hpss_sh = _depth_scale_for(sh_idx)
-        depth_map = (nr * w_noise_sh * w_nontrans * w_narrow)[None, :] * w_sh * hpss_sh
-        phases = rng.uniform(0.0, 2.0 * np.pi, size=Z[sh_idx].shape[:2]).astype(np.float32)
-        zph = np.cos(phases) + 1j * np.sin(phases)
-        zph = zph[:, :, None]
-        d = depth_map[:, :, None]
-        if ms_enabled:
-            d = d * ch_scales.astype(np.float32)[None, None, :]
-        Z[sh_idx] = (1.0 - d) * Z[sh_idx] + d * (np.abs(Z[sh_idx]) * zph)
-
-    # --- (D) HPSS & Phase Blur ---
-    pb_amt = float(p.phase_blur)
-    if pb_amt > 1e-6 and pb_idx.size:
-        phases = rng.uniform(0.0, 2.0 * np.pi, size=Z[pb_idx].shape[:2]).astype(np.float32)
-        zph = (np.cos(phases) + 1j * np.sin(phases)).astype(np.complex64)
-        zph = zph[:, :, None]
-        mix_v = pb_amt
-        if bool(getattr(p, "pb_harmonic_only", True)):
-             mag_pb = Mag_mono[pb_idx, :]
-             L = np.log(mag_pb + eps)
-             H = median_filter(L, size=(1, int(p.hpss_time_frames)), mode='nearest')
-             P = median_filter(L, size=(int(p.hpss_freq_bins), 1), mode='nearest')
-             Hlin = np.exp(H); Plin = np.exp(P)
-             Mh = Hlin**2 / (Hlin**2 + Plin**2 + eps)
-             mix_v = pb_amt * Mh
-        
-        m = mix_v if np.isscalar(mix_v) else mix_v[:, :, None]
-        Z[pb_idx] = (1.0 - m) * Z[pb_idx] + m * (np.abs(Z[pb_idx]) * zph)
-
-    # --- (E) Swish repair: adaptive phase coherence smoothing ---
-    swish_amt = float(getattr(p, "swish_repair", 0.0))
-    if swish_amt > 1e-6 and sw_idx.size:
-        _apply_swish_phase_repair(
-            Z,
-            sw_idx,
-            strength=swish_amt,
-            time_amt=float(getattr(p, "swish_time_amt", 0.55)),
-            freq_amt=float(getattr(p, "swish_freq_amt", 0.30)),
-            time_win=int(getattr(p, "swish_time_win", 7)),
-            freq_win=int(getattr(p, "swish_freq_win", 5)),
-            w_nontrans=w_nontrans,
-            transient_protect=float(getattr(p, "swish_transient_protect", 0.85)),
-            harmonic_protect=float(getattr(p, "swish_harmonic_protect", 0.45)),
-            Mag_mono=Mag_mono,
-            hpss_time_frames=hpss_tf,
-            hpss_freq_bins=hpss_ff,
-            eps=eps,
-        )
-
-    # --- (F) HF stereo decorrelation ---
-    hdc_amt = float(getattr(p, "hf_decorrelate", 0.0))
-    if hdc_amt > 1e-6 and hdc_idx.size and n_ch >= 2:
-        _apply_hf_decorrelation(Z, hdc_idx, amount=hdc_amt, rng=rng, eps=eps)
 
     # --- Debug collection ---
     if dbg is not None:
@@ -1571,9 +2300,13 @@ def process_stft(x: np.ndarray, sr: int, p: Params, dbg: Optional[DebugCollector
                 return None
             return (-20.0 * np.log10(np.clip(g_map, 1e-6, 1.0))).astype(np.float32, copy=False)
 
-        att_dn_db_map = _att_db_from_gain(g_eff_dn_map)
-        att_deq_db_map = _att_db_from_gain(g_eff_deq_map)
-        att_sh_db_map = _att_db_from_gain(g_eff_sh_map)
+        att_dn_db_map = _att_db_from_gain(ctx.debug_maps.get("g_eff_dn_map"))
+        att_deq_db_map = _att_db_from_gain(ctx.debug_maps.get("g_eff_deq_map"))
+        att_sh_db_map = _att_db_from_gain(ctx.debug_maps.get("g_eff_sh_map"))
+        noise_psd_dn_db_map = ctx.debug_maps.get("noise_psd_dn_db_map")
+        dn_depth_map = ctx.debug_maps.get("dn_depth_map")
+        deq_depth_map = ctx.debug_maps.get("deq_depth_map")
+        sh_depth_map = ctx.debug_maps.get("sh_depth_map")
 
         for fi in range(n_cols):
             if dbg.want():
@@ -1654,7 +2387,7 @@ def hf_resynth_post(x: np.ndarray, sr: int, p: Params, *, artifact_conf: Optiona
 
     def lr4_sos(kind: str, hz: float):
         s = _butter_sos(sr, kind, float(hz), order=2)
-        return np.concatenate([s, s], axis=0)
+        return np.concatenate([np.asarray(s), np.asarray(s)], axis=0)
 
     def _sos_apply(sos, sig):
         y = sosfilt(sos, sig, axis=0)
@@ -1698,7 +2431,7 @@ def hf_resynth_post(x: np.ndarray, sr: int, p: Params, *, artifact_conf: Optiona
     if conf_frames is None or conf_frames.size == 0:
         return y_full.squeeze()
 
-    hop = int(p.hop)
+    hop = p.hop
     n_samp = x2.shape[0]
     conf_t = np.mean(conf_frames, axis=0).astype(np.float32)
     t_frames = np.arange(conf_t.size, dtype=np.float32) * (hop / float(sr))
@@ -1728,8 +2461,8 @@ def _compute_mag_spectrogram_db(x: np.ndarray, sr: int, n_fft: int, hop: int, ma
     x = np.asarray(x, dtype=np.float32)
     if x.ndim > 1:
         x = np.mean(x, axis=1)
-    n_fft = int(max(256, n_fft))
-    hop = int(max(1, hop))
+    n_fft = max(256, n_fft)
+    hop = max(1, hop)
 
     freqs = np.fft.rfftfreq(n_fft, d=1.0 / sr)
     f_mask = freqs <= float(min(0.5 * sr, max_hz))
@@ -1785,7 +2518,8 @@ def render_debug(
 
     if dp.save_npz:
         npz_path = os.path.join(dbg_dir, "debug_data.npz")
-        np.savez_compressed(npz_path, **{k: v for k, v in dbg_data.items() if isinstance(v, np.ndarray)})
+        arrays = dict((k, v) for k, v in dbg_data.items() if isinstance(v, np.ndarray))
+        np.savez_compressed(npz_path, **arrays)  # type: ignore[arg-type]
 
     _write_json(os.path.join(dbg_dir, "summary.json"), summary)
 
@@ -1812,9 +2546,9 @@ def render_debug(
     # input spectrogram
     fig = plt.figure()
     ax = fig.add_subplot(111)
-    im = ax.imshow(S0, origin="lower", aspect="auto",
-                   extent=[float(t[0]) if t.size else 0.0, float(t[-1]) if t.size else 0.0,
-                           float(f[0]) if f.size else 0.0, float(f[-1]) if f.size else 0.0])
+    ext: tuple[float, float, float, float] = (float(t[0]) if t.size else 0.0, float(t[-1]) if t.size else 0.0,
+                                                float(f[0]) if f.size else 0.0, float(f[-1]) if f.size else 0.0)
+    im = ax.imshow(S0, origin="lower", aspect="auto", extent=ext)
     ax.set_title("Spectrogram (input) [dB]")
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Frequency (Hz)")
@@ -1824,9 +2558,7 @@ def render_debug(
     # output spectrogram
     fig = plt.figure()
     ax = fig.add_subplot(111)
-    im = ax.imshow(S1, origin="lower", aspect="auto",
-                   extent=[float(t[0]) if t.size else 0.0, float(t[-1]) if t.size else 0.0,
-                           float(f[0]) if f.size else 0.0, float(f[-1]) if f.size else 0.0])
+    im = ax.imshow(S1, origin="lower", aspect="auto", extent=ext)
     ax.set_title("Spectrogram (output) [dB]")
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Frequency (Hz)")
@@ -1837,9 +2569,7 @@ def render_debug(
     Sd = (S1 - S0).astype(np.float32)
     fig = plt.figure()
     ax = fig.add_subplot(111)
-    im = ax.imshow(Sd, origin="lower", aspect="auto",
-                   extent=[float(t[0]) if t.size else 0.0, float(t[-1]) if t.size else 0.0,
-                           float(f[0]) if f.size else 0.0, float(f[-1]) if f.size else 0.0])
+    im = ax.imshow(Sd, origin="lower", aspect="auto", extent=ext)
     ax.set_title("Spectrogram (output - input) [dB]")
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Frequency (Hz)")
@@ -1858,8 +2588,8 @@ def render_debug(
             return
         fig = plt.figure()
         ax = fig.add_subplot(111)
-        extent = [float(t_frames[0]), float(t_frames[-1]), float(F[0]), float(F[-1])]
-        im = ax.imshow(A, origin="lower", aspect="auto", extent=extent)
+        ext_att: tuple[float, float, float, float] = (float(t_frames[0]), float(t_frames[-1]), float(F[0]), float(F[-1]))
+        im = ax.imshow(A, origin="lower", aspect="auto", extent=ext_att)
         ax.set_title(f"Attenuation map: {name} [dB]")
         ax.set_xlabel("Time (s)")
         ax.set_ylabel("Frequency (Hz)")
@@ -2204,8 +2934,8 @@ def main() -> int:
     )
 
     summary: Dict[str, Any] = {
-        "sr": int(sr),
-        "channels": int(x.shape[1]),
+        "sr": sr,
+        "channels": x.shape[1],
         "duration_s": float(x.shape[0] / sr),
         "params": asdict(p),
         "master_params": asdict(mp),
@@ -2222,7 +2952,7 @@ def main() -> int:
     dbg_collector = None
     dbg_data: Dict[str, Any] = {}
     if dp.enabled:
-        n_fft = int(p.n_fft)
+        n_fft = p.n_fft
         freqs = np.fft.rfftfreq(n_fft, d=1.0 / sr)
         nyq = float(freqs[-1])
 

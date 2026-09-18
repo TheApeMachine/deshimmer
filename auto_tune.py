@@ -104,14 +104,14 @@ def _to_mono_float(x: np.ndarray) -> np.ndarray:
 def _slice(x: np.ndarray, sr: int, t0: float, dur: float) -> np.ndarray:
     if x.ndim == 1:
         n = x.shape[0]
-        s0 = int(round(max(0.0, t0) * sr))
-        s1 = int(round(max(0.0, t0 + dur) * sr))
+        s0 = round(max(0.0, t0) * sr)
+        s1 = round(max(0.0, t0 + dur) * sr)
         s0 = max(0, min(n, s0))
         s1 = max(s0, min(n, s1))
         return x[s0:s1]
     n = x.shape[0]
-    s0 = int(round(max(0.0, t0) * sr))
-    s1 = int(round(max(0.0, t0 + dur) * sr))
+    s0 = round(max(0.0, t0) * sr)
+    s1 = round(max(0.0, t0 + dur) * sr)
     s0 = max(0, min(n, s0))
     s1 = max(s0, min(n, s1))
     return x[s0:s1, :]
@@ -311,17 +311,17 @@ def _detect_shimmer_band(
         densities.append(density)
         peak_db_per_center.append(peak_db)
 
-    densities = np.asarray(densities, dtype=np.float32)
-    peaks = np.asarray(peak_db_per_center, dtype=np.float32)
-    if densities.size == 0 or float(densities.max()) <= 0.0:
+    dens_arr = np.asarray(densities, dtype=np.float32)
+    peaks_arr = np.asarray(peak_db_per_center, dtype=np.float32)
+    if dens_arr.size == 0 or float(dens_arr.max()) <= 0.0:
         return (5100.0, 7200.0, 0.0)
 
-    knee = max(0.05, 0.5 * float(densities.max()))
-    above = densities >= knee
+    knee = max(0.05, 0.5 * float(dens_arr.max()))
+    above = dens_arr >= knee
     if not above.any():
-        i = int(np.argmax(densities))
+        i = int(np.argmax(dens_arr))
         c = float(centers[i])
-        return (max(20.0, c - win_hz / 2.0 - 200.0), min(nyq - 50.0, c + win_hz / 2.0 + 200.0), float(peaks[i]))
+        return (max(20.0, c - win_hz / 2.0 - 200.0), min(nyq - 50.0, c + win_hz / 2.0 + 200.0), float(peaks_arr[i]))
 
     runs: list[tuple[int, int]] = []
     s = None
@@ -339,7 +339,7 @@ def _detect_shimmer_band(
     band_hi = float(min(nyq - 50.0, centers[e] + win_hz / 2.0 + 200.0))
     if band_hi - band_lo < 400.0:
         band_hi = min(nyq - 50.0, band_lo + 800.0)
-    peak_strength = float(np.mean(peaks[s:e + 1]))
+    peak_strength = float(np.mean(peaks_arr[s:e + 1]))
     return (band_lo, band_hi, peak_strength)
 
 
@@ -381,7 +381,7 @@ def analyze(
     base_params: Optional[_m.Params] = None,
 ) -> tuple[_m.Params, _m.MasterParams, AnalysisReport]:
     xm = _to_mono_float(x)
-    sr = int(sr)
+    sr = sr
     total_s = xm.shape[0] / float(sr)
     nyq = 0.5 * float(sr)
 
@@ -811,8 +811,8 @@ class EvaluationFailureLog:
     ):
         self.debug_dir = debug_dir
         self.path = os.path.join(debug_dir, "failed_trials.json")
-        self.planned_trials_per_stage = int(max(1, planned_trials_per_stage))
-        self.max_consecutive = int(max(1, max_consecutive))
+        self.planned_trials_per_stage = max(1, planned_trials_per_stage)
+        self.max_consecutive = max(1, max_consecutive)
         self.max_failure_rate = float(max(0.0, max_failure_rate))
         self.consecutive = 0
         self.total_failures = 0
@@ -857,10 +857,142 @@ class EvaluationFailureLog:
             f"[auto_tune] stage={stage} trial={trial_number} failed: {type(exc).__name__}: {exc}",
             file=sys.stderr,
         )
-        allowed_stage_failures = int(math.floor(self.max_failure_rate * self.planned_trials_per_stage))
+        allowed_stage_failures = math.floor(self.max_failure_rate * self.planned_trials_per_stage)
         return self.consecutive >= self.max_consecutive or (
             self.stage_failures.get(stage, 0) > max(1, allowed_stage_failures)
         )
+
+
+def build_synthetic_transition(
+    x: np.ndarray,
+    sr: int,
+    regions: list[Region],
+    *,
+    transition_dur: float = 1.0,
+) -> Optional[tuple[np.ndarray, int]]:
+    """
+    Synthetically splices the tail of a loud region into the head of a quiet region
+    (e.g., 1s loud + 1s quiet) to create an artificial dynamic boundary seam.
+    Returns (synthetic_audio, seam_sample_idx) or None if suitable contrasting regions
+    cannot be identified.
+    """
+    if len(regions) < 2:
+        return None
+
+    xm = np.asarray(x)
+    total_samples = xm.shape[0]
+
+    # Look for labeled loud and quiet regions first
+    loud_reg = next((r for r in regions if r.label == "loud"), None)
+    quiet_reg = next((r for r in regions if r.label == "quiet"), None)
+
+    # Fallback to computing RMS of regions if explicit labels not found
+    if loud_reg is None or quiet_reg is None:
+        rms_vals = []
+        for r in regions:
+            s0 = int(r.t0 * sr)
+            s1 = min(total_samples, s0 + int(r.dur * sr))
+            if s1 - s0 >= 1024:
+                seg = xm[s0:s1]
+                rms_vals.append((float(np.sqrt(np.mean(seg ** 2) + _EPS)), r))
+        if len(rms_vals) < 2:
+            return None
+        rms_vals.sort(key=lambda t: t[0])
+        quiet_reg = rms_vals[0][1]
+        loud_reg = rms_vals[-1][1]
+
+    if loud_reg == quiet_reg:
+        return None
+
+    dur_samples = max(2048, int(transition_dur * sr))
+
+    loud_s0 = int(loud_reg.t0 * sr)
+    loud_s1 = min(total_samples, loud_s0 + int(loud_reg.dur * sr))
+    if loud_s1 - loud_s0 < dur_samples:
+        loud_tail = xm[loud_s0:loud_s1]
+    else:
+        loud_tail = xm[loud_s1 - dur_samples:loud_s1]
+
+    quiet_s0 = int(quiet_reg.t0 * sr)
+    quiet_s1 = min(total_samples, quiet_s0 + int(quiet_reg.dur * sr))
+    if quiet_s1 - quiet_s0 < dur_samples:
+        quiet_head = xm[quiet_s0:quiet_s1]
+    else:
+        quiet_head = xm[quiet_s0:quiet_s0 + dur_samples]
+
+    seam_idx = loud_tail.shape[0]
+    synthetic = np.concatenate([loud_tail, quiet_head], axis=0)
+    return synthetic, seam_idx
+
+
+def score_transition_boundary(
+    x_trans: np.ndarray,
+    y_trans: np.ndarray,
+    sr: int,
+    seam_idx: int,
+    *,
+    window_ms: float = 150.0,
+) -> dict[str, float]:
+    """
+    Evaluates dynamic transition consistency across the synthetic seam:
+    - boundary_step_error: unnatural gating or squashing across the loud->quiet seam.
+    - boundary_pumping: gain fluctuation / hysteresis in the immediate quiet recovery frames.
+    - boundary_stereo_delta: stereo soundstage deviation across the transition boundary.
+    """
+    x2 = np.asarray(x_trans, dtype=np.float32)
+    y2 = np.asarray(y_trans, dtype=np.float32)
+
+    win_samples = max(512, int(sr * window_ms / 1000.0))
+    pre_start = max(0, seam_idx - win_samples)
+    post_end = min(x2.shape[0], seam_idx + win_samples)
+
+    if seam_idx - pre_start < 256 or post_end - seam_idx < 256:
+        return {
+            "boundary_step_error": 0.0,
+            "boundary_pumping": 0.0,
+            "boundary_stereo_delta": 0.0,
+        }
+
+    x_pre = x2[pre_start:seam_idx]
+    x_post = x2[seam_idx:post_end]
+    y_pre = y2[pre_start:seam_idx]
+    y_post = y2[seam_idx:post_end]
+
+    # 1. Loudness step preservation
+    rms_x_pre = float(np.sqrt(np.mean(x_pre ** 2) + _EPS))
+    rms_x_post = float(np.sqrt(np.mean(x_post ** 2) + _EPS))
+    rms_y_pre = float(np.sqrt(np.mean(y_pre ** 2) + _EPS))
+    rms_y_post = float(np.sqrt(np.mean(y_post ** 2) + _EPS))
+
+    step_x_db = 20.0 * math.log10(rms_x_pre / rms_x_post)
+    step_y_db = 20.0 * math.log10(rms_y_pre / rms_y_post)
+    boundary_step_error = float(abs(step_y_db - step_x_db))
+
+    # 2. Pumping in the initial recovery sub-blocks of the quiet section
+    post_len = post_end - seam_idx
+    sub_len = max(1, post_len // 3)
+    gains = []
+    for k in range(3):
+        k0 = seam_idx + k * sub_len
+        k1 = min(post_end, k0 + sub_len)
+        rk_x = float(np.sqrt(np.mean(x2[k0:k1] ** 2) + _EPS))
+        rk_y = float(np.sqrt(np.mean(y2[k0:k1] ** 2) + _EPS))
+        gains.append(rk_y / rk_x)
+
+    gain_variance = float(np.var(gains))
+    gain_gating = float(max(0.0, gains[-1] - gains[0]))
+    boundary_pumping = float(gain_variance * 100.0 + gain_gating * 10.0)
+
+    # 3. Stereo width jump across seam
+    w_x_post = _stereo_width_ratio(x_post)
+    w_y_post = _stereo_width_ratio(y_post)
+    boundary_stereo_delta = float(abs(w_y_post - w_x_post)) * 50.0
+
+    return {
+        "boundary_step_error": boundary_step_error,
+        "boundary_pumping": boundary_pumping,
+        "boundary_stereo_delta": boundary_stereo_delta,
+    }
 
 
 def _evaluate_params_multi(
@@ -875,12 +1007,14 @@ def _evaluate_params_multi(
     failure_log: EvaluationFailureLog | None = None,
     stage: str = "refine",
     trial_number: int | None = None,
+    transition_aware: bool = False,
+    variance_weight: float = 0.15,
 ) -> tuple[float, ...]:
     mp = _m.MasterParams(enabled=False)
     dp = _m.DebugParams(enabled=False)
     p_use = replace(p, delta_listen=False)
     context_s = preview_context_seconds(p_use)
-    objs_acc = np.zeros(len(OBJECTIVE_NAMES), dtype=np.float64)
+    objs_list: list[tuple[float, ...]] = []
     count = 0
     for r in regions:
         inset = max(0.0, (r.dur - refine_dur) * 0.5)
@@ -934,13 +1068,41 @@ def _evaluate_params_multi(
 
             raise
 
-        objs_acc += np.asarray(objectives, dtype=np.float64)
+        objs_list.append(objectives)
         count += 1
+
     if count == 0:
         raise ValueError("evaluation requires at least one scorable region")
     if failure_log is not None:
         failure_log.success(stage)
-    mean = objs_acc / float(count)
+
+    mean = np.mean(objs_list, axis=0)
+
+    if transition_aware and len(objs_list) > 1:
+        var_objs = np.var(objs_list, axis=0)
+        penalized = mean - variance_weight * var_objs
+
+        trans_data = build_synthetic_transition(x, sr, regions, transition_dur=min(1.0, refine_dur * 0.5))
+        if trans_data is not None:
+            x_trans, seam_idx = trans_data
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    y_trans, _ = process_audio(x_trans, sr, params=p_use, master_params=mp, debug_params=dp)
+                    b_metrics = score_transition_boundary(x_trans, y_trans, sr, seam_idx)
+                    boundary_penalty = (
+                        0.5 * b_metrics["boundary_step_error"]
+                        + 0.3 * b_metrics["boundary_pumping"]
+                        + 0.2 * b_metrics["boundary_stereo_delta"]
+                    )
+                    # Apply boundary penalty to loudness_tilt_preservation (index 4) and music_preservation (index 1)
+                    penalized[4] -= 0.5 * boundary_penalty
+                    penalized[1] -= 0.5 * boundary_penalty
+            except Exception:
+                pass
+
+        return tuple(float(value) for value in penalized)
+
     return tuple(float(value) for value in mean)
 
 
@@ -1047,6 +1209,7 @@ def refine(
     refine_dur: float = 3.0,
     debug_dir: Optional[str] = None,
     progress_cb: Optional[Callable[[float, str], None]] = None,
+    transition_aware: bool = True,
 ) -> tuple[_m.Params, dict[str, Any]]:
     try:
         import optuna
@@ -1058,7 +1221,7 @@ def refine(
         ) from e
 
     xm = np.asarray(x)
-    sr = int(sr)
+    sr = sr
     if regions is None or len(regions) == 0:
         regions = pick_regions(xm, sr, n=5, dur=max(refine_dur + 0.5, 5.0))
 
@@ -1079,6 +1242,7 @@ def refine(
     p_cur = replace(base_params, mix=1.0 if base_params.mix == 0.0 else base_params.mix)
     summary: dict[str, Any] = {
         "aggressiveness": float(aggressiveness),
+        "transition_aware": transition_aware,
         "regions": [{"t0": r.t0, "dur": r.dur, "label": r.label} for r in regions],
         "objective_weights": objective_weights.__dict__,
         "selection_weights": selection_weights.__dict__,
@@ -1120,6 +1284,7 @@ def refine(
         # Retain the current settings when every proposed change scores worse.
         baseline = _evaluate_params_multi(
             xm, sr, regions, p_cur, objective_weights, band, refine_dur,
+            transition_aware=transition_aware,
         )
         study.add_trial(optuna.trial.create_trial(values=baseline))
 
@@ -1136,6 +1301,7 @@ def refine(
                 failure_log=failure_log,
                 stage=_stage,
                 trial_number=int(getattr(trial, "number", -1)),
+                transition_aware=transition_aware,
             )
 
         trial_scores: list[float] = []
