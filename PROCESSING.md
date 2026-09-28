@@ -52,23 +52,12 @@ and pruned, never returned as apparently valid objective values. Each stage
 includes the incoming settings as a candidate and retains them when proposals
 score worse. Refining from bypass activates the wet mix that was evaluated.
 
-Run regression tests with the existing Python environment (standard-library
-`unittest`; no additional test dependency):
+Run regression tests with the test environment:
 
 ```sh
-.venv/bin/python -m unittest test_master test_auto_tune test_deshimmer_api test_ui_gradio test_tonal_tracking test_harmonic_field test_tonal_repair
-.venv/bin/python test_dynamic_spectral_carver.py
+uv run pytest
+# or: .venv/bin/pytest tests/
 ```
 
-Time the real pipeline using a stereo WAV:
+All 27 regression tests establish implementation behavior, channel alignment contracts, and numerical stability; they do not establish perceptual quality on an unseen track.
 
-```sh
-.venv/bin/python benchmark_pipeline.py YOUR_AUDIO.wav --seconds 3 --repeat 3 --compare-correlation
-.venv/bin/python benchmark_tonal_repair.py --seconds 2 --repeat 3
-```
-
-The benchmark warms each operation, reports median wall time and processing time
-divided by audio duration, and checks that FFT and direct correlation choose the
-same delay. The direct operation is a computational reference only. These tests
-and timings establish implementation behavior and runtime cost; they do not
-establish perceptual quality on an unseen track.

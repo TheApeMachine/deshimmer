@@ -1,0 +1,183 @@
+"""High-level Python API for processing audio without shelling out to the CLI."""
+
+from __future__ import annotations
+
+from dataclasses import asdict, replace
+from typing import Any, Dict, Optional, Tuple
+
+import numpy as np
+
+from .core import (
+    DebugCollector,
+    DebugParams,
+    MasterParams,
+    Params,
+    _as_2d,
+    _lin_to_db,
+    master_post,
+    measure_lufs,
+    measure_rms_dbfs,
+    measure_true_peak_db,
+    process_stft,
+)
+
+
+def preview_context_seconds(params: Optional[Params] = None) -> float:
+    """Lead-in/out duration so preview/refine match full-track stateful DSP."""
+    p = params if params is not None else Params()
+    return max(
+        1.5,
+        2.0 * float(getattr(p, "deq_persist_ms", 600.0)) / 1000.0,
+        2.0 * float(getattr(p, "dn_minwin_ms", 300.0)) / 1000.0,
+    )
+
+
+def _slice_samples(x: np.ndarray, sr: int, t0: float, dur: float) -> tuple[np.ndarray, int, int]:
+    n = x.shape[0]
+    s0 = int(round(max(0.0, t0) * sr))
+    s1 = int(round(max(0.0, t0 + dur) * sr))
+    s0 = max(0, min(n, s0))
+    s1 = max(s0, min(n, s1))
+    if x.ndim == 1:
+        return x[s0:s1], s0, s1
+    return x[s0:s1, :], s0, s1
+
+
+def slice_with_context(
+    x: np.ndarray,
+    sr: int,
+    t0: float,
+    dur: float,
+    *,
+    context_s: Optional[float] = None,
+    params: Optional[Params] = None,
+) -> tuple[np.ndarray, int, int, int]:
+    """
+    Slice audio with temporal context for stateful processing.
+
+    Returns (x_ctx, target_s0, target_s1, ctx_s0) where target_* are sample
+    indices in the original x for the requested [t0, t0+dur) window.
+    Trim processed output with y[target_s0 - ctx_s0 : target_s1 - ctx_s0].
+    """
+    ctx = preview_context_seconds(params) if context_s is None else float(context_s)
+    ctx_t0 = max(0.0, float(t0) - ctx)
+    ctx_dur = float(dur) + 2.0 * ctx
+    x_ctx, ctx_s0, _ = _slice_samples(x, sr, ctx_t0, ctx_dur)
+    _, target_s0, target_s1 = _slice_samples(x, sr, t0, dur)
+    return x_ctx, target_s0, target_s1, ctx_s0
+
+
+def process_audio(
+    x: np.ndarray,
+    sr: int,
+    *,
+    params: Optional[Params] = None,
+    master_params: Optional[MasterParams] = None,
+    debug_params: Optional[DebugParams] = None,
+    include_residuals: bool = False,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """
+    Process audio and return (y_out, info).
+
+    - x: (N,) or (N, C) float audio
+    - sr: sample rate
+    - params/master_params/debug_params: optional dataclass instances
+    """
+    if sr <= 0:
+        raise ValueError("sr must be > 0")
+
+    x2 = np.asarray(x, dtype=np.float32)
+    if x2.ndim == 1:
+        x2 = x2[:, None]
+    elif x2.ndim != 2:
+        raise ValueError("x must be 1D or 2D")
+
+    p = params if params is not None else Params()
+    mp = master_params if master_params is not None else MasterParams(enabled=False)
+    dp = debug_params if debug_params is not None else DebugParams(enabled=False)
+
+    # ---- Measurements (input) ----
+    info: Dict[str, Any] = {
+        "sr": int(sr),
+        "channels": int(x2.shape[1]),
+        "duration_s": float(x2.shape[0] / sr),
+        "params": asdict(p),
+        "master_params": asdict(mp),
+        "debug_params": asdict(dp),
+    }
+    info["measure_in"] = {
+        "sample_peak_dbfs": float(_lin_to_db(np.max(np.abs(x2)) + 1e-12)),
+        "true_peak_dbtp": float(measure_true_peak_db(x2, os_factor=max(1, int(mp.os_factor)))),
+        "rms_dbfs": float(measure_rms_dbfs(x2)),
+        "lufs": measure_lufs(x2, sr),
+    }
+
+    # ---- Optional debug collector ----
+    dbg_collector = None
+    if dp.enabled:
+        n_fft = int(p.n_fft)
+        freqs = np.fft.rfftfreq(n_fft, d=1.0 / sr)
+        nyq = float(freqs[-1])
+
+        def _idx(lo_hz: float, hi_hz: float) -> np.ndarray:
+            lo = float(max(0.0, lo_hz))
+            hi = float(min(nyq, hi_hz))
+            if hi <= lo:
+                return np.array([], dtype=np.int64)
+            return np.where((freqs >= lo) & (freqs <= hi))[0]
+
+        sh_idx = _idx(p.start_hz, p.end_hz)
+        dn_idx = _idx(p.dn_start_hz, p.dn_end_hz)
+        deq_idx = _idx(p.deq_start_hz, p.deq_end_hz)
+        pad_offset = n_fft if p.pad else 0
+        dbg_collector = DebugCollector(
+            sr=sr,
+            freqs=freqs,
+            dn_idx=dn_idx,
+            deq_idx=deq_idx,
+            sh_idx=sh_idx,
+            stride=int(max(1, dp.stride)),
+            pad_offset=pad_offset,
+            duration_s=float(x2.shape[0] / sr),
+        )
+
+    # ---- STFT repair ----
+    y_repaired = process_stft(x2, sr, replace(p, delta_listen=False), dbg=dbg_collector, diagnostics=info)
+    y_rep_2d = _as_2d(y_repaired)
+    info["measure_after_repair"] = {
+        "sample_peak_dbfs": float(_lin_to_db(np.max(np.abs(y_rep_2d)) + 1e-12)),
+        "true_peak_dbtp": float(measure_true_peak_db(y_rep_2d, os_factor=max(1, int(mp.os_factor)))),
+        "rms_dbfs": float(measure_rms_dbfs(y_rep_2d)),
+        "lufs": measure_lufs(y_rep_2d, sr),
+    }
+
+    # ---- Optional master ----
+    y_out, master_info = master_post(y_repaired, sr, mp, debug=dp.enabled)
+    y_out_2d = _as_2d(y_out)
+    info["measure_out"] = {
+        "sample_peak_dbfs": float(_lin_to_db(np.max(np.abs(y_out_2d)) + 1e-12)),
+        "true_peak_dbtp": float(measure_true_peak_db(y_out_2d, os_factor=max(1, int(mp.os_factor)))),
+        "rms_dbfs": float(measure_rms_dbfs(y_out_2d)),
+        "lufs": measure_lufs(y_out_2d, sr),
+    }
+    info["master_info"] = master_info
+
+    if include_residuals:
+        artifact_output = y_rep_2d
+
+        if p.enhance and p.mix != 0.0:
+            artifact_output = _as_2d(process_stft(
+                x2, sr, replace(p, enhance=False, delta_listen=False),
+            ))
+
+        info["residuals"] = {
+            "artifact_repair_diff": (x2 - artifact_output).squeeze(),
+            "total_enhancement_diff": (x2 - y_out_2d).squeeze(),
+        }
+
+    dbg_data: Dict[str, Any] = {}
+    if dp.enabled and dbg_collector is not None:
+        dbg_data = dbg_collector.finalize()
+        info["dbg_data_keys"] = sorted(list(dbg_data.keys()))
+    result = x2 - y_out_2d if p.delta_listen else y_out_2d
+    return result.squeeze(), info

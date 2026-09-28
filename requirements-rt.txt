@@ -1,5 +1,0 @@
-sounddevice
-soundfile
-numpy
-scipy
-

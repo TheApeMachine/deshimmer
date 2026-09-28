@@ -1,0 +1,78 @@
+"""Auto-tuning and parameter optimization package for deshimmer."""
+
+from ..api import preview_context_seconds, process_audio, slice_with_context
+from .analyzer import (
+    _detect_resonances,
+    _detect_shimmer_band,
+    analyze,
+    pick_regions,
+)
+from .optimizer import (
+    _evaluate_params_multi,
+    _evaluate_params_single,
+    _make_stage,
+    _pick_pareto_trial,
+    refine,
+)
+from .scoring import (
+    _EPS,
+    _band_idx,
+    _flatness,
+    _frame_db,
+    _hpss_components,
+    _residual_above_median,
+    _slice,
+    _stft_mag,
+    _to_mono_float,
+    build_synthetic_transition,
+    flat_weights,
+    score_objectives,
+    score_processed,
+    score_transition_boundary,
+    weights_from_aggressiveness,
+)
+from .types import (
+    MATH_FAILURES,
+    OBJECTIVE_NAMES,
+    AnalysisReport,
+    EvaluationFailureLog,
+    Region,
+    Weights,
+    _SnapshotTrial,
+)
+
+__all__ = [
+    "MATH_FAILURES",
+    "OBJECTIVE_NAMES",
+    "AnalysisReport",
+    "EvaluationFailureLog",
+    "Region",
+    "Weights",
+    "_SnapshotTrial",
+    "_band_idx",
+    "_detect_resonances",
+    "_detect_shimmer_band",
+    "_evaluate_params_multi",
+    "_evaluate_params_single",
+    "_flatness",
+    "_frame_db",
+    "_hpss_components",
+    "_make_stage",
+    "_pick_pareto_trial",
+    "_residual_above_median",
+    "_slice",
+    "_stft_mag",
+    "_to_mono_float",
+    "analyze",
+    "build_synthetic_transition",
+    "flat_weights",
+    "pick_regions",
+    "preview_context_seconds",
+    "process_audio",
+    "refine",
+    "score_objectives",
+    "score_processed",
+    "score_transition_boundary",
+    "slice_with_context",
+    "weights_from_aggressiveness",
+]
