@@ -91,8 +91,6 @@ def process_stft(
     """Repair the wet signal; mix and delta always reference the original samples."""
     global _LAST_ARTIFACT_CONF_FRAMES
     _LAST_ARTIFACT_CONF_FRAMES = None
-    if "master" in sys.modules:
-        setattr(sys.modules["master"], "_LAST_ARTIFACT_CONF_FRAMES", None)
 
     if x.ndim == 1:
         x = x[:, None]
@@ -223,8 +221,6 @@ def process_stft(
         artifact_conf_frames = conf_per_frame.reshape(1, -1)
 
     _LAST_ARTIFACT_CONF_FRAMES = artifact_conf_frames
-    if "master" in sys.modules:
-        setattr(sys.modules["master"], "_LAST_ARTIFACT_CONF_FRAMES", artifact_conf_frames)
 
     # --- Debug collection ---
     if dbg is not None:

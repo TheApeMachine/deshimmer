@@ -40,6 +40,6 @@ packages = ["src/deshimmer"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
-pythonpath = ["src", ".", "tests"]
+pythonpath = ["src", "tests"]
 
 

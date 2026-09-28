@@ -9,8 +9,8 @@ from dataclasses import replace
 import numpy as np
 import optuna
 
-import auto_tune
-import master
+from deshimmer import autotune as auto_tune
+from deshimmer import core as master
 
 
 class TestWeights(unittest.TestCase):

@@ -1,8 +1,7 @@
 {
   "typeCheckingMode": "basic",
   "exclude": [
-    "ui_gradio.py",
-    "realtime_player.py"
+    ".venv"
   ],
   "reportMissingTypeStubs": "none",
   "reportUnknownMemberType": "none",

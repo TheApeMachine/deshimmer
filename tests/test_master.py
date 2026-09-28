@@ -10,7 +10,7 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
-import master
+from deshimmer import core as master
 
 
 class TestMaster(unittest.TestCase):
@@ -68,7 +68,7 @@ class TestMaster(unittest.TestCase):
             source = Path(directory) / "input.wav"
             destination = Path(directory) / "output.wav"
             sf.write(source, audio, 44100, subtype="FLOAT")
-            command = [sys.executable, str(Path(master.__file__)), str(source), str(destination),
+            command = [sys.executable, "-m", "deshimmer.cli", str(source), str(destination),
                        "--n-fft", "512", "--hop", "128", "--subtype", "FLOAT"]
             outputs = {}
             scenarios = {

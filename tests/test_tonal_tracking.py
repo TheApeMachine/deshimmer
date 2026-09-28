@@ -4,7 +4,7 @@ from dataclasses import replace
 import numpy as np
 
 from tonal_fixtures import TonalFixture
-from tonal_tracking import PartialTracker, TonalConfig
+from deshimmer.tonal import PartialTracker, TonalConfig
 
 
 class TestPartialTracker(unittest.TestCase):

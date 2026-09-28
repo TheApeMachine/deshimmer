@@ -35,7 +35,7 @@ The repair-only comparison costs an additional repair pass when enhancement is
 enabled. Its difference from the total residual includes interactions between
 stages, so it is not an isolated recording of the engineering stages. Residual
 arrays are omitted from `info` by default. `Params(enhance=False)` or the
-`master.py --repair-only` option disables those three engineering stages in the
+`deshimmer-cli --repair-only` option disables those three engineering stages in the
 main output itself; delivery mastering remains independently configurable.
 
 Refinement uses six weighted objectives: artifact reduction, music damage,

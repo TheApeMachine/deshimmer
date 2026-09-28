@@ -138,8 +138,8 @@ def render_full_to_files(
     out_audio = removed if p.delta_listen else processed
     diff_audio = processed if p.delta_listen else removed
 
-    # Support testing patch on ui_gradio.__file__
-    mod = sys.modules.get("ui_gradio")
+    # Support testing patch on module __file__
+    mod = sys.modules.get("deshimmer.ui") or sys.modules.get("ui_gradio")
     module_file = getattr(mod, "__file__", __file__) if mod is not None else __file__
     outdir = os.path.join(os.path.dirname(module_file), "ui_downloads")
     os.makedirs(outdir, exist_ok=True)

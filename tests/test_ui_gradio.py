@@ -10,8 +10,8 @@ from unittest.mock import patch
 import numpy as np
 import soundfile as sf
 
-import ui_gradio
-from deshimmer_api import process_audio
+from deshimmer import ui as ui_gradio
+from deshimmer.api import process_audio
 from tonal_fixtures import TonalFixture
 
 
@@ -51,7 +51,7 @@ class TestUIGradio(unittest.TestCase):
         )
 
         with tempfile.TemporaryDirectory() as directory:
-            with patch.object(ui_gradio, "__file__", str(Path(directory) / "ui_gradio.py")):
+            with patch.object(ui_gradio, "__file__", str(Path(directory) / "__init__.py")):
                 output_path, diff_path, params_path = ui_gradio.render_full_to_files((44100, audio), state, True)
 
             output, rate = sf.read(output_path, dtype="float32", always_2d=True)
@@ -97,7 +97,7 @@ class TestUIGradio(unittest.TestCase):
             np.testing.assert_array_equal(preview[2][1], audio - expected)
 
             with tempfile.TemporaryDirectory() as directory:
-                with patch.object(ui_gradio, "__file__", str(Path(directory) / "ui_gradio.py")):
+                with patch.object(ui_gradio, "__file__", str(Path(directory) / "__init__.py")):
                     output_path, diff_path, params_path = ui_gradio.render_full_to_files(
                         (fixture.sample_rate, audio), state,
                     )

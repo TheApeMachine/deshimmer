@@ -2,7 +2,7 @@ import warnings
 
 import numpy as np
 
-import master
+from deshimmer import core as master
 
 
 def test_dynamic_spectral_carver_broadcasts_gain_over_channels():

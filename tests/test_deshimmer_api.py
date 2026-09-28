@@ -5,8 +5,9 @@ from dataclasses import replace
 
 import numpy as np
 
-import master
-from deshimmer_api import process_audio
+from deshimmer import core as master
+from deshimmer.api import process_audio
+from deshimmer.core import pipeline
 
 
 class TestDeshimmerAPI(unittest.TestCase):
@@ -43,9 +44,9 @@ class TestDeshimmerAPI(unittest.TestCase):
                 self.assertFalse(np.array_equal(repair, output))
 
         with self.subTest("bypass clears artifact confidence and both residuals"):
-            master._LAST_ARTIFACT_CONF_FRAMES = np.ones((1, 4), dtype=np.float32)
+            pipeline._LAST_ARTIFACT_CONF_FRAMES = np.ones((1, 4), dtype=np.float32)
             bypass, info = process_audio(audio, 44100, params=replace(params, mix=0.0), include_residuals=True)
-            self.assertIsNone(master._LAST_ARTIFACT_CONF_FRAMES)
+            self.assertIsNone(pipeline._LAST_ARTIFACT_CONF_FRAMES)
             np.testing.assert_array_equal(bypass, audio)
 
             for residual in info["residuals"].values():

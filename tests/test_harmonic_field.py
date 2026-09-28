@@ -3,7 +3,7 @@ import unittest
 import numpy as np
 
 from tonal_fixtures import TonalFixture
-from tonal_repair import TonalRepair
+from deshimmer.tonal import TonalRepair
 
 
 class TestHarmonicField(unittest.TestCase):

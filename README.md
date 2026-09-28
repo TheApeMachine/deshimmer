@@ -60,7 +60,6 @@ Launch the interactive UI:
 ```bash
 deshimmer-ui
 # or: python -m deshimmer
-# or: python ui_gradio.py
 ```
 
 Open `http://localhost:7860` in your web browser.
@@ -310,7 +309,6 @@ deshimmer/
 │   ├── test_tonal_tracking.py
 │   ├── test_ui_gradio.py
 │   └── tonal_fixtures.py
-└── master.py, ui_gradio.py...  # Backward-compatibility shims
 ```
 
 ---
