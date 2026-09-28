@@ -1,14 +1,14 @@
 # Repair, residuals, and optimizer verification
 
 The normal **Set from audio → Optimize → Render full & generate downloads**
-workflow includes [tonal self-consistency repair](TONAL_REPAIR.md) by default.
+workflow includes [tonal self-consistency repair](tonal_repair.md) by default.
 Analysis activates its initial amount; optimization evaluates its coherence
 objective in every stage and searches its amount in a final tonal stage. No
 additional checkbox, preset, or alternate renderer is required.
 New repair stages must follow this workflow contract: participate in the normal
 defaults, analysis, optimization, preview, and export without another enabling step.
 
-`master.process_stft` blends the original input with the complete wet repair,
+`deshimmer.core.process_stft` blends the original input with the complete wet repair,
 including optional HF resynthesis. `mix=0` returns the original samples and a
 zero repair residual without running the DSP. Delivery mastering is separate:
 disable it as the UI's Bypass preset does for an end-to-end null.

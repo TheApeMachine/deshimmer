@@ -1,134 +1,134 @@
 # Deshimmer
 
-Deshimmer is an audio repair toolkit and parameter optimization engine for suppressing the spectral artifacts common in AI-generated audio and neural vocoders.
+Deshimmer is a surgical audio restoration toolkit and multi-objective parameter optimization engine designed to eliminate high-frequency artifacts common in AI-generated audio (e.g. Suno, Udio, Stable Audio) and aggressive lossy codecs.
 
-Neural synthesis models (diffusion networks, flow-matching engines, and generative vocoders) frequently introduce audible anomalies in the upper frequency spectrum:
-- **Shimmer and "birdies"**: High-frequency spectral spikes (typically between 4 kHz and 12 kHz) that flicker rapidly across time frames, producing an unnatural, metallic, "crystalline" sizzle.
-- **Stationary whines**: Steady, pure-tone resonant lines caused by generator clock harmonics, frame-grid boundaries, or neural sampling artifacts.
-- **Phase swish**: Chaotic inter-frame and inter-bin phase instability in high frequencies that makes cymbals, reverbs, and sustained notes sound watery and disconnected.
-- **Tonal partial wandering**: Pitch jitter and harmonic drift in sustained melodic lines.
+Neural vocoders, diffusion networks, and generative audio models frequently introduce characteristic acoustic anomalies:
+- **High-Frequency Shimmer ("Birdies")**: Rapidly fluctuating, metallic energy spikes (typically in the 4–12 kHz range) that produce an unnatural digital sizzle.
+- **Stationary Resonant Whines**: Persistent narrowband whistles caused by sampling rate clock harmonics, frame-grid boundaries, or vocoder resonance nodes.
+- **Phase Swish & Incoherence**: Erratic inter-frame phase jumps that make cymbals, reverbs, and sustained instruments sound watery or comb-filtered.
+- **Sinusoidal Harmonic Drift**: Micro-pitch wandering and jitter in sustained melodic lines.
 
-Rather than running a destructive black-box neural model to fix another neural model, Deshimmer uses stateful, deterministic digital signal processing (DSP) coupled with multi-objective Bayesian optimization. You can inspect every stage, listen to the removed difference signal in isolation, and verify that the original audio is preserved.
-
----
-
-## Key Features
-
-- **Modular DSP Pipeline**: Eleven discrete, chainable processing stages operating in the Short-Time Fourier Transform (STFT) domain, with Numba-accelerated inner loops for performance.
-- **Tonal Self-Consistency**: High-resolution Quadratic Interpolated FFT (QIFFT) partial tracking that identifies harmonic families and stabilizes wandering partials without retuning legitimate vibrato or glissandi.
-- **Two-Layer Auto-Tuning**:
-  - *Layer 1 (Deterministic Analysis)*: Quickly scans representative audio regions (quiet, loud, transient, tonal) to identify shimmer bands, noise floor levels, and stationary whines, proposing baseline settings.
-  - *Layer 2 (Multi-Objective Optimization)*: Uses Optuna's NSGA-II genetic algorithm across six acoustic objectives (artifact reduction, music preservation, transient leakage, stereo width, spectral tilt, and tonal coherence) to find the best parameter trade-offs.
-- **Full-Featured Web UI**: A Gradio-based interface with synchronized dual-player playback (input vs. processed output vs. isolated residual), high-resolution spectrograms, looping crossfades, and preset management.
-- **Mastering Chain**: Optional EBU R128 integrated loudness normalization (LUFS) and an oversampled (4x/8x) lookahead true-peak limiter.
-- **Pure Python with `uv`**: Packaged with modern standards (`pyproject.toml`) and installed cleanly via `uv`.
+Rather than applying a destructive black-box neural network to repair another neural network, Deshimmer relies on **deterministic, psychoacoustically bounded digital signal processing (DSP)** combined with an **evolutionary NSGA-II multi-objective optimizer**. Every stage is fully transparent, mathematically invertible, and auditable through isolated forensic difference signals.
 
 ---
 
-## Installation
+## ⚡ Quickstart
 
-Deshimmer requires **Python 3.10+** and uses [uv](https://docs.astral.sh/uv/) for package and virtual environment management.
-
-### 1. Install `uv`
-If you do not have `uv` installed:
+Get the interactive web application up and running with a single command:
 
 ```bash
-# macOS / Linux
-curl -LsSf https://astral.sh/uv/install.sh | sh
+make run
 ```
 
-### 2. Clone and Setup Environment
-
-```bash
-git clone https://github.com/theapemachine/deshimmer.git
-cd deshimmer
-
-# Create a virtual environment and install deshimmer in editable mode with dev dependencies
-uv venv
-source .venv/bin/activate
-uv pip install -e ".[dev]"
-```
+This single command automatically bootstraps the virtual environment, verifies dependencies, and launches the Gradio Web UI at **`http://localhost:7860`**.
 
 ---
 
-## Quick Start
+## 📚 Documentation Index
 
-### 1. Web Interface (Gradio)
+The system is granularly documented across specialized guides in the [`docs/`](docs/) directory:
 
-Launch the interactive UI:
-
-```bash
-deshimmer-ui
-# or: python -m deshimmer
-```
-
-Open `http://localhost:7860` in your web browser.
-
-#### Interactive Workflow:
-1. **Load Audio**: Drop a WAV, FLAC, or MP3 file into the Input Audio component.
-2. **Select Preview**: Set preview start time and duration (e.g. 4–6 seconds around a noisy passage) and enable loop crossfade for smooth auditioning.
-3. **Auto-Tune (Optional)**:
-   - Click **Set from audio** to detect shimmer bands and stationary resonances automatically.
-   - Click **Optimize** to run the NSGA-II multi-objective optimizer. It evaluates candidate settings across multiple regions and updates the sliders with the best-scoring parameters.
-4. **Audition**:
-   - Compare **Input** vs. **Output**.
-   - Check **Listen to removed audio** (or **Listen to repair-only diff**) to hear exactly what is being subtracted. If you hear drums or dry vocal leads in the diff, back off the reduction slope or increase transient flux thresholds.
-5. **Render Full Track**: Click **Render full & generate downloads** to process the complete file to 24-bit PCM WAV.
+| Document | Description |
+|:---|:---|
+| **[Core DSP Pipeline](docs/dsp_pipeline.md)** | Deep dive into STFT framing, psychoacoustic masking curves, spatial alignment, and the 10 discrete processing stages. |
+| **[Auto-Tune & NSGA-II Optimizer](docs/autotune_optimizer.md)** | Explanation of dynamic region slicing, the 6 weighted acoustic objectives, synthetic seam scoring, and Pareto trial selection. |
+| **[Tonal Self-Consistency](docs/tonal_repair.md)** | Mathematical formulation of QIFFT partial tracking, alternating-median harmonic field regression, and cubic Hermite phase synthesis. |
+| **[Processing Contracts & Residuals](docs/processing.md)** | Details on bypass invertibility ($mix=0$ null contract), dual residual separation, and forensic difference verification. |
+| **[Interactive Web UI Guide](docs/ui_guide.md)** | Walkthrough of the Gradio interface: waveform/spectrogram displays, loop crossfade playback, parameter tabs, presets, and 24-bit export. |
+| **[CLI Reference & Batch Manual](docs/cli.md)** | Complete command-line flag documentation, batch shell scripting recipes, and headless server rendering. |
+| **[Python API Reference](docs/api.md)** | Developer documentation for `process_audio`, parameter dataclasses (`Params`, `MasterParams`), and custom pipeline construction. |
+| **[Architecture & Extension Guide](docs/architecture.md)** | Codebase layout, design principles, testing philosophy, and a step-by-step tutorial on implementing custom `DSPStage` modules. |
 
 ---
 
-### 2. Command-Line Interface (CLI)
+## 🛠️ Key Capabilities
 
-Process audio files directly from your terminal:
+- **10-Stage Modular DSP Pipeline**: Operates in the Short-Time Fourier Transform (STFT) domain with Numba JIT-accelerated performance loops. Stages include downward expansion, minimum-statistics noise subtraction, dynamic de-resonators, dual-threshold flux attenuators, HPSS, noise resynthesis, and phase blur.
+- **Tonal Self-Consistency Stage**: Extracts sinusoids with sub-bin precision using Quadratic Interpolated FFT (QIFFT), groups trajectories into harmonic families via alternating-median regression, and resolves wandering partials using cubic Hermite phase interpolation.
+- **Two-Layer Automated Optimization**:
+  - *Layer 1 (Deterministic Scene Analysis)*: Scans dynamic audio regions (quiet, loud, transient, tonal) to identify shimmer frequency bands and stationary whines automatically.
+  - *Layer 2 (NSGA-II Multi-Objective Optimization)*: Explores the multi-dimensional parameter space across six competing acoustic objectives (artifact reduction, music preservation, transient leakage, stereo width, spectral balance, and tonal coherence) to find optimal Pareto trade-offs.
+- **Forensic Delta Verification**: Audition the exact difference signal ($x_{\text{input}} - y_{\text{processed}}$) in real time. If musical notes or drum hits leak into the removed audio, parameters can be instantly adjusted before rendering.
+- **Integrated Studio Mastering**: Subsonic high-pass filtering (20 Hz), ITU-R BS.1770 / EBU R128 loudness normalization (LUFS), and a 4x oversampled true-peak lookahead limiter.
+- **Clean Tooling with Make & `uv`**: Fully standardized packaging using `pyproject.toml`, reproducible `uv` dependency management, and a comprehensive `Makefile`.
+
+---
+
+## 🚀 Usage
+
+### 1. Interactive Web Interface (Gradio)
+
+Launch the interface via `make run` or directly via CLI:
 
 ```bash
-# Basic repair with default shimmer suppression (5.1–7.2 kHz)
+make run
+# or: deshimmer-ui
+# or: python -m deshimmer.ui.app
+```
+
+Navigate to `http://localhost:7860` in your web browser.
+
+#### Standard UI Workflow:
+1. **Load Audio**: Drop a WAV, FLAC, MP3, or AIFF file into the Input component.
+2. **Set Preview Loop**: Choose a 3–8 second slice around an audible artifact. Enable **Loop Crossfade** for click-free browser looping.
+3. **Auto-Tune**:
+   - Click **Set from audio** to detect shimmer bands and stationary resonances.
+   - Click **Optimize** to run the NSGA-II evolutionary search and populate the sliders with the best-scoring compromise.
+4. **Audition**: Switch between **Input**, **Output**, and **Removed Audio (Diff)**.
+5. **Export**: Click **Render full & generate downloads** to export a 24-bit PCM WAV master, difference track, and JSON parameter sidecar.
+
+*For full details on all controls, see the [Web UI Guide](docs/ui_guide.md).*
+
+---
+
+### 2. Command-Line Batch Processing (CLI)
+
+Process audio files directly from the terminal or automate whole directories:
+
+```bash
+# Basic repair on default 5.1–7.2 kHz shimmer band
 deshimmer-cli input.wav output.wav
 
-# Target a specific resonance whine with the dynamic de-resonator
-deshimmer-cli input.wav output.wav \
+# Eliminate persistent 3.5 kHz generative whine and write difference WAV
+deshimmer-cli generated.mp3 cleaned.wav \
   --start-hz 3000 --end-hz 4200 \
   --deres 0.8 --deq-thr-db 4.0 --deq-max-att-db 12.0 \
-  --deq-persist-ms 1000
+  --deq-persist-ms 1000 \
+  --write-diff diff.wav
 
-# Combine shimmer repair, light denoising, and EBU R128 delivery mastering (-14 LUFS)
-deshimmer-cli input.wav output.wav \
-  --thr-db 7.0 --slope 0.75 \
-  --denoise 0.30 --dn-floor-db -20 \
+# Full restoration stack with streaming delivery mastering (-14.0 LUFS, -1.0 dBTP)
+deshimmer-cli rough_mix.wav master_delivery.wav \
+  --thr-db 7.5 --slope 0.7 \
+  --denoise 0.35 --dn-floor-db -22.0 \
+  --tonal-repair 0.5 \
   --master --target-lufs -14.0 --ceiling-dbtp -1.0
 ```
 
-Run `deshimmer-cli --help` to see all available command-line flags.
+*For complete flag listings and shell scripting recipes, see the [CLI Reference](docs/cli.md).*
 
 ---
 
-### 3. Python API
+### 3. Python API Integration
 
-Deshimmer can be integrated directly into your Python scripts or batch pipelines:
+Embed Deshimmer directly into Python applications, batch jobs, or ML pipelines:
 
 ```python
 import soundfile as sf
-from deshimmer import process_audio, Params, MasterParams
+from deshimmer.api import process_audio
+from deshimmer.core import Params, MasterParams
 
-# Load audio (channels as columns, shape (N, C))
-audio, sr = sf.read("input.wav")
+# Load audio (channels as columns, shape (samples, channels))
+audio, sr = sf.read("input.wav", dtype="float32")
 
-# Configure repair settings
+# Configure DSP parameters and delivery mastering
 params = Params(
     start_hz=4800.0,
     end_hz=8200.0,
     thr_db=7.5,
     slope=0.7,
-    swish_repair=0.35,
     tonal_repair=0.5,
 )
-
-# Optional delivery mastering
-mastering = MasterParams(
-    enabled=True,
-    target_lufs=-14.0,
-    ceiling_dbtp=-1.0,
-)
+mastering = MasterParams(enabled=True, target_lufs=-14.0, ceiling_dbtp=-1.0)
 
 # Process audio
 output, info = process_audio(
@@ -139,20 +139,15 @@ output, info = process_audio(
     include_residuals=True,
 )
 
-# Access measurement statistics
-print(f"Input LUFS: {info['measure_in']['lufs']:.2f}")
-print(f"Output LUFS: {info['measure_out']['lufs']:.2f}")
-print(f"True peak: {info['measure_out']['true_peak_dbtp']:.2f} dBTP")
-
-# Save processed output
-sf.write("output.wav", output, sr, subtype="PCM_24")
+# Export broadcast-ready 24-bit master
+sf.write("repaired_master.wav", output, sr, subtype="PCM_24")
 ```
+
+*For comprehensive parameter tables and custom pipeline examples, see the [Python API Reference](docs/api.md).*
 
 ---
 
-## DSP Pipeline Architecture
-
-Deshimmer processes audio through a pipeline of decoupled STFT stages. The internal structure operates as follows:
+## 🏗️ Architecture Summary
 
 ```
                   ┌───────────────────────────────┐
@@ -164,34 +159,31 @@ Deshimmer processes audio through a pipeline of decoupled STFT stages. The inter
                   └───────────────┬───────────────┘
                                   ▼
                   ┌───────────────────────────────┐
-                  │   STFT Analysis (Hann, 50%+)  │
-                  └───────────────┬───────────────┘
-                                  ▼
-                  ┌───────────────────────────────┐
-                  │   L/R Spectral Balancing      │
+                  │   STFT Analysis (Hann, 75%)   │
                   └───────────────┬───────────────┘
                                   ▼
                   ┌───────────────────────────────┐
                   │ Psychoacoustic Mask Threshold │
+                  │ (ATH + Forward Temporal Decay)│
                   └───────────────┬───────────────┘
                                   ▼
                   ┌───────────────────────────────┐
-                  │        Modular Stages         │
+                  │  Modular DSP Pipeline Stages  │
                   │  1. Downward Expander         │
-                  │  2. Smart Spectral Denoise    │
+                  │  2. Minimum-Stats Denoise     │
                   │  3. Adaptive De-Resonator     │
                   │  4. Shimmer Suppressor        │
-                  │  5. Dynamic Spectral Carver   │
-                  │  6. Texture Noise Resynth     │
-                  │  7. Phase Blur                │
-                  │  8. Swish Phase Repair        │
-                  │  9. Stereo Decorrelation      │
-                  │ 10. Gain App & Inpainting     │
+                  │  5. Swish Phase Repair        │
+                  │  6. HPSS Transients Filter    │
+                  │  7. Noise Resynthesis         │
+                  │  8. Phase Blur Dispersion     │
+                  │  9. Dynamic Spectral Carver   │
+                  │ 10. Gain Application          │
                   └───────────────┬───────────────┘
                                   ▼
                   ┌───────────────────────────────┐
-                  │  Tonal Self-Consistency       │
-                  │  (QIFFT Tracking + Hermite)   │
+                  │    Tonal Self-Consistency     │
+                  │ (QIFFT Tracking + Hermite)    │
                   └───────────────┬───────────────┘
                                   ▼
                   ┌───────────────────────────────┐
@@ -200,131 +192,77 @@ Deshimmer processes audio through a pipeline of decoupled STFT stages. The inter
                                   ▼
                   ┌───────────────────────────────┐
                   │ Delivery Mastering & Limiter  │
+                  │ (High-pass + LUFS + True-Peak)│
                   └───────────────┬───────────────┘
                                   ▼
                   ┌───────────────────────────────┐
-                  │         Output Audio          │
+                  │  Final Master (24-bit PCM)    │
                   └───────────────────────────────┘
 ```
 
-### Core Processing Stages
-
-1. **L/R Micro-Delay & Spectral Balancing**: Corrects sub-millisecond phase offsets and channel level imbalances introduced by lossy vocoder decoders before spectral analysis.
-2. **Psychoacoustic Masking Constraint**: Calculates simultaneous spectral masking curves and forward temporal decay (using Numba JIT). Suppressions that would fall below hearing thresholds are clamped to prevent audible dropouts or hollow artifacts.
-3. **Smart Spectral Denoise**: Implements minimum-statistics noise floor tracking. Rather than using an abrupt noise gate, it computes a soft floor attenuation that preserves natural room ambiance while removing background hiss.
-4. **Adaptive De-Resonator**: Distinguishes between musical harmonics and unwanted stationary ringing. A frequency peak must demonstrate sustained temporal persistence across multiple analysis windows before the dynamic notch filter engages.
-5. **Shimmer Suppressor with Inpainting**: Compares spectral energy against a moving frequency median. Bins that exceed the threshold in noisy/unvoiced sections are reduced. When *Magnitude Inpainting* is enabled, spikes are capped to the local median rather than cut to zero, preserving natural high-frequency presence.
-6. **Swish Phase Repair**: Evaluates the inter-frame and inter-bin phase derivative variance. In regions where phase instability indicates vocoder phase-smearing ("swish"), the complex phasor angles are smoothed along time and frequency axes.
-7. **Tonal Self-Consistency (`src/deshimmer/tonal/`)**:
-   - `PartialTracker`: Extracts sinusoidal peaks with sub-bin precision using parabolic QIFFT peak interpolation on a 4x zero-padded Hann spectrum.
-   - `HarmonicField`: Groups related partial trajectories into harmonic families using alternating medians on log-frequency space.
-   - `TonalRepair`: Corrects erratic wandering of individual harmonics relative to their family core using cubic Hermite phase synthesis, leaving independent musical voices untouched.
-8. **Delivery Mastering**: High-pass filtering (sub-bass cleanup), EBU R128 integrated loudness normalization, and a 4x/8x oversampled true-peak limiter.
-
 ---
 
-## Auto-Tuning Engine
-
-Finding clean settings manually across 20+ DSP parameters can be tedious. Deshimmer's auto-tuning engine automates this in two steps:
-
-### Layer 1: Deterministic Analysis (`analyze`)
-Analyzes the audio across representative regions (quiet background, loud sections, transients, and vocal passages):
-- Detects the primary shimmer frequency range by calculating spectral residue density.
-- Estimates the background noise floor to configure denoiser thresholds.
-- Identifies stationary resonance peaks and estimates their persistence.
-- Evaluates tonal consistency metrics across harmonic families.
-
-### Layer 2: Multi-Objective Bayesian Optimization (`refine`)
-Uses Optuna's **NSGA-II** genetic sampler to optimize parameters sequentially across stages (shimmer, denoise, deres, swish, tonal). It optimizes six explicit objectives simultaneously:
-
-1. **Artifact Reduction**: Maximizes dB reduction in detected shimmer and swish bands.
-2. **Music Preservation**: Penalizes changes outside the target band, spectral centroid shifts, and added musical noise.
-3. **Diff Leakage**: Penalizes transient energy (percussive attacks) and strong musical harmonics leaking into the difference signal.
-4. **Stereo Preservation**: Penalizes widening or narrowing of the inter-channel correlation ratio.
-5. **Loudness & Tilt Preservation**: Penalizes unwanted spectral darkening or loudness loss.
-6. **Tonal Coherence**: Rewards improved agreement among detected harmonic families.
-
-Candidate trials that cause mathematical instability or boundary pumping are rejected. Current settings are retained if proposed candidate trials score worse than the incoming baseline.
-
----
-
-## Project Structure
+## 📂 Project Organization
 
 ```
 deshimmer/
-├── pyproject.toml              # Build configuration and dependencies (uv / hatchling)
-├── ui_presets.json             # Bundled factory presets
-├── src/
-│   └── deshimmer/
-│       ├── __init__.py         # Public package exports
-│       ├── __main__.py         # Package executable entrypoint
-│       ├── api.py              # High-level Python API (process_audio, slice_with_context)
-│       ├── cli.py              # Command-line interface logic
-│       ├── core/               # Core DSP modules
-│       │   ├── context.py      # DSPContext data container
-│       │   ├── debug.py        # Diagnostic metrics and spectrogram plotting
-│       │   ├── hpss.py         # Harmonic-percussive separation and inpainting
-│       │   ├── mastering.py    # Peak limiter and LUFS normalization
-│       │   ├── measurements.py # True peak, LUFS, and phase instability metrics
-│       │   ├── params.py       # Params, MasterParams, and DebugParams dataclasses
-│       │   ├── pipeline.py     # DSPPipeline orchestrator and process_stft
-│       │   ├── psychoacoustic.py # Psychoacoustic masking & temporal decay
-│       │   ├── resynth.py      # High-frequency harmonic resynthesis
-│       │   ├── spatial.py      # Delay alignment, spectral balancing, and carving
-│       │   ├── utils.py        # DSP conversion helpers
-│       │   └── stages/         # Individual STFT processing stages
-│       │       ├── base.py
-│       │       ├── carver.py
-│       │       ├── decorrelation.py
-│       │       ├── denoise.py
-│       │       ├── deresonator.py
-│       │       ├── expander.py
-│       │       ├── gain.py
-│       │       ├── noise_resynth.py
-│       │       ├── phase_blur.py
-│       │       ├── shimmer.py
-│       │       └── swish.py
-│       ├── tonal/              # Sinusoidal tracking and harmonic repair
-│       │   ├── tracking.py     # QIFFT partial tracking
-│       │   ├── harmonic_field.py # Harmonic family fitting
-│       │   └── repair.py       # Tonal synthesis and phase reconstruction
-│       ├── autotune/           # Automatic analysis and parameter optimization
-│       │   ├── analyzer.py     # Deterministic prior detection and region selection
-│       │   ├── optimizer.py    # Optuna NSGA-II multi-objective optimization
-│       │   ├── scoring.py      # Acoustic metric scoring functions
-│       │   └── types.py        # Region, Weights, and report definitions
-│       └── ui/                 # Gradio Web Interface
-│           ├── app.py          # UI layout and event bindings
-│           ├── audio.py        # Audio formatting, slicing, and spectrograms
-│           ├── handlers.py     # Preview execution and full export handlers
-│           ├── presets.py      # Preset loading and saving
-│           └── state.py        # UI state mapping and conversions
-├── tests/                      # Automated test suite
-│   ├── test_auto_tune.py
-│   ├── test_deshimmer_api.py
-│   ├── test_dynamic_spectral_carver.py
-│   ├── test_harmonic_field.py
-│   ├── test_master.py
-│   ├── test_tonal_repair.py
-│   ├── test_tonal_tracking.py
-│   ├── test_ui_gradio.py
-│   └── tonal_fixtures.py
+├── Makefile                    # Project automation commands
+├── pyproject.toml              # Build config and dependencies
+├── pyrightconfig.json          # Type checker configuration
+├── ui_presets.json             # Factory & user-saved parameter presets
+├── docs/                       # Granular technical documentation
+│   ├── api.md                  # Python API reference
+│   ├── architecture.md         # Architecture and stage extension guide
+│   ├── autotune_optimizer.md   # NSGA-II optimizer & scoring metrics
+│   ├── cli.md                  # Command-line interface manual
+│   ├── dsp_pipeline.md         # Core DSP pipeline & psychoacoustic engine
+│   ├── processing.md           # Processing contracts & residual verification
+│   ├── tonal_repair.md         # Tonal self-consistency & sinusoidal tracking
+│   └── ui_guide.md             # Gradio web interface manual
+├── src/deshimmer/              # Main package codebase
+│   ├── api.py                  # High-level process_audio entry point
+│   ├── cli.py                  # Headless batch CLI implementation
+│   ├── core/                   # Core DSP processing engine & stages
+│   ├── tonal/                  # Sinusoidal tracking & harmonic field
+│   ├── autotune/               # Automated scene analysis & NSGA-II optimizer
+│   └── ui/                     # Gradio web interface
+└── tests/                      # Automated unit and regression test suite
 ```
 
 ---
 
-## Testing
+## ⚙️ Makefile Reference
 
-Run the full test suite using `pytest`:
+| Target | Description |
+|:---|:---|
+| **`make run`** | Bootstraps virtual environment if needed and starts the interactive Gradio UI. |
+| **`make test`** | Executes all 27 unit and regression tests via `pytest`. |
+| **`make cli`** | Runs the CLI interface. Pass flags via `ARGS="..."` (e.g. `make cli ARGS="--help"`). |
+| **`make install`** | Sets up the virtual environment (`.venv`) and installs dependencies via `uv`. |
+| **`make clean`** | Removes cache files, bytecode (`__pycache__`), and build artifacts. |
+| **`make help`** | Displays the list of available Makefile targets. |
+
+---
+
+## 🧪 Testing & Verification
+
+Run the test suite:
 
 ```bash
-uv run pytest
+make test
+# or: uv run pytest tests -v
 ```
 
-All 27 regression tests verify that channel alignment, spectral balancing, stage isolation, Optuna scoring, file exports, and UI callbacks execute with 100% numerical fidelity.
+The automated test suite contains 27 test cases (with 78 subtests) covering:
+- Exact phase invertibility and wet/dry mathematical contracts.
+- L/R micro-delay alignment bounds within 3 ms.
+- Dynamic spectral carving channel broadcasting.
+- Optuna multi-objective metric evaluation and failure resilience.
+- Sinusoidal peak interpolation and harmonic family tracking.
+- Web UI handlers, looping crossfade logic, and 24-bit PCM WAV exports.
 
 ---
 
-## License
+## 📄 License
 
 This project is licensed under the [MIT License](LICENSE).
