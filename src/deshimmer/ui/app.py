@@ -6,8 +6,16 @@ from dataclasses import asdict
 import json
 import os
 from typing import Any, Mapping
+import warnings
 
 import gradio as gr
+
+# Suppress Gradio's internal notice when converting float32 audio for web browser playback
+warnings.filterwarnings(
+    "ignore",
+    message=r"Trying to convert audio automatically from .* to 16-bit int format\.",
+    category=UserWarning,
+)
 import numpy as np
 
 from ..autotune import Region, analyze, pick_regions, refine

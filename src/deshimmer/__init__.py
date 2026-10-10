@@ -5,7 +5,11 @@ __version__ = "0.1.0"
 from .api import preview_context_seconds, process_audio, slice_with_context
 from .autotune import AnalysisReport, Region, Weights, analyze, refine
 from .core import DebugParams, MasterParams, Params
-from .ui import build_ui
+def __getattr__(name: str):
+    if name == "build_ui":
+        from .ui.app import build_ui
+        return build_ui
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
     "AnalysisReport",
