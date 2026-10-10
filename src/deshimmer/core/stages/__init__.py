@@ -11,6 +11,11 @@ from .noise_resynth import NoiseResynthConfig, NoiseResynthStage
 from .phase_blur import PhaseBlurConfig, PhaseBlurStage
 from .swish import SwishRepairConfig, SwishRepairStage
 from .decorrelation import HFDecorrelationConfig, HFDecorrelationStage
+from .tonal_balance import TonalBalanceConfig, TonalBalanceStage
+from .transient_punch import TransientPunchConfig, TransientPunchStage
+from .low_end import LowEndConfig, LowEndStage
+from .stereo_translation import StereoTranslationConfig, StereoTranslationStage
+from .harmonic_enhance import HarmonicEnhanceConfig, HarmonicEnhanceStage
 
 __all__ = [
     "DSPStage",
@@ -34,4 +39,14 @@ __all__ = [
     "SwishRepairStage",
     "HFDecorrelationConfig",
     "HFDecorrelationStage",
+    "TonalBalanceConfig",
+    "TonalBalanceStage",
+    "TransientPunchConfig",
+    "TransientPunchStage",
+    "LowEndConfig",
+    "LowEndStage",
+    "StereoTranslationConfig",
+    "StereoTranslationStage",
+    "HarmonicEnhanceConfig",
+    "HarmonicEnhanceStage",
 ]

@@ -8,7 +8,7 @@ Neural vocoders, diffusion networks, and generative audio models frequently intr
 - **Phase Swish & Incoherence**: Erratic inter-frame phase jumps that make cymbals, reverbs, and sustained instruments sound watery or comb-filtered.
 - **Sinusoidal Harmonic Drift**: Micro-pitch wandering and jitter in sustained melodic lines.
 
-Rather than applying a destructive black-box neural network to repair another neural network, Deshimmer relies on **deterministic, psychoacoustically bounded digital signal processing (DSP)** combined with an **evolutionary NSGA-II multi-objective optimizer**. Every stage is fully transparent, mathematically invertible, and auditable through isolated forensic difference signals.
+Rather than applying a destructive black-box neural network to repair another neural network, Deshimmer relies on **deterministic, psychoacoustically bounded digital signal processing (DSP)** combined with an **evolutionary NSGA-II multi-objective optimizer**. Every stage is fully transparent, auditable through isolated forensic difference signals, and mathematically reconstructible via its exact residual contract ($x = y + d$, where $d = x - y$), guaranteeing complete signal preservation and zero-loss phase cancellation when retaining the residual.
 
 ---
 

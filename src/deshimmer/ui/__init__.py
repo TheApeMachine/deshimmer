@@ -1,6 +1,13 @@
 """Deshimmer UI package."""
 
-from .app import build_ui, main
+def __getattr__(name: str):
+    if name == "build_ui":
+        from .app import build_ui
+        return build_ui
+    if name == "main":
+        from .app import main
+        return main
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 from .audio import (
     _gradio_audio,
     _loop_crossfade_rotate,

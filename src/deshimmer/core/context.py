@@ -57,6 +57,14 @@ class DSPContext:
             return self.depth_scale_for(band_idx)
         return np.ones((band_idx.size, self.n_cols), dtype=np.float32)
 
+    @property
+    def n_bins(self) -> int:
+        return int(self.freqs.shape[0]) if self.freqs is not None else int(self.Z.shape[0])
+
+    @property
+    def n_frames(self) -> int:
+        return self.n_cols
+
     @classmethod
     def create(
         cls,

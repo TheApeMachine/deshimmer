@@ -40,24 +40,45 @@ class AnalysisReport:
     measured_noise_floor_db: float = -60.0
     notes: list[str] = field(default_factory=list)
     tonal_regions: list[dict] = field(default_factory=list)
+    tonal_balance_summary: dict[str, Any] = field(default_factory=dict)
+    dynamics_summary: dict[str, Any] = field(default_factory=dict)
+    stereo_summary: dict[str, Any] = field(default_factory=dict)
 
     def to_markdown(self) -> str:
-        lines = ["**Auto analysis report**", ""]
+        lines = ["**Auto analysis & diagnostic report**", ""]
         b0, b1 = self.detected_band
-        lines.append(f"- Shimmer band detected: **{b0:.0f} – {b1:.0f} Hz**")
+        lines.append(f"- Shimmer band detected: **{b0:.0f} – {b1:.0f} Hz** (prominence: {self.band_db_diff:.1f} dB)")
         lines.append(f"- Estimated noise floor: **{self.measured_noise_floor_db:+.1f} dBFS**")
         if self.detected_whines:
             whines_s = ", ".join(f"{w:.0f} Hz" for w in self.detected_whines[:6])
             lines.append(f"- Identified stationary whines: **{len(self.detected_whines)}** ({whines_s})")
         else:
             lines.append("- Identified stationary whines: none detected")
+
+        if self.tonal_balance_summary:
+            tb = self.tonal_balance_summary
+            tb_s = ", ".join(f"{k}: {v:+.1f} dB" for k, v in tb.items() if isinstance(v, (int, float)))
+            lines.append(f"- **Tonal Balance**: {tb_s}")
+
+        if self.dynamics_summary:
+            dyn = self.dynamics_summary
+            cf = dyn.get("crest_factor_db", 0.0)
+            dr = dyn.get("dynamic_range_db", 0.0)
+            lines.append(f"- **Dynamics**: Crest factor **{cf:.1f} dB**, Dynamic spread **{dr:.1f} dB** ({dyn.get('verdict', 'normal')})")
+
+        if self.stereo_summary:
+            st = self.stereo_summary
+            corr = st.get("phase_correlation", 1.0)
+            sub_side = st.get("sub_side_ratio", 0.0)
+            lines.append(f"- **Stereo & Translation**: L/R correlation **{corr:.2f}**, Sub side ratio **{sub_side:.2f}** ({st.get('verdict', 'safe')})")
+
         for n in self.notes:
             lines.append(f"- {n}")
 
         for region in self.tonal_regions:
-            disagreement = region["p95_disagreement_cents"]
+            disagreement = region.get("p95_disagreement_cents")
             measured = f"{disagreement:.2f} cents p95 disagreement" if disagreement is not None else "insufficient family evidence"
-            lines.append(f"- Tonal region **{region['label']}**: {region['families']} families, {measured}.")
+            lines.append(f"- Tonal region **{region['label']}**: {region.get('families', 0)} families, {measured}.")
 
         return "\n".join(lines)
 

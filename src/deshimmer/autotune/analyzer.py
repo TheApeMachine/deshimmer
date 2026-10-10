@@ -334,6 +334,170 @@ def analyze(
         p.swish_repair = 0.35
         p.hf_decorrelate = 0.20
 
+    # --- Perceptual Diagnostic Layer ---
+    # 1. Tonal Balance Diagnosis across 5 perceptual bands
+    tb_summary: dict[str, float] = {}
+    band_defs = [
+        ("Sub_Bass", 40.0, 250.0),
+        ("Low_Mid", 250.0, 800.0),
+        ("Mid", 800.0, 2500.0),
+        ("Presence", 2500.0, 8000.0),
+        ("Air", 8000.0, min(20000.0, nyq - 50.0)),
+    ]
+    band_energies = []
+    for b_name, lo_b, hi_b in band_defs:
+        idx_b = _band_idx(freqs_ref, lo_b, hi_b)
+        if idx_b.size > 0:
+            e_b = float(np.mean(mag_concat[idx_b, :] ** 2))
+            db_b = 10.0 * math.log10(e_b + _EPS)
+        else:
+            db_b = -80.0
+        band_energies.append(db_b)
+        tb_summary[b_name] = round(db_b, 1)
+
+    if len(band_energies) == 5:
+        sub_e, lmid_e, mid_e, pres_e, air_e = band_energies
+        mid_ref = 0.5 * (sub_e + pres_e)
+        low_mid_dev = lmid_e - mid_ref
+        air_dev = air_e - (pres_e - 4.0)
+
+        if low_mid_dev > 3.5:
+            p.tonal_balance = 0.5
+            p.tb_low_mid_db = -float(np.clip(low_mid_dev * 0.35, 0.5, 2.0))
+        if air_dev < -3.5:
+            p.tonal_balance = 0.5
+            p.tb_air_db = float(np.clip(abs(air_dev) * 0.35, 0.5, 2.0))
+
+    # 2. Dynamics & Punch Diagnosis
+    seg_peaks = []
+    seg_rms = []
+    x_arr = np.asarray(x)
+    for r in regions:
+        seg = _slice(xm, sr, r.t0, r.dur)
+        if seg.size >= 1024:
+            seg_peaks.append(float(np.max(np.abs(seg)) + _EPS))
+            seg_rms.append(float(np.sqrt(np.mean(seg ** 2)) + _EPS))
+
+    if seg_peaks and seg_rms:
+        overall_peak = max(seg_peaks)
+        overall_rms = float(np.mean(seg_rms))
+        crest_factor_db = 20.0 * math.log10((overall_peak + _EPS) / (overall_rms + _EPS))
+        max_rms = max(seg_rms)
+        min_rms = min(seg_rms)
+        dyn_spread_db = 20.0 * math.log10((max_rms + _EPS) / (min_rms + _EPS))
+    else:
+        crest_factor_db = 12.0
+        dyn_spread_db = 15.0
+
+    if crest_factor_db < 9.0:
+        p.transient_punch = 0.35
+        p.punch_attack_boost_db = 2.0
+        p.punch_low = 0.6
+        p.punch_high = 0.5
+        dyn_verdict = "compressed / lacks punch"
+    else:
+        dyn_verdict = "healthy dynamics"
+
+    dyn_summary = {
+        "crest_factor_db": round(crest_factor_db, 1),
+        "dynamic_range_db": round(dyn_spread_db, 1),
+        "verdict": dyn_verdict,
+    }
+
+    # 3. Low-End Coherence & Stereo Translation Diagnosis
+    stereo_summary = {}
+    if x_arr.ndim == 2 and x_arr.shape[1] >= 2:
+        L = x_arr[:, 0]
+        R = x_arr[:, 1]
+        corr = float(np.sum(L * R) / (np.sqrt(np.sum(L ** 2) * np.sum(R ** 2)) + _EPS))
+
+        sub_side_rms = 0.0
+        sub_mid_rms = 0.0
+        for r in regions:
+            s = _slice(x_arr, sr, r.t0, r.dur)
+            if s.shape[0] >= 2048:
+                s_mid = 0.5 * (s[:, 0] + s[:, 1])
+                s_side = 0.5 * (s[:, 0] - s[:, 1])
+                M_sub = np.abs(np.fft.rfft(s_mid))
+                S_sub = np.abs(np.fft.rfft(s_side))
+                f_fft = np.fft.rfftfreq(s.shape[0], d=1.0 / sr)
+                m_idx = (f_fft >= 20.0) & (f_fft <= 120.0)
+                if np.any(m_idx):
+                    sub_mid_rms += float(np.mean(M_sub[m_idx] ** 2))
+                    sub_side_rms += float(np.mean(S_sub[m_idx] ** 2))
+
+        sub_ratio = float(np.sqrt((sub_side_rms + _EPS) / (sub_mid_rms + _EPS)))
+
+        # Demonstrate low-end defect before enabling mono bass:
+        # Activated strictly by measured sub-bass (20-120 Hz) side-energy leakage.
+        # Do not couple with broadband stereo correlation, preserving wide mixes with coherent center bass.
+        if sub_ratio > 0.22:
+            p.bass_mono = True
+            p.bass_mono_hz = 120.0
+            st_verdict = "sub-bass phase leakage detected"
+        else:
+            p.bass_mono = False
+            p.bass_mono_hz = 120.0
+            st_verdict = "coherent stereo bass"
+
+        # Check for isolated low-frequency boom resonance in 40-160 Hz:
+        # Avoid mistaking intentional musical bass notes (or pure sine subs) for resonance.
+        # An unwanted acoustic boom / room mode is stationary at a single fixed frequency
+        # across different sections, whereas musical bass notes shift frequency with the chord progression.
+        peak_freqs: list[float] = []
+        high_q_count = 0
+        for r in regions:
+            s = _slice(x_arr, sr, r.t0, r.dur)
+            if s.shape[0] >= 2048:
+                s_mono = s if s.ndim == 1 else np.mean(s, axis=1)
+                S_mag = np.abs(np.fft.rfft(s_mono))
+                f_fft = np.fft.rfftfreq(s.shape[0], d=1.0 / sr)
+                b_idx = (f_fft >= 40.0) & (f_fft <= 160.0)
+                if np.any(b_idx):
+                    b_mag = S_mag[b_idx]
+                    b_f = f_fft[b_idx]
+                    p_to_m = float(np.max(b_mag) / (np.median(b_mag) + _EPS))
+                    if p_to_m > 4.5:
+                        peak_freq = float(b_f[np.argmax(b_mag)])
+                        peak_freqs.append(peak_freq)
+                        high_q_count += 1
+
+        boom_detected = False
+        if len(peak_freqs) >= 2:
+            # Check for frequency stationarity across regions (within +/- 4.0 Hz)
+            for i in range(len(peak_freqs)):
+                matches = sum(1 for j in range(len(peak_freqs)) if abs(peak_freqs[i] - peak_freqs[j]) <= 4.0)
+                if matches >= 2:
+                    boom_detected = True
+                    break
+        elif len(regions) == 1 and high_q_count >= 1:
+            boom_detected = True
+
+        if boom_detected:
+            p.bass_tighten = 0.25
+            if "leakage" in st_verdict:
+                st_verdict += " & boom resonance"
+            else:
+                st_verdict = "boom resonance detected"
+        else:
+            p.bass_tighten = 0.0
+
+        if corr < 0.35:
+            p.stereo_safe_mono = True
+            p.stereo_width = 1.0
+        elif corr > 0.90 and sub_ratio < 0.10:
+            p.stereo_safe_mono = False
+            p.stereo_width = 1.15
+        else:
+            p.stereo_safe_mono = False
+            p.stereo_width = 1.0
+
+        stereo_summary = {
+            "phase_correlation": round(corr, 2),
+            "sub_side_ratio": round(sub_ratio, 2),
+            "verdict": st_verdict,
+        }
+
     mp = MasterParams(enabled=False)
 
     tonal_regions = [
@@ -343,6 +507,12 @@ def analyze(
     notes: list[str] = ["Self-referenced tonal repair is active; Optimize includes its coherence objective and stage."]
     if flat_p75 < 0.12:
         notes.append("Highly tonal material: configured Swish Phase Repair and high-frequency stereo decorrelation.")
+    if p.tonal_balance > 1e-3:
+        notes.append("Tonal balance: automated corrective EQ configured based on spectral profile.")
+    if p.transient_punch > 1e-3:
+        notes.append("Dynamics: microdynamic punch restoration activated to recover transient attacks.")
+    if p.bass_tighten > 1e-3:
+        notes.append("Low-end: mono bass centering and bass tightening active to eliminate phase mud.")
 
     rep = AnalysisReport(
         detected_band=(band_lo, band_hi),
@@ -351,5 +521,8 @@ def analyze(
         measured_noise_floor_db=floor_db,
         notes=notes,
         tonal_regions=tonal_regions,
+        tonal_balance_summary=tb_summary,
+        dynamics_summary=dyn_summary,
+        stereo_summary=stereo_summary,
     )
     return p, mp, rep

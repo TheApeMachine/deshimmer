@@ -15,6 +15,7 @@ from ..core.params import DebugParams, MasterParams, Params
 from .analyzer import pick_regions
 from .scoring import (
     build_synthetic_transition,
+    compute_enhancement_rewards,
     score_objectives,
     score_transition_boundary,
     weights_from_aggressiveness,
@@ -49,6 +50,8 @@ def _evaluate_params_multi(
     p_use = replace(p, delta_listen=False)
     context_s = preview_context_seconds(p_use)
     objs_list: list[tuple[float, ...]] = []
+    seg_rms_in: list[float] = []
+    seg_rms_out: list[float] = []
     count = 0
     for r in regions:
         inset = max(0.0, (r.dur - refine_dur) * 0.5)
@@ -74,14 +77,23 @@ def _evaluate_params_multi(
                     if seg.ndim == 2:
                         y = _as_2d(y)
 
-                    objectives = score_objectives(
+                    objectives_list = list(score_objectives(
                         seg, y, sr, band=band,
                         swish_band=(p_use.swish_start_hz, p_use.swish_end_hz),
                         weights=weights,
-                    )
+                    ))
+
+                    rewards = compute_enhancement_rewards(seg, y, sr, stage=stage, p=p_use)
+                    for obj_idx, r_val in rewards.items():
+                        objectives_list[obj_idx] += r_val
+
+                    objectives = tuple(objectives_list)
 
                     if not np.all(np.isfinite(objectives)):
                         raise ValueError("scoring produced non-finite objectives")
+
+                    seg_rms_in.append(float(np.sqrt(np.mean(seg ** 2)) + 1e-12))
+                    seg_rms_out.append(float(np.sqrt(np.mean(y ** 2)) + 1e-12))
         except MATH_FAILURES as exc:
             if failure_log is not None:
                 fatal = failure_log.record(
@@ -97,7 +109,6 @@ def _evaluate_params_multi(
                         f"See {failure_log.path}"
                     ) from exc
                 import optuna
-
                 raise optuna.TrialPruned(f"invalid DSP evaluation: {exc}") from exc
 
             raise
@@ -115,6 +126,15 @@ def _evaluate_params_multi(
     if transition_aware and len(objs_list) > 1:
         var_objs = np.var(objs_list, axis=0)
         penalized = mean - variance_weight * var_objs
+
+        # Section-wise musical contrast preservation:
+        # Penalize over-homogenizing dynamic contrast across sections
+        if len(seg_rms_in) > 1 and len(seg_rms_out) > 1:
+            in_spread = float(np.std(seg_rms_in) / (np.mean(seg_rms_in) + 1e-6))
+            out_spread = float(np.std(seg_rms_out) / (np.mean(seg_rms_out) + 1e-6))
+            contrast_loss = max(0.0, in_spread - out_spread)
+            penalized[1] -= 0.4 * contrast_loss
+            penalized[4] -= 0.4 * contrast_loss
 
         trans_data = build_synthetic_transition(x, sr, regions, transition_dur=min(1.0, refine_dur * 0.5))
         if trans_data is not None:
@@ -148,8 +168,10 @@ def _evaluate_params_single(
     weights: Weights,
     band: tuple[float, float],
     refine_dur: float,
+    *,
+    stage: str = "all",
 ) -> float:
-    obj = _evaluate_params_multi(x, sr, regions, p, weights, band, refine_dur)
+    obj = _evaluate_params_multi(x, sr, regions, p, weights, band, refine_dur, stage=stage)
     # Each metric contributes to exactly one weighted objective.
     return float(sum(obj))
 
@@ -197,6 +219,43 @@ def _make_stage(name: str, p: Params, trial: Any) -> Params:
             hf_decorrelate=float(trial.suggest_float("hf_decorrelate", 0.0, 0.55)),
             ms_process=bool(trial.suggest_categorical("ms_process", [True, False])),
             ms_side_scale=float(trial.suggest_float("ms_side_scale", 0.15, 0.65)),
+        )
+    if name == "tonal_balance":
+        return replace(
+            p,
+            tonal_balance=float(trial.suggest_float("tonal_balance", 0.0, 0.75)),
+            tb_low_db=float(trial.suggest_float("tb_low_db", -2.5, 2.5)),
+            tb_low_mid_db=float(trial.suggest_float("tb_low_mid_db", -2.5, 2.5)),
+            tb_mid_db=float(trial.suggest_float("tb_mid_db", -2.0, 2.0)),
+            tb_presence_db=float(trial.suggest_float("tb_presence_db", -2.5, 2.5)),
+            tb_air_db=float(trial.suggest_float("tb_air_db", -2.0, 2.5)),
+        )
+    if name == "transient_punch":
+        return replace(
+            p,
+            transient_punch=float(trial.suggest_float("transient_punch", 0.0, 0.65)),
+            punch_attack_boost_db=float(trial.suggest_float("punch_attack_boost_db", 1.0, 3.5)),
+            punch_low=float(trial.suggest_float("punch_low", 0.2, 0.8)),
+            punch_high=float(trial.suggest_float("punch_high", 0.2, 0.8)),
+        )
+    if name == "low_end":
+        return replace(
+            p,
+            bass_mono=bool(trial.suggest_categorical("bass_mono", [True, False])),
+            bass_mono_hz=float(trial.suggest_float("bass_mono_hz", 80.0, 160.0)),
+            bass_tighten=float(trial.suggest_float("bass_tighten", 0.0, 0.45)),
+        )
+    if name == "stereo_enhance":
+        return replace(
+            p,
+            stereo_width=float(trial.suggest_float("stereo_width", 0.9, 1.35)),
+            stereo_safe_mono=bool(trial.suggest_categorical("stereo_safe_mono", [True])),
+        )
+    if name == "harmonic":
+        return replace(
+            p,
+            harmonic_enhance=float(trial.suggest_float("harmonic_enhance", 0.0, 0.4)),
+            harmonic_start_hz=float(trial.suggest_float("harmonic_start_hz", 3000.0, 6000.0)),
         )
     raise ValueError(f"unknown stage: {name}")
 
@@ -290,6 +349,26 @@ def refine(
 
     stages.append("tonal")
 
+    if float(getattr(p_cur, "tonal_balance", 0.0)) > 1e-3:
+        stages.append("tonal_balance")
+
+    if float(getattr(p_cur, "transient_punch", 0.0)) > 1e-3:
+        stages.append("transient_punch")
+
+    if (
+        bool(getattr(p_cur, "bass_mono", False))
+        or float(getattr(p_cur, "bass_tighten", 0.0)) > 1e-3
+    ) and xm.ndim == 2 and xm.shape[1] >= 2:
+        stages.append("low_end")
+
+    if (
+        abs(float(getattr(p_cur, "stereo_width", 1.0)) - 1.0) > 1e-3
+    ) and xm.ndim == 2 and xm.shape[1] >= 2:
+        stages.append("stereo_enhance")
+
+    if float(getattr(p_cur, "harmonic_enhance", 0.0)) > 1e-3:
+        stages.append("harmonic")
+
     total_trials = max(1, n_trials_per_stage * len(stages))
     done = 0
 
@@ -309,6 +388,7 @@ def refine(
         # Retain current settings when proposed changes score worse
         baseline = _evaluate_params_multi(
             xm, sr, regions, p_cur, objective_weights, band, refine_dur,
+            stage=stage,
             transition_aware=transition_aware,
         )
         study.add_trial(optuna.trial.create_trial(values=baseline))
@@ -361,7 +441,7 @@ def refine(
             },
         })
 
-    final_score = _evaluate_params_single(xm, sr, regions, p_cur, selection_weights, band, refine_dur)
+    final_score = _evaluate_params_single(xm, sr, regions, p_cur, selection_weights, band, refine_dur, stage="all")
     summary["final_score"] = float(final_score)
     _emit(1.0, f"Done. Final score={final_score:.3f}")
     return p_cur, summary

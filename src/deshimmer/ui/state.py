@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, fields, replace
-from typing import Mapping
+from typing import Any, Mapping
 
 from ..core.params import DebugParams, MasterParams, Params
 
@@ -33,6 +33,11 @@ PARAM_KNOB_NAMES: tuple[str, ...] = (
     "hf_decorrelate", "hf_dec_start_hz", "hf_dec_end_hz",
     "hf_resynth", "hf_lp_hz", "hf_src_lo_hz", "hf_src_hi_hz",
     "hf_drive", "hf_hp_hz", "hf_mix", "hf_confidence_blend",
+    "tonal_balance", "tb_low_db", "tb_low_mid_db", "tb_mid_db", "tb_presence_db", "tb_air_db",
+    "transient_punch", "punch_attack_boost_db", "punch_low", "punch_high",
+    "bass_mono", "bass_mono_hz", "bass_tighten",
+    "stereo_width", "stereo_safe_mono",
+    "harmonic_enhance", "harmonic_start_hz",
     "master_enabled", "hp_hz", "target_lufs", "target_rms_dbfs",
     "norm_max_gain_db", "norm_max_atten_db", "ceiling_dbtp",
     "lim_lookahead_ms", "lim_release_ms", "tp_os",
@@ -148,7 +153,7 @@ def _build_params(
     state = _merge_param_state(param_state, {})
 
     p = Params()
-    p_updates: dict[str, object] = {}
+    p_updates: dict[str, Any] = {}
     for f in fields(Params):
         if f.name not in state:
             continue
@@ -157,7 +162,7 @@ def _build_params(
     p = replace(p, **p_updates)
 
     mp = MasterParams()
-    mp_updates: dict[str, object] = {}
+    mp_updates: dict[str, Any] = {}
     for f in fields(MasterParams):
         ui_name = MASTER_TO_UI_NAME.get(f.name, f.name)
         if ui_name not in state:

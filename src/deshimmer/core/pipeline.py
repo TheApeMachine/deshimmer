@@ -25,8 +25,12 @@ from .stages import (
     ExpanderStage,
     GainApplicationConfig,
     GainApplicationStage,
+    HarmonicEnhanceConfig,
+    HarmonicEnhanceStage,
     HFDecorrelationConfig,
     HFDecorrelationStage,
+    LowEndConfig,
+    LowEndStage,
     NoiseResynthConfig,
     NoiseResynthStage,
     PhaseBlurConfig,
@@ -35,8 +39,14 @@ from .stages import (
     ShimmerStage,
     SmartDenoiseConfig,
     SmartDenoiseStage,
+    StereoTranslationConfig,
+    StereoTranslationStage,
     SwishRepairConfig,
     SwishRepairStage,
+    TonalBalanceConfig,
+    TonalBalanceStage,
+    TransientPunchConfig,
+    TransientPunchStage,
 )
 from .utils import _as_2d
 
@@ -65,7 +75,7 @@ class DSPPipeline:
 
 
 def build_default_pipeline(p: Params) -> DSPPipeline:
-    return DSPPipeline([
+    stages: List[DSPStage] = [
         ExpanderStage.from_params(p),
         SmartDenoiseStage.from_params(p),
         DeResonatorStage.from_params(p),
@@ -76,7 +86,18 @@ def build_default_pipeline(p: Params) -> DSPPipeline:
         PhaseBlurStage.from_params(p),
         SwishRepairStage.from_params(p),
         HFDecorrelationStage.from_params(p),
-    ])
+    ]
+    goodizer_stages: List[DSPStage] = [
+        LowEndStage.from_params(p),
+        TonalBalanceStage.from_params(p),
+        TransientPunchStage.from_params(p),
+        StereoTranslationStage.from_params(p),
+        HarmonicEnhanceStage.from_params(p),
+    ]
+    for s in goodizer_stages:
+        if s.is_enabled():
+            stages.append(s)
+    return DSPPipeline(stages)
 
 
 def process_stft(

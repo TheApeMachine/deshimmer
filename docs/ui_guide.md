@@ -45,7 +45,7 @@ Open your browser and navigate to `http://localhost:7860`.
 │  - Removed (Forensic Diff)       │  - Tonal Coherence Metrics          │
 ├──────────────────────────────────┴─────────────────────────────────────┤
 │ Parameter Tabs & Knobs:                                                │
-│  [Presets] [Shimmer] [Denoise & Swish] [De-Resonator] [Expander/HPSS] │
+│  [Presets] [Shimmer] [Denoise & Swish] [De-Resonator] [Expander/HPSS]  │
 │  [HF Resynth] [Delivery Mastering]                                     │
 ├────────────────────────────────────────────────────────────────────────┤
 │ Export Section:                                                        │

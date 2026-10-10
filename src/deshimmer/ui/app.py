@@ -6,8 +6,17 @@ from dataclasses import asdict
 import json
 import os
 from typing import Any, Mapping
+import warnings
 
 import gradio as gr
+
+# Suppress Gradio's internal notice when converting float32 audio for web browser playback
+warnings.filterwarnings(
+    "ignore",
+    message=r"Trying to convert audio automatically from .* to 16-bit int format\.",
+    category=UserWarning,
+)
+import numpy as np
 
 from ..autotune import Region, analyze, pick_regions, refine
 from ..core.params import MasterParams, Params
@@ -636,6 +645,100 @@ def build_ui() -> Any:
                     info="Upper edge of the source band.",
                 )
 
+        with gr.Accordion("✨ Sound Goodizer: Tonal Balance, Punch & Stereo Translation", open=False):
+            gr.Markdown("*Automatic musical enhancement engine: self-adapting tonal balance, punch restoration, mono bass, and translation-safe stereo.*")
+            with gr.Row():
+                tonal_balance = gr.Slider(
+                    0.0, 1.0, value=0.0, step=0.01,
+                    label="Tonal balance strength",
+                    info="Overall strength of the self-adapting multi-band EQ.",
+                )
+                transient_punch = gr.Slider(
+                    0.0, 1.0, value=0.0, step=0.01,
+                    label="Punch restoration",
+                    info="Restores lost attack definition and microdynamic punch in squashed mixes.",
+                )
+            with gr.Row():
+                tb_low_db = gr.Slider(
+                    -3.0, 3.0, value=0.0, step=0.1,
+                    label="Low balance (dB)",
+                    info="Sub and bass balance (~40-250 Hz).",
+                )
+                tb_low_mid_db = gr.Slider(
+                    -3.0, 3.0, value=0.0, step=0.1,
+                    label="Low-mid warmth / de-mud (dB)",
+                    info="Controls boxiness and muddiness (~200-900 Hz).",
+                )
+                tb_mid_db = gr.Slider(
+                    -3.0, 3.0, value=0.0, step=0.1,
+                    label="Mid presence (dB)",
+                    info="Controls vocal and body presence (~700-3000 Hz).",
+                )
+                tb_presence_db = gr.Slider(
+                    -3.0, 3.0, value=0.0, step=0.1,
+                    label="Presence / de-harsh (dB)",
+                    info="Controls sharpness and bite (~2500-8000 Hz).",
+                )
+                tb_air_db = gr.Slider(
+                    -3.0, 3.0, value=0.0, step=0.1,
+                    label="Air sheen (dB)",
+                    info="Controls top-end openness and air (>7000 Hz).",
+                )
+            with gr.Row():
+                punch_attack_boost_db = gr.Slider(
+                    1.0, 4.0, value=2.0, step=0.1,
+                    label="Max attack boost (dB)",
+                    info="Maximum transient expansion on attacks.",
+                )
+                punch_low = gr.Slider(
+                    0.0, 1.0, value=0.5, step=0.05,
+                    label="Low-end punch focus",
+                    info="Focus punch on kick drum attacks.",
+                )
+                punch_high = gr.Slider(
+                    0.0, 1.0, value=0.5, step=0.05,
+                    label="High-end snap focus",
+                    info="Focus punch on snare and pluck transients.",
+                )
+            with gr.Row():
+                bass_mono = gr.Checkbox(
+                    value=False,
+                    label="Mono bass",
+                    info="Collapses sub-bass to mono to eliminate phase cancellation on speakers and clubs.",
+                )
+                bass_mono_hz = gr.Slider(
+                    60.0, 180.0, value=120.0, step=5.0,
+                    label="Mono bass cutoff (Hz)",
+                    info="Frequencies below this cutoff are centered in mono.",
+                )
+                bass_tighten = gr.Slider(
+                    0.0, 1.0, value=0.0, step=0.01,
+                    label="Bass tighten",
+                    info="Attenuates sustained low-end mud/boom overhang while preserving transient kick hits.",
+                )
+            with gr.Row():
+                stereo_width = gr.Slider(
+                    0.5, 1.5, value=1.0, step=0.01,
+                    label="Stereo width scaling",
+                    info="1.0 = neutral. Adjusts side channel with translation safety.",
+                )
+                stereo_safe_mono = gr.Checkbox(
+                    value=False,
+                    label="Stereo mono safety",
+                    info="Suppresses anti-phase amplification while preserving exact mono downmix.",
+                )
+            with gr.Row():
+                harmonic_enhance = gr.Slider(
+                    0.0, 0.5, value=0.0, step=0.01,
+                    label="Harmonic sheen exciter",
+                    info="Musically coherent overtone enhancement in the upper frequencies.",
+                )
+                harmonic_start_hz = gr.Number(
+                    value=3500.0,
+                    label="Harmonic sheen start frequency (Hz)",
+                    info="Frequency threshold above which harmonic sheen is blended.",
+                )
+
         with gr.Accordion("🎚️ Delivery Mastering (loudness/limiting)", open=False):
             gr.Markdown("*Final loudness normalization and limiting for delivery. Only enable when you're done tweaking!*")
             master_enabled = gr.Checkbox(
@@ -749,14 +852,13 @@ def build_ui() -> Any:
                 return tuple([current_state] + _state_to_component_values(current_state) + [report])
 
             sr_v, x_v = audio_in_v
-            sr_v = int(sr_v)
             x_v = _to_float_audio(x_v)
             base_p, _base_mp, _base_dp = _build_params(current_state)
 
             locked = None
-            if bool(use_preview_v):
+            if use_preview_v:
                 locked = Region(t0=float(preview_t0_v), dur=float(preview_dur_v), label="user")
-            n_reg = int(max(1, round(float(n_regions_v))))
+            n_reg = max(1, round(float(n_regions_v)))
             regions = pick_regions(x_v, sr_v, n=n_reg, dur=max(2.0, float(preview_dur_v)), locked=locked)
             new_p, new_mp, report = analyze(x_v, sr_v, regions, base_params=base_p)
             new_state = _merge_param_state(current_state, _state_from_dataclasses(new_p, new_mp))
@@ -780,14 +882,13 @@ def build_ui() -> Any:
                 return tuple([current_state] + _state_to_component_values(current_state) + [report])
 
             sr_v, x_v = audio_in_v
-            sr_v = int(sr_v)
             x_v = _to_float_audio(x_v)
             base_p, base_mp, _base_dp = _build_params(current_state)
 
             locked = None
-            if bool(use_preview_v):
+            if use_preview_v:
                 locked = Region(t0=float(preview_t0_v), dur=float(preview_dur_v), label="user")
-            n_reg = int(max(1, round(float(n_regions_v))))
+            n_reg = max(1, round(float(n_regions_v)))
             refine_dur = float(max(1.0, min(refine_dur_v, preview_dur_v + 1.0)))
             region_dur = float(max(refine_dur + 0.5, preview_dur_v, 4.0))
             regions = pick_regions(x_v, sr_v, n=n_reg, dur=region_dur, locked=locked)
