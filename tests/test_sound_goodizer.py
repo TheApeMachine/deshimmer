@@ -7,7 +7,9 @@ import numpy as np
 
 from deshimmer.api import process_audio
 from deshimmer.autotune import Region, analyze, refine
-from deshimmer.autotune.scoring import compute_enhancement_rewards
+from deshimmer.autotune.optimizer import _evaluate_params_multi, _evaluate_params_single
+from deshimmer.autotune.scoring import _onset_envelope, compute_enhancement_rewards
+from deshimmer.autotune.types import Weights
 from deshimmer.cli import build_parser
 from deshimmer.core import DSPContext, DSPPipeline, Params, process_stft
 from deshimmer.core.stages import (
@@ -240,23 +242,115 @@ class TestSoundGoodizer(unittest.TestCase):
         self.assertTrue(np.isfinite(summary["final_score"]))
 
     def test_low_end_preserves_musical_bass_harmonics(self):
-        """Verify that LowEndStage with bass_tighten preserves pitched musical notes with harmonics more than isolated ringing boom."""
+        """Verify that LowEndStage with bass_tighten preserves pitched musical notes with harmonics."""
         sr = 44100
         t = np.arange(8192) / sr
         # Pitched musical bass note (60 Hz fundamental + 120 Hz 2nd harmonic)
         musical_bass = (0.5 * np.sin(2 * np.pi * 60 * t) + 0.3 * np.sin(2 * np.pi * 120 * t)).astype(np.float32)[:, None]
-        # Isolated unpitched boom (60 Hz only, without harmonics)
-        isolated_boom = (0.5 * np.sin(2 * np.pi * 60 * t)).astype(np.float32)[:, None]
+        p_tight = Params(bass_tighten=0.8, enhance=True, tonal_repair=0.0)
+        pipe = DSPPipeline([LowEndStage.from_params(p_tight)])
+        out_musical = np.asarray(process_stft(musical_bass, sr, p_tight, pipeline=pipe)).reshape(-1)
 
-        p_tight = Params(bass_tighten=0.5)
-        out_musical = process_stft(musical_bass, sr, p_tight)
-        out_boom = process_stft(isolated_boom, sr, p_tight)
+        f_fft = np.fft.rfftfreq(len(t), d=1.0 / sr)
+        k60 = np.argmin(np.abs(f_fft - 60.0))
+        m_mus_60 = np.abs(np.fft.rfft(out_musical))[k60]
+        m_in_60 = np.abs(np.fft.rfft(musical_bass[:, 0]))[k60]
+        # Pitched bass with harmonics should retain >= 99% of its 60 Hz fundamental energy
+        self.assertGreaterEqual(float(m_mus_60 / m_in_60), 0.99)
 
-        musical_loss = float(np.mean(musical_bass ** 2) - np.mean(out_musical ** 2))
-        boom_loss = float(np.mean(isolated_boom ** 2) - np.mean(out_boom ** 2))
+    def test_pure_sine_synth_bass_preserved(self):
+        """Verify LowEndStage does NOT mistake an intentional pure sine synth bass for unwanted boom resonance."""
+        sr = 44100
+        t = np.arange(8192) / sr
+        # Pure 60 Hz sine wave with no harmonics (e.g. 808 sub or clean synth bass)
+        sine_bass = (0.5 * np.sin(2 * np.pi * 60 * t)).astype(np.float32)[:, None]
 
-        # Attenuation of isolated boom should be significantly greater than musical bass
-        self.assertGreater(boom_loss, musical_loss * 0.9)
+        p_tight = Params(bass_tighten=0.8, enhance=True, tonal_repair=0.0)
+        pipe = DSPPipeline([LowEndStage.from_params(p_tight)])
+        out_sine = np.asarray(process_stft(sine_bass, sr, p_tight, pipeline=pipe)).reshape(-1)
+
+        f_fft = np.fft.rfftfreq(len(t), d=1.0 / sr)
+        k60 = np.argmin(np.abs(f_fft - 60.0))
+        m_out_60 = np.abs(np.fft.rfft(out_sine))[k60]
+        m_in_60 = np.abs(np.fft.rfft(sine_bass[:, 0]))[k60]
+        # A steady pure sine bass note has no transient overhang decay, so it must not be attenuated
+        self.assertGreaterEqual(float(m_out_60 / m_in_60), 0.99)
+
+    def test_wide_mix_with_coherent_sub_bass_preserves_stereo(self):
+        """Verify analyzer does not falsely trigger bass_mono on wide mixes with coherent center bass."""
+        sr = 44100
+        rng = np.random.default_rng(101)
+        n = 44100 * 2
+        t = np.arange(n) / sr
+
+        # Coherent center mono sub-bass at 50 Hz
+        sub_bass = 0.15 * np.sin(2 * np.pi * 50 * t).astype(np.float32)
+        # Wide, uncorrelated high/mid stereo material (ambient pads, ping-pong synths)
+        mid_l = rng.normal(0, 0.35, n).astype(np.float32)
+        mid_r = rng.normal(0, 0.35, n).astype(np.float32)
+
+        stereo = np.column_stack((sub_bass + mid_l, sub_bass + mid_r))
+        corr = float(np.sum(stereo[:, 0] * stereo[:, 1]) / (np.sqrt(np.sum(stereo[:, 0] ** 2) * np.sum(stereo[:, 1] ** 2)) + 1e-12))
+        # Mix is wide (low broadband correlation)
+        self.assertLess(corr, 0.35)
+
+        # Analyze audio
+        p_diag, _, _ = analyze(stereo, sr)
+        # Bass is completely mono, so bass_mono must NOT be activated despite low broadband correlation
+        self.assertFalse(p_diag.bass_mono)
+        self.assertTrue(p_diag.stereo_safe_mono)
+
+    def test_transient_onset_alignment_with_synthetic_impulses(self):
+        """Verify onset envelope frame indices align exactly with sample windowing (hop=256)."""
+        sr = 44100
+        n_samples = 16384
+        audio = np.zeros((n_samples, 1), dtype=np.float32)
+        # Place synthetic impulses at known exact sample indices
+        impulse_samples = [2048, 6144, 10240]
+        for s_idx in impulse_samples:
+            audio[s_idx:s_idx + 32, 0] = 0.9
+
+        hop = 256
+        env = _onset_envelope(audio, sr, hop=hop)
+        # Peak frames in onset envelope must match s_idx // hop
+        expected_frames = [s // hop for s in impulse_samples]
+        for exp_f in expected_frames:
+            # Check maximum in local neighborhood (+/- 1 frame) around expected frame
+            local_max_f = exp_f - 1 + int(np.argmax(env[max(0, exp_f - 1):exp_f + 2]))
+            self.assertEqual(local_max_f, exp_f)
+
+        # Test transient punch reward on boosted attacks
+        audio_boosted = audio.copy()
+        for s_idx in impulse_samples:
+            audio_boosted[s_idx:s_idx + 32, 0] *= 1.5
+
+        p_punch = Params(transient_punch=0.5)
+        rewards = compute_enhancement_rewards(audio, audio_boosted, sr, "transient_punch", p_punch)
+        self.assertIn(2, rewards)
+        self.assertGreater(rewards[2], 0.0)
+
+    def test_optimizer_consistent_objective_scoring(self):
+        """Verify baseline, candidate, and final evaluation use consistent objective scoring."""
+        from deshimmer.autotune import weights_from_aggressiveness
+
+        sr = 44100
+        audio = np.random.default_rng(55).normal(0, 0.1, (44100, 2)).astype(np.float32)
+        regions = [Region(0.0, 0.5, "intro")]
+        weights = weights_from_aggressiveness(0.5)
+        band = (3000.0, 16000.0)
+        p_base = Params(tonal_balance=0.5, tb_low_mid_db=-1.5)
+
+        # Baseline evaluated with stage="tonal_balance"
+        base_obj = _evaluate_params_multi(audio, sr, regions, p_base, weights, band, 0.5, stage="tonal_balance")
+        # Candidate evaluated with stage="tonal_balance"
+        cand_obj = _evaluate_params_multi(audio, sr, regions, p_base, weights, band, 0.5, stage="tonal_balance")
+        # Exact mathematical equality on identical parameter configuration
+        np.testing.assert_allclose(base_obj, cand_obj, atol=1e-6)
+
+        # Single evaluation with stage="all"
+        single_val = _evaluate_params_single(audio, sr, regions, p_base, weights, band, 0.5, stage="all")
+        multi_val = sum(_evaluate_params_multi(audio, sr, regions, p_base, weights, band, 0.5, stage="all"))
+        self.assertAlmostEqual(single_val, multi_val, places=5)
 
     def test_optimizer_enhancement_rewards(self):
         """Verify compute_enhancement_rewards gives positive score for genuine acoustic improvements."""

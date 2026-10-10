@@ -69,8 +69,10 @@ class LowEndStage(DSPStage):
             boom_idx = np.where((freqs >= 40.0) & (freqs <= 180.0))[0]
             if boom_idx.size > 0:
                 # Distinguish undesirable boom overhang from sustained musical bass:
-                # Pitched musical notes (synth/bass guitar) possess rich 2nd/3rd harmonics,
-                # whereas unwanted boom is an isolated, ringing narrowband resonance.
+                # 1. Harmonic presence: Pitched musical notes (synth/bass guitar) possess rich 2nd/3rd harmonics.
+                # 2. Temporal decay tracking: An unwanted resonance hangs over (fails to decay) during quiet
+                #    decay frames where broadband energy has dropped, whereas pure sine bass notes
+                #    decay naturally with the musical envelope.
                 mag_mono = ctx.Mag_mono
                 harmonic_mask = np.zeros(len(boom_idx), dtype=np.float32)
                 for bi, b_k in enumerate(boom_idx):
@@ -79,7 +81,20 @@ class LowEndStage(DSPStage):
                         ratio = float(np.mean(mag_mono[harm2_k, :]) / (np.mean(mag_mono[b_k, :]) + ctx.eps))
                         harmonic_mask[bi] = float(np.clip(ratio * 2.5, 0.0, 1.0))
 
-                isolated_boom = (1.0 - harmonic_mask)[:, None]
+                # Track post-transient decay tail:
+                # An unwanted boom rings out during the decay tail following a transient hit,
+                # whereas steady, sustained pure sine bass notes have no transient decay tail.
+                decay_env = np.zeros_like(ctx.w_trans)
+                curr_decay = 0.0
+                for t_col in range(ctx.n_cols):
+                    if ctx.w_trans[t_col] > 0.3:
+                        curr_decay = float(ctx.w_trans[t_col])
+                    else:
+                        curr_decay *= 0.85
+                    decay_env[t_col] = curr_decay
+                overhang_tail = np.clip(decay_env - ctx.w_trans, 0.0, 1.0)[None, :]  # (1, T)
+
+                isolated_boom = (1.0 - harmonic_mask)[:, None] * overhang_tail
                 w_decay = ctx.w_nontrans[None, :]
                 overhang_attenuation = 1.0 - 0.40 * tight_str * (isolated_boom * w_decay)
                 att_factor = np.clip(overhang_attenuation, 0.55, 1.0).astype(np.float32)

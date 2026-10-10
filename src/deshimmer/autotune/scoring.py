@@ -167,7 +167,7 @@ def _spectral_tilt_db(mag: np.ndarray, freqs: np.ndarray, pivot_hz: float = 3000
 
 def _onset_envelope(x: np.ndarray, sr: int, hop: int = 512) -> np.ndarray:
     xm = _to_mono_float(x)
-    n_fft = 2048
+    n_fft = 2 * hop
     if xm.size < n_fft:
         return np.zeros(1, dtype=np.float32)
     _, _, Z = _scipy_stft(
@@ -349,13 +349,20 @@ def compute_enhancement_rewards(
     x_in: np.ndarray,
     y_out: np.ndarray,
     sr: int,
-    stage: str,
-    p: Params,
+    stage: Optional[str] = None,
+    p: Optional[Params] = None,
 ) -> dict[int, float]:
     """Calculate dedicated measurable improvement rewards for sound goodizer stages."""
+    if p is None and isinstance(stage, Params):
+        p, stage = stage, None
+    if p is None:
+        return {}
+
+    eval_all = stage is None or stage in ("all", "refine")
     rewards: dict[int, float] = {}
 
-    if stage == "tonal_balance" and getattr(p, "tonal_balance", 0.0) > 1e-4:
+    # 1. Tonal Balance
+    if (eval_all or stage == "tonal_balance") and getattr(p, "tonal_balance", 0.0) > 1e-4:
         # Measure balance improvement: reduction in 5-band spectral variance
         mag_in, freqs = _stft_mag(x_in, sr)
         mag_out, _ = _stft_mag(y_out, sr)
@@ -367,18 +374,20 @@ def compute_enhancement_rewards(
         var_out = float(np.var(np.array(e_out) - ref_slope))
         var_reduction = max(0.0, var_in - var_out)
         r_val = float(np.clip(1.5 * var_reduction, 0.0, 8.0))
-        rewards[4] = r_val
-        rewards[1] = 0.5 * r_val
+        rewards[4] = rewards.get(4, 0.0) + r_val
+        rewards[1] = rewards.get(1, 0.0) + 0.5 * r_val
 
-    elif stage == "transient_punch" and getattr(p, "transient_punch", 0.0) > 1e-4:
+    # 2. Transient Punch
+    if (eval_all or stage == "transient_punch") and getattr(p, "transient_punch", 0.0) > 1e-4:
         # Measure punch improvement: attack transient crest factor gain on onset frames
         xm_in = _to_mono_float(x_in)
         xm_out = _to_mono_float(y_out)
-        env_in = _onset_envelope(xm_in, sr)
+        hop = 256
+        frame_len = 1024
+        # Explicitly pass hop to align onset detection frame indices with sample slicing
+        env_in = _onset_envelope(xm_in, sr, hop=hop)
         onsets = np.where(env_in > np.percentile(env_in, 85.0))[0]
         if len(onsets) > 2:
-            frame_len = 1024
-            hop = 256
             crest_in_list = []
             crest_out_list = []
             for o in onsets:
@@ -394,10 +403,11 @@ def compute_enhancement_rewards(
                 mean_cout = float(np.mean(crest_out_list))
                 crest_gain_db = 20.0 * math.log10(max(1e-3, mean_cout) / max(1e-3, mean_cin))
                 punch_reward = float(np.clip(max(0.0, crest_gain_db) * 2.5, 0.0, 7.5))
-                rewards[2] = punch_reward
-                rewards[1] = 0.5 * punch_reward
+                rewards[2] = rewards.get(2, 0.0) + punch_reward
+                rewards[1] = rewards.get(1, 0.0) + 0.5 * punch_reward
 
-    elif stage == "low_end":
+    # 3. Low-End Coherence
+    if (eval_all or stage == "low_end") and (bool(getattr(p, "bass_mono", False)) or getattr(p, "bass_tighten", 0.0) > 1e-4):
         # Measure low-end coherence: reduction in sub-bass side energy
         if x_in.ndim == 2 and x_in.shape[1] >= 2 and y_out.ndim == 2 and y_out.shape[1] >= 2:
             s_mid_in = 0.5 * (x_in[:, 0] + x_in[:, 1])
@@ -413,10 +423,11 @@ def compute_enhancement_rewards(
                 sub_ratio_in = float(np.sqrt((S_in + 1e-12) / (M_in + 1e-12)))
                 sub_ratio_out = float(np.sqrt((S_out + 1e-12) / (M_in + 1e-12)))
                 mono_reward = float(np.clip(max(0.0, sub_ratio_in - sub_ratio_out) * 12.0, 0.0, 6.0))
-                rewards[3] = mono_reward
-                rewards[0] = 0.5 * mono_reward
+                rewards[3] = rewards.get(3, 0.0) + mono_reward
+                rewards[0] = rewards.get(0, 0.0) + 0.5 * mono_reward
 
-    elif stage == "stereo_enhance":
+    # 4. Stereo Translation
+    if (eval_all or stage == "stereo_enhance") and (abs(float(getattr(p, "stereo_width", 1.0)) - 1.0) > 1e-3 or bool(getattr(p, "stereo_safe_mono", False))):
         # Measure stereo translation: safe width without anti-phase corruption
         if x_in.ndim == 2 and x_in.shape[1] >= 2 and y_out.ndim == 2 and y_out.shape[1] >= 2:
             L_in, R_in = x_in[:, 0], x_in[:, 1]
@@ -427,19 +438,27 @@ def compute_enhancement_rewards(
             w_out = _stereo_width_ratio(y_out)
             if corr_out >= min(corr_in - 0.05, 0.4):
                 w_gain = float(np.clip(max(0.0, w_out - w_in) * 15.0, 0.0, 5.0))
-                rewards[3] = w_gain
+                rewards[3] = rewards.get(3, 0.0) + w_gain
 
-    elif stage == "harmonic" and getattr(p, "harmonic_enhance", 0.0) > 1e-4:
-        # Measure coherent harmonic generation in target high band
+    # 5. Harmonic Enhancement
+    if (eval_all or stage == "harmonic") and getattr(p, "harmonic_enhance", 0.0) > 1e-4:
+        # Measure coherent harmonic generation in target high band:
+        # Reward genuine harmonic prominence (peak-to-median ratio gain),
+        # not just diffuse broadband energy or simple high-shelf boosts.
         mag_in, freqs = _stft_mag(x_in, sr)
         mag_out, _ = _stft_mag(y_out, sr)
-        h_idx = np.where(freqs >= getattr(p, "harmonic_start_hz", 3500.0))[0]
+        start_hz = float(getattr(p, "harmonic_start_hz", 3500.0))
+        h_idx = np.where(freqs >= start_hz)[0]
         if h_idx.size > 0:
             e_in = float(np.mean(mag_in[h_idx, :] ** 2))
             e_out = float(np.mean(mag_out[h_idx, :] ** 2))
+            crest_in = float(np.max(mag_in[h_idx, :]) / (np.median(mag_in[h_idx, :]) + 1e-6))
+            crest_out = float(np.max(mag_out[h_idx, :]) / (np.median(mag_out[h_idx, :]) + 1e-6))
+            prominence_gain = max(0.0, crest_out - crest_in)
             h_gain = max(0.0, 10.0 * math.log10((e_out + 1e-12) / (e_in + 1e-12)))
-            rewards[5] = float(np.clip(h_gain * 1.5, 0.0, 5.0))
-            rewards[1] = float(np.clip(h_gain * 0.7, 0.0, 2.5))
+            harm_reward = float(np.clip(h_gain * 0.8 + prominence_gain * 0.5, 0.0, 5.0))
+            rewards[5] = rewards.get(5, 0.0) + harm_reward
+            rewards[1] = rewards.get(1, 0.0) + 0.5 * harm_reward
 
     return rewards
 

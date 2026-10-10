@@ -83,10 +83,9 @@ def _evaluate_params_multi(
                         weights=weights,
                     ))
 
-                    if stage in ("tonal_balance", "transient_punch", "low_end", "stereo_enhance", "harmonic"):
-                        rewards = compute_enhancement_rewards(seg, y, sr, stage, p_use)
-                        for obj_idx, r_val in rewards.items():
-                            objectives_list[obj_idx] += r_val
+                    rewards = compute_enhancement_rewards(seg, y, sr, stage=stage, p=p_use)
+                    for obj_idx, r_val in rewards.items():
+                        objectives_list[obj_idx] += r_val
 
                     objectives = tuple(objectives_list)
 
@@ -169,8 +168,10 @@ def _evaluate_params_single(
     weights: Weights,
     band: tuple[float, float],
     refine_dur: float,
+    *,
+    stage: str = "all",
 ) -> float:
-    obj = _evaluate_params_multi(x, sr, regions, p, weights, band, refine_dur)
+    obj = _evaluate_params_multi(x, sr, regions, p, weights, band, refine_dur, stage=stage)
     # Each metric contributes to exactly one weighted objective.
     return float(sum(obj))
 
@@ -387,6 +388,7 @@ def refine(
         # Retain current settings when proposed changes score worse
         baseline = _evaluate_params_multi(
             xm, sr, regions, p_cur, objective_weights, band, refine_dur,
+            stage=stage,
             transition_aware=transition_aware,
         )
         study.add_trial(optuna.trial.create_trial(values=baseline))
@@ -439,7 +441,7 @@ def refine(
             },
         })
 
-    final_score = _evaluate_params_single(xm, sr, regions, p_cur, selection_weights, band, refine_dur)
+    final_score = _evaluate_params_single(xm, sr, regions, p_cur, selection_weights, band, refine_dur, stage="all")
     summary["final_score"] = float(final_score)
     _emit(1.0, f"Done. Final score={final_score:.3f}")
     return p_cur, summary

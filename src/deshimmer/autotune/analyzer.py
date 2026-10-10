@@ -428,8 +428,10 @@ def analyze(
 
         sub_ratio = float(np.sqrt((sub_side_rms + _EPS) / (sub_mid_rms + _EPS)))
 
-        # Demonstrate low-end defect before enabling mono bass
-        if sub_ratio > 0.22 or corr < 0.3:
+        # Demonstrate low-end defect before enabling mono bass:
+        # Activated strictly by measured sub-bass (20-120 Hz) side-energy leakage.
+        # Do not couple with broadband stereo correlation, preserving wide mixes with coherent center bass.
+        if sub_ratio > 0.22:
             p.bass_mono = True
             p.bass_mono_hz = 120.0
             st_verdict = "sub-bass phase leakage detected"
@@ -438,8 +440,12 @@ def analyze(
             p.bass_mono_hz = 120.0
             st_verdict = "coherent stereo bass"
 
-        # Check for isolated low-frequency boom resonance in 40-160 Hz
-        boom_detected = False
+        # Check for isolated low-frequency boom resonance in 40-160 Hz:
+        # Avoid mistaking intentional musical bass notes (or pure sine subs) for resonance.
+        # An unwanted acoustic boom / room mode is stationary at a single fixed frequency
+        # across different sections, whereas musical bass notes shift frequency with the chord progression.
+        peak_freqs: list[float] = []
+        high_q_count = 0
         for r in regions:
             s = _slice(x_arr, sr, r.t0, r.dur)
             if s.shape[0] >= 2048:
@@ -449,10 +455,23 @@ def analyze(
                 b_idx = (f_fft >= 40.0) & (f_fft <= 160.0)
                 if np.any(b_idx):
                     b_mag = S_mag[b_idx]
+                    b_f = f_fft[b_idx]
                     p_to_m = float(np.max(b_mag) / (np.median(b_mag) + _EPS))
                     if p_to_m > 4.5:
-                        boom_detected = True
-                        break
+                        peak_freq = float(b_f[np.argmax(b_mag)])
+                        peak_freqs.append(peak_freq)
+                        high_q_count += 1
+
+        boom_detected = False
+        if len(peak_freqs) >= 2:
+            # Check for frequency stationarity across regions (within +/- 4.0 Hz)
+            for i in range(len(peak_freqs)):
+                matches = sum(1 for j in range(len(peak_freqs)) if abs(peak_freqs[i] - peak_freqs[j]) <= 4.0)
+                if matches >= 2:
+                    boom_detected = True
+                    break
+        elif len(regions) == 1 and high_q_count >= 1:
+            boom_detected = True
 
         if boom_detected:
             p.bass_tighten = 0.25
