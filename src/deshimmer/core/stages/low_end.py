@@ -66,11 +66,23 @@ class LowEndStage(DSPStage):
 
         if self.config.tighten > 1e-6:
             tight_str = float(np.clip(self.config.tighten, 0.0, 1.0))
-            boom_idx = np.where((freqs >= 40.0) & (freqs <= 200.0))[0]
+            boom_idx = np.where((freqs >= 40.0) & (freqs <= 180.0))[0]
             if boom_idx.size > 0:
+                # Distinguish undesirable boom overhang from sustained musical bass:
+                # Pitched musical notes (synth/bass guitar) possess rich 2nd/3rd harmonics,
+                # whereas unwanted boom is an isolated, ringing narrowband resonance.
+                mag_mono = ctx.Mag_mono
+                harmonic_mask = np.zeros(len(boom_idx), dtype=np.float32)
+                for bi, b_k in enumerate(boom_idx):
+                    harm2_k = int(np.round(2 * b_k))
+                    if harm2_k < len(freqs):
+                        ratio = float(np.mean(mag_mono[harm2_k, :]) / (np.mean(mag_mono[b_k, :]) + ctx.eps))
+                        harmonic_mask[bi] = float(np.clip(ratio * 2.5, 0.0, 1.0))
+
+                isolated_boom = (1.0 - harmonic_mask)[:, None]
                 w_decay = ctx.w_nontrans[None, :]
-                att_factor = 1.0 - 0.35 * tight_str * w_decay
-                att_factor = np.clip(att_factor, 0.5, 1.0).astype(np.float32)
+                overhang_attenuation = 1.0 - 0.40 * tight_str * (isolated_boom * w_decay)
+                att_factor = np.clip(overhang_attenuation, 0.55, 1.0).astype(np.float32)
                 ctx.Z[boom_idx, :, :] *= att_factor[:, :, None]
 
         ctx.Mag = np.abs(ctx.Z)

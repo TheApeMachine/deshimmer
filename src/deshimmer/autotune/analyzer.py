@@ -428,23 +428,49 @@ def analyze(
 
         sub_ratio = float(np.sqrt((sub_side_rms + _EPS) / (sub_mid_rms + _EPS)))
 
-        p.bass_mono = True
-        p.bass_mono_hz = 120.0
-        if sub_ratio > 0.15:
-            p.bass_tighten = 0.25
+        # Demonstrate low-end defect before enabling mono bass
+        if sub_ratio > 0.22 or corr < 0.3:
+            p.bass_mono = True
+            p.bass_mono_hz = 120.0
             st_verdict = "sub-bass phase leakage detected"
         else:
-            p.bass_tighten = 0.0
-            st_verdict = "coherent stereo field"
+            p.bass_mono = False
+            p.bass_mono_hz = 120.0
+            st_verdict = "coherent stereo bass"
 
-        if corr < 0.2:
+        # Check for isolated low-frequency boom resonance in 40-160 Hz
+        boom_detected = False
+        for r in regions:
+            s = _slice(x_arr, sr, r.t0, r.dur)
+            if s.shape[0] >= 2048:
+                s_mono = s if s.ndim == 1 else np.mean(s, axis=1)
+                S_mag = np.abs(np.fft.rfft(s_mono))
+                f_fft = np.fft.rfftfreq(s.shape[0], d=1.0 / sr)
+                b_idx = (f_fft >= 40.0) & (f_fft <= 160.0)
+                if np.any(b_idx):
+                    b_mag = S_mag[b_idx]
+                    p_to_m = float(np.max(b_mag) / (np.median(b_mag) + _EPS))
+                    if p_to_m > 4.5:
+                        boom_detected = True
+                        break
+
+        if boom_detected:
+            p.bass_tighten = 0.25
+            if "leakage" in st_verdict:
+                st_verdict += " & boom resonance"
+            else:
+                st_verdict = "boom resonance detected"
+        else:
+            p.bass_tighten = 0.0
+
+        if corr < 0.35:
             p.stereo_safe_mono = True
             p.stereo_width = 1.0
-        elif corr > 0.92 and sub_ratio < 0.08:
-            p.stereo_safe_mono = True
+        elif corr > 0.90 and sub_ratio < 0.10:
+            p.stereo_safe_mono = False
             p.stereo_width = 1.15
         else:
-            p.stereo_safe_mono = True
+            p.stereo_safe_mono = False
             p.stereo_width = 1.0
 
         stereo_summary = {

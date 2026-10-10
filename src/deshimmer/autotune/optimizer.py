@@ -15,6 +15,7 @@ from ..core.params import DebugParams, MasterParams, Params
 from .analyzer import pick_regions
 from .scoring import (
     build_synthetic_transition,
+    compute_enhancement_rewards,
     score_objectives,
     score_transition_boundary,
     weights_from_aggressiveness,
@@ -76,11 +77,18 @@ def _evaluate_params_multi(
                     if seg.ndim == 2:
                         y = _as_2d(y)
 
-                    objectives = score_objectives(
+                    objectives_list = list(score_objectives(
                         seg, y, sr, band=band,
                         swish_band=(p_use.swish_start_hz, p_use.swish_end_hz),
                         weights=weights,
-                    )
+                    ))
+
+                    if stage in ("tonal_balance", "transient_punch", "low_end", "stereo_enhance", "harmonic"):
+                        rewards = compute_enhancement_rewards(seg, y, sr, stage, p_use)
+                        for obj_idx, r_val in rewards.items():
+                            objectives_list[obj_idx] += r_val
+
+                    objectives = tuple(objectives_list)
 
                     if not np.all(np.isfinite(objectives)):
                         raise ValueError("scoring produced non-finite objectives")

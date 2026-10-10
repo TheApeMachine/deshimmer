@@ -715,9 +715,9 @@ def build_ui() -> Any:
                     info="1.0 = neutral. Adjusts side channel with translation safety.",
                 )
                 stereo_safe_mono = gr.Checkbox(
-                    value=True,
+                    value=False,
                     label="Stereo mono safety",
-                    info="Prevents anti-phase amplification to ensure mono compatibility.",
+                    info="Suppresses anti-phase amplification while preserving exact mono downmix.",
                 )
             with gr.Row():
                 harmonic_enhance = gr.Slider(

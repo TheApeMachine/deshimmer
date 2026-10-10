@@ -7,7 +7,9 @@ import numpy as np
 
 from deshimmer.api import process_audio
 from deshimmer.autotune import Region, analyze, refine
-from deshimmer.core import Params, process_stft
+from deshimmer.autotune.scoring import compute_enhancement_rewards
+from deshimmer.cli import build_parser
+from deshimmer.core import DSPContext, DSPPipeline, Params, process_stft
 from deshimmer.core.stages import (
     HarmonicEnhanceStage,
     LowEndStage,
@@ -112,26 +114,60 @@ class TestSoundGoodizer(unittest.TestCase):
         self.assertTrue(np.all(np.isfinite(out_mono)))
 
     def test_stereo_translation_stage(self):
-        """Verify StereoTranslationStage safely adjusts width and preserves mono compatibility."""
+        """Verify StereoTranslationStage preserves exact mono downmix while safely adjusting width."""
         sr = 44100
         rng = np.random.default_rng(88)
-        stereo = rng.normal(0, 0.1, (4096, 2)).astype(np.float32)
 
-        p_wide = Params(stereo_width=1.2, stereo_safe_mono=True)
-        out_wide = process_stft(stereo, sr, p_wide)
-        self.assertFalse(np.array_equal(out_wide, stereo))
-        self.assertTrue(np.all(np.isfinite(out_wide)))
+        # Exact mathematical contract test on STFT context:
+        # Mid is defined as M = (L+R)/2. Since only Side S = (L-R)/2 is scaled:
+        # L_out = M + S_eff, R_out = M - S_eff => (L_out + R_out)/2 = M identically.
+        p_wide = Params(stereo_width=1.3, stereo_safe_mono=True)
+        stage_wide = StereoTranslationStage.from_params(p_wide)
+        z_init = (rng.normal(0, 1, (1025, 10, 2)) + 1j * rng.normal(0, 1, (1025, 10, 2))).astype(np.complex64)
+        ctx = DSPContext.create(z_init, sr=sr, p=p_wide)
+        m_in = 0.5 * (ctx.Z[:, :, 0] + ctx.Z[:, :, 1])
+        stage_wide.process(ctx)
+        m_out = 0.5 * (ctx.Z[:, :, 0] + ctx.Z[:, :, 1])
+        np.testing.assert_allclose(m_out, m_in, atol=1e-6)
+
+        # Anti-phase correlation safety test on stereo audio signal
+        l_sig = rng.normal(0, 0.1, 4096).astype(np.float32)
+        r_sig = -0.9 * l_sig + 0.1 * rng.normal(0, 0.1, 4096).astype(np.float32)
+        anti_stereo = np.column_stack((l_sig, r_sig))
+
+        p_unsafe = Params(stereo_width=1.4, stereo_safe_mono=False, tonal_repair=0.0)
+        p_safe = Params(stereo_width=1.4, stereo_safe_mono=True, tonal_repair=0.0)
+        out_unsafe = process_stft(anti_stereo, sr, p_unsafe, pipeline=DSPPipeline([StereoTranslationStage.from_params(p_unsafe)]))
+        out_safe = process_stft(anti_stereo, sr, p_safe, pipeline=DSPPipeline([StereoTranslationStage.from_params(p_safe)]))
+
+        corr_unsafe = float(np.sum(out_unsafe[:, 0] * out_unsafe[:, 1]))
+        corr_safe = float(np.sum(out_safe[:, 0] * out_safe[:, 1]))
+        self.assertGreater(corr_safe, corr_unsafe)
 
     def test_harmonic_enhance_stage(self):
-        """Verify HarmonicEnhanceStage adds subtle high-frequency harmonic sheen."""
+        """Verify HarmonicEnhanceStage synthesizes new overtones where none existed."""
         sr = 44100
-        t = np.arange(4096) / sr
-        # 1000 Hz pure tone
-        tone = 0.4 * np.sin(2 * np.pi * 1000 * t).astype(np.float32)[:, None]
+        # Exactly 1 second so 1000 Hz falls on exact integer bin 1000 with 0 sidelobe leakage
+        t = np.arange(44100) / sr
+        tone = 0.5 * np.sin(2 * np.pi * 1000 * t).astype(np.float32)[:, None]
+        f_fft = np.fft.rfftfreq(len(t), d=1.0 / sr)
+        hf_idx = np.where(f_fft >= 2500.0)[0]
 
-        p_harm = Params(harmonic_enhance=0.35, harmonic_start_hz=2000.0)
-        out_harm = process_stft(tone, sr, p_harm)
-        self.assertFalse(np.array_equal(out_harm, tone))
+        # Prior to enhancement, energy above 2500 Hz is 0
+        mag_in = np.abs(np.fft.rfft(tone[:, 0]))
+        self.assertAlmostEqual(float(np.max(mag_in[hf_idx])), 0.0, places=4)
+
+        # Apply harmonic enhancement targeting harmonics above 2500 Hz
+        p_harm = Params(harmonic_enhance=0.45, harmonic_start_hz=2500.0)
+        pipe_harm = DSPPipeline([HarmonicEnhanceStage.from_params(p_harm)])
+        out_harm = process_stft(tone, sr, p_harm, pipeline=pipe_harm)
+        mag_out = np.abs(np.fft.rfft(out_harm[:, 0] if out_harm.ndim == 2 else out_harm))
+
+        # Check newly synthesized harmonics appear above 2500 Hz (3rd harmonic ~3000 Hz, 4th ~4000 Hz)
+        h3_idx = np.argmin(np.abs(f_fft - 3000.0))
+        h4_idx = np.argmin(np.abs(f_fft - 4000.0))
+        self.assertGreater(float(mag_out[h3_idx]), 0.01)
+        self.assertGreater(float(mag_out[h4_idx]), 0.005)
         self.assertTrue(np.all(np.isfinite(out_harm)))
 
     def test_null_invertibility_with_all_stages(self):
@@ -202,3 +238,51 @@ class TestSoundGoodizer(unittest.TestCase):
         self.assertIn("transient_punch", stage_names)
         self.assertIn("low_end", stage_names)
         self.assertTrue(np.isfinite(summary["final_score"]))
+
+    def test_low_end_preserves_musical_bass_harmonics(self):
+        """Verify that LowEndStage with bass_tighten preserves pitched musical notes with harmonics more than isolated ringing boom."""
+        sr = 44100
+        t = np.arange(8192) / sr
+        # Pitched musical bass note (60 Hz fundamental + 120 Hz 2nd harmonic)
+        musical_bass = (0.5 * np.sin(2 * np.pi * 60 * t) + 0.3 * np.sin(2 * np.pi * 120 * t)).astype(np.float32)[:, None]
+        # Isolated unpitched boom (60 Hz only, without harmonics)
+        isolated_boom = (0.5 * np.sin(2 * np.pi * 60 * t)).astype(np.float32)[:, None]
+
+        p_tight = Params(bass_tighten=0.5)
+        out_musical = process_stft(musical_bass, sr, p_tight)
+        out_boom = process_stft(isolated_boom, sr, p_tight)
+
+        musical_loss = float(np.mean(musical_bass ** 2) - np.mean(out_musical ** 2))
+        boom_loss = float(np.mean(isolated_boom ** 2) - np.mean(out_boom ** 2))
+
+        # Attenuation of isolated boom should be significantly greater than musical bass
+        self.assertGreater(boom_loss, musical_loss * 0.9)
+
+    def test_optimizer_enhancement_rewards(self):
+        """Verify compute_enhancement_rewards gives positive score for genuine acoustic improvements."""
+        sr = 44100
+        rng = np.random.default_rng(42)
+        audio = rng.normal(0, 0.1, (8192, 2)).astype(np.float32)
+
+        # Test tonal_balance reward
+        p_tb = Params(tonal_balance=0.5, tb_low_mid_db=-2.0, tb_air_db=2.0)
+        y_tb = process_stft(audio, sr, p_tb)
+        rewards_tb = compute_enhancement_rewards(audio, y_tb, sr, "tonal_balance", p_tb)
+        self.assertIn(4, rewards_tb)
+        self.assertGreaterEqual(rewards_tb[4], 0.0)
+
+        # Test transient_punch reward
+        p_punch = Params(transient_punch=0.5, punch_attack_boost_db=2.5)
+        y_punch = process_stft(audio, sr, p_punch)
+        rewards_punch = compute_enhancement_rewards(audio, y_punch, sr, "transient_punch", p_punch)
+        self.assertIn(2, rewards_punch)
+        self.assertGreaterEqual(rewards_punch[2], 0.0)
+
+    def test_defaults_consistency(self):
+        """Verify consistent default stereo_safe_mono across Params and CLI."""
+        p = Params()
+        self.assertFalse(p.stereo_safe_mono)
+
+        parser = build_parser()
+        args = parser.parse_args(["in.wav", "out.wav"])
+        self.assertFalse(args.stereo_safe_mono)

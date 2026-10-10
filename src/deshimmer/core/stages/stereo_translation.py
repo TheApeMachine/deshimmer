@@ -1,4 +1,13 @@
-"""Translation-safe stereo width optimization and mono compatibility stage."""
+"""Translation-safe stereo width optimization and mono compatibility stage.
+
+Mathematical Guarantees:
+1. Exact Mono Downmix Invariance: Because processing only modifies the side component
+   S = 0.5 * (L - R) and leaves the mid component M = 0.5 * (L + R) intact,
+   the mono downmix M_out = 0.5 * (L_out + R_out) is mathematically identical to M_in.
+2. Anti-Phase Protection: Prevents stereo widening from aggravating existing anti-phase
+   material (where cos(Δφ) < 0), clamping the side gain to suppress anti-phase
+   diffuseness and maintain positive inter-channel correlation.
+"""
 
 from __future__ import annotations
 

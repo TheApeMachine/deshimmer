@@ -15,6 +15,7 @@ from ..core import (
     measure_phase_instability,
     measure_rms_dbfs,
 )
+from ..core.params import Params
 from ..tonal import TonalRepair
 from .types import Region, Weights
 
@@ -342,6 +343,105 @@ def score_objectives(
         x_in, y_out, sr, band=band, swish_band=swish_band, weights=weights,
     )
     return weights.objectives(metrics)
+
+
+def compute_enhancement_rewards(
+    x_in: np.ndarray,
+    y_out: np.ndarray,
+    sr: int,
+    stage: str,
+    p: Params,
+) -> dict[int, float]:
+    """Calculate dedicated measurable improvement rewards for sound goodizer stages."""
+    rewards: dict[int, float] = {}
+
+    if stage == "tonal_balance" and getattr(p, "tonal_balance", 0.0) > 1e-4:
+        # Measure balance improvement: reduction in 5-band spectral variance
+        mag_in, freqs = _stft_mag(x_in, sr)
+        mag_out, _ = _stft_mag(y_out, sr)
+        bands = [(40.0, 250.0), (200.0, 900.0), (700.0, 3000.0), (2500.0, 8000.0), (7000.0, min(18000.0, sr * 0.48))]
+        e_in = [_band_energy_db(mag_in, freqs, lo, hi) for lo, hi in bands]
+        e_out = [_band_energy_db(mag_out, freqs, lo, hi) for lo, hi in bands]
+        ref_slope = np.array([0.0, -3.0, -6.0, -9.0, -12.0])
+        var_in = float(np.var(np.array(e_in) - ref_slope))
+        var_out = float(np.var(np.array(e_out) - ref_slope))
+        var_reduction = max(0.0, var_in - var_out)
+        r_val = float(np.clip(1.5 * var_reduction, 0.0, 8.0))
+        rewards[4] = r_val
+        rewards[1] = 0.5 * r_val
+
+    elif stage == "transient_punch" and getattr(p, "transient_punch", 0.0) > 1e-4:
+        # Measure punch improvement: attack transient crest factor gain on onset frames
+        xm_in = _to_mono_float(x_in)
+        xm_out = _to_mono_float(y_out)
+        env_in = _onset_envelope(xm_in, sr)
+        onsets = np.where(env_in > np.percentile(env_in, 85.0))[0]
+        if len(onsets) > 2:
+            frame_len = 1024
+            hop = 256
+            crest_in_list = []
+            crest_out_list = []
+            for o in onsets:
+                s0 = o * hop
+                s1 = min(len(xm_in), s0 + frame_len)
+                if s1 - s0 >= 256:
+                    c_in = float(np.max(np.abs(xm_in[s0:s1])) / (np.sqrt(np.mean(xm_in[s0:s1] ** 2)) + 1e-6))
+                    c_out = float(np.max(np.abs(xm_out[s0:s1])) / (np.sqrt(np.mean(xm_out[s0:s1] ** 2)) + 1e-6))
+                    crest_in_list.append(c_in)
+                    crest_out_list.append(c_out)
+            if crest_in_list:
+                mean_cin = float(np.mean(crest_in_list))
+                mean_cout = float(np.mean(crest_out_list))
+                crest_gain_db = 20.0 * math.log10(max(1e-3, mean_cout) / max(1e-3, mean_cin))
+                punch_reward = float(np.clip(max(0.0, crest_gain_db) * 2.5, 0.0, 7.5))
+                rewards[2] = punch_reward
+                rewards[1] = 0.5 * punch_reward
+
+    elif stage == "low_end":
+        # Measure low-end coherence: reduction in sub-bass side energy
+        if x_in.ndim == 2 and x_in.shape[1] >= 2 and y_out.ndim == 2 and y_out.shape[1] >= 2:
+            s_mid_in = 0.5 * (x_in[:, 0] + x_in[:, 1])
+            s_side_in = 0.5 * (x_in[:, 0] - x_in[:, 1])
+            s_mid_out = 0.5 * (y_out[:, 0] + y_out[:, 1])
+            s_side_out = 0.5 * (y_out[:, 0] - y_out[:, 1])
+            f_fft = np.fft.rfftfreq(len(s_mid_in), d=1.0 / sr)
+            m_sub = (f_fft >= 20.0) & (f_fft <= 120.0)
+            if np.any(m_sub):
+                M_in = float(np.mean(np.abs(np.fft.rfft(s_mid_in))[m_sub] ** 2))
+                S_in = float(np.mean(np.abs(np.fft.rfft(s_side_in))[m_sub] ** 2))
+                S_out = float(np.mean(np.abs(np.fft.rfft(s_side_out))[m_sub] ** 2))
+                sub_ratio_in = float(np.sqrt((S_in + 1e-12) / (M_in + 1e-12)))
+                sub_ratio_out = float(np.sqrt((S_out + 1e-12) / (M_in + 1e-12)))
+                mono_reward = float(np.clip(max(0.0, sub_ratio_in - sub_ratio_out) * 12.0, 0.0, 6.0))
+                rewards[3] = mono_reward
+                rewards[0] = 0.5 * mono_reward
+
+    elif stage == "stereo_enhance":
+        # Measure stereo translation: safe width without anti-phase corruption
+        if x_in.ndim == 2 and x_in.shape[1] >= 2 and y_out.ndim == 2 and y_out.shape[1] >= 2:
+            L_in, R_in = x_in[:, 0], x_in[:, 1]
+            L_out, R_out = y_out[:, 0], y_out[:, 1]
+            corr_in = float(np.sum(L_in * R_in) / (np.sqrt(np.sum(L_in ** 2) * np.sum(R_in ** 2)) + 1e-12))
+            corr_out = float(np.sum(L_out * R_out) / (np.sqrt(np.sum(L_out ** 2) * np.sum(R_out ** 2)) + 1e-12))
+            w_in = _stereo_width_ratio(x_in)
+            w_out = _stereo_width_ratio(y_out)
+            if corr_out >= min(corr_in - 0.05, 0.4):
+                w_gain = float(np.clip(max(0.0, w_out - w_in) * 15.0, 0.0, 5.0))
+                rewards[3] = w_gain
+
+    elif stage == "harmonic" and getattr(p, "harmonic_enhance", 0.0) > 1e-4:
+        # Measure coherent harmonic generation in target high band
+        mag_in, freqs = _stft_mag(x_in, sr)
+        mag_out, _ = _stft_mag(y_out, sr)
+        h_idx = np.where(freqs >= getattr(p, "harmonic_start_hz", 3500.0))[0]
+        if h_idx.size > 0:
+            e_in = float(np.mean(mag_in[h_idx, :] ** 2))
+            e_out = float(np.mean(mag_out[h_idx, :] ** 2))
+            h_gain = max(0.0, 10.0 * math.log10((e_out + 1e-12) / (e_in + 1e-12)))
+            rewards[5] = float(np.clip(h_gain * 1.5, 0.0, 5.0))
+            rewards[1] = float(np.clip(h_gain * 0.7, 0.0, 2.5))
+
+    return rewards
 
 
 def build_synthetic_transition(

@@ -29,7 +29,7 @@ from .core import (
 )
 
 
-def main(argv: list[str] | None = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         description="Repair AI/codec-ish shimmer + smart denoise + smart de-resonator with psychoacoustic bounds."
     )
@@ -165,7 +165,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--bass-tighten", type=float, default=0.0)
 
     ap.add_argument("--stereo-width", type=float, default=1.0)
-    ap.add_argument("--no-stereo-safe-mono", action="store_true")
+    ap.add_argument("--stereo-safe-mono", action="store_true", default=False)
 
     ap.add_argument("--harmonic-enhance", type=float, default=0.0)
     ap.add_argument("--harmonic-start-hz", type=float, default=3500.0)
@@ -196,7 +196,11 @@ def main(argv: list[str] | None = None) -> int:
 
     ap.add_argument("--write-diff", type=str, default=None)
     ap.add_argument("--seed", type=int, default=0)
+    return ap
 
+
+def main(argv: list[str] | None = None) -> int:
+    ap = build_parser()
     args = ap.parse_args(argv)
 
     x, sr = sf.read(args.input, always_2d=True)
@@ -300,7 +304,7 @@ def main(argv: list[str] | None = None) -> int:
         bass_mono_hz=float(getattr(args, "bass_mono_hz", 120.0)),
         bass_tighten=float(getattr(args, "bass_tighten", 0.0)),
         stereo_width=float(getattr(args, "stereo_width", 1.0)),
-        stereo_safe_mono=(not bool(getattr(args, "no_stereo_safe_mono", False))),
+        stereo_safe_mono=bool(getattr(args, "stereo_safe_mono", False)),
         harmonic_enhance=float(getattr(args, "harmonic_enhance", 0.0)),
         harmonic_start_hz=float(getattr(args, "harmonic_start_hz", 3500.0)),
     )
