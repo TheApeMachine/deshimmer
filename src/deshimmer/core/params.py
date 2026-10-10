@@ -186,6 +186,43 @@ class Params:
     mask_decay_ms: float = 15.0
     mask_flat_gate: bool = True
 
+    # ----------------------------------------------------------------------
+    # Sound Goodizer: Self-adapting tonal balance
+    # ----------------------------------------------------------------------
+    tonal_balance: float = 0.0          # 0..1 overall strength
+    tb_low_db: float = 0.0              # -3.0..+3.0 dB (sub/bass ~40-250 Hz)
+    tb_low_mid_db: float = 0.0          # -3.0..+3.0 dB (warmth/boxiness ~200-900 Hz)
+    tb_mid_db: float = 0.0              # -3.0..+3.0 dB (presence/body ~700-3000 Hz)
+    tb_presence_db: float = 0.0         # -3.0..+3.0 dB (clarity/harshness ~2500-8000 Hz)
+    tb_air_db: float = 0.0              # -3.0..+3.0 dB (openness/sheen >7000 Hz)
+
+    # ----------------------------------------------------------------------
+    # Sound Goodizer: Transient & microdynamic punch restoration
+    # ----------------------------------------------------------------------
+    transient_punch: float = 0.0        # 0..1 overall strength
+    punch_attack_boost_db: float = 2.0  # 1.0..4.0 dB max attack expansion
+    punch_low: float = 0.5              # low-end punch weight (kick impact)
+    punch_high: float = 0.5             # high-end punch weight (snare/plucks)
+
+    # ----------------------------------------------------------------------
+    # Sound Goodizer: Low-end coherence & mono punch
+    # ----------------------------------------------------------------------
+    bass_mono: bool = False
+    bass_mono_hz: float = 120.0         # collapse side energy below this Hz
+    bass_tighten: float = 0.0           # 0..1 attenuate sustained boom overhang
+
+    # ----------------------------------------------------------------------
+    # Sound Goodizer: Stereo image translation & mono safety
+    # ----------------------------------------------------------------------
+    stereo_width: float = 1.0           # 0.5..1.5 width scaling (1.0 = neutral)
+    stereo_safe_mono: bool = False      # preserve mono compatibility, suppress anti-phase
+
+    # ----------------------------------------------------------------------
+    # Sound Goodizer: Musical harmonic overtone enhancement
+    # ----------------------------------------------------------------------
+    harmonic_enhance: float = 0.0       # 0..0.5 strength
+    harmonic_start_hz: float = 3500.0   # start frequency for subtle harmonic sheen
+
 
 @dataclass
 class MasterParams:

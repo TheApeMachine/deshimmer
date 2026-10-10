@@ -34,6 +34,23 @@ def _numba_dn_noise_est(curr_min, n_blocks, curr_noise_vec, rise):
     return noise_est_blocks
 
 
+@jit(nopython=True)
+def _numba_smooth_gain_temporal(g_in, att, rel):
+    F, T = g_in.shape
+    g_out = np.empty_like(g_in)
+    for f in range(F):
+        sm = g_in[f, 0]
+        g_out[f, 0] = sm
+        for t in range(1, T):
+            target = g_in[f, t]
+            if target < sm:
+                sm = att * sm + (1.0 - att) * target
+            else:
+                sm = rel * sm + (1.0 - rel) * target
+            g_out[f, t] = sm
+    return g_out
+
+
 @dataclass
 class SmartDenoiseConfig:
     strength: float = 0.0
@@ -44,6 +61,8 @@ class SmartDenoiseConfig:
     psd_smooth_ms: float = 50.0
     minwin_ms: float = 400.0
     up_db_per_s: float = 3.0
+    attack_ms: float = 5.0
+    release_ms: float = 120.0
     freq_smooth_bins: int = 3
 
     @classmethod
@@ -57,6 +76,8 @@ class SmartDenoiseConfig:
             psd_smooth_ms=float(getattr(p, "dn_psd_smooth_ms", 50.0)),
             minwin_ms=float(getattr(p, "dn_minwin_ms", 400.0)),
             up_db_per_s=float(getattr(p, "dn_up_db_per_s", 3.0)),
+            attack_ms=float(getattr(p, "dn_attack_ms", 5.0)),
+            release_ms=float(getattr(p, "dn_release_ms", 120.0)),
             freq_smooth_bins=int(getattr(p, "dn_freq_smooth_bins", 3)),
         )
 
@@ -127,6 +148,21 @@ class SmartDenoiseStage(DSPStage):
 
             dn_g[:, ti] = g_inst_frame
             prev_clean_psd = (g_inst_frame ** 2) * current_psd
+
+        att = _frame_coeff(ctx.hop, ctx.sr, self.config.attack_ms)
+        rel = _frame_coeff(ctx.hop, ctx.sr, self.config.release_ms)
+        if HAS_NUMBA:
+            dn_g = _numba_smooth_gain_temporal(dn_g.astype(np.float32), float(att), float(rel))
+        else:
+            for f in range(F_dn):
+                sm = dn_g[f, 0]
+                for ti in range(1, ctx.n_cols):
+                    target = dn_g[f, ti]
+                    if target < sm:
+                        sm = att * sm + (1.0 - att) * target
+                    else:
+                        sm = rel * sm + (1.0 - rel) * target
+                    dn_g[f, ti] = sm
 
         if self.config.freq_smooth_bins > 1:
             dn_g = uniform_filter1d(dn_g, size=self.config.freq_smooth_bins, axis=0, mode='nearest')

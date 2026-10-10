@@ -40,6 +40,18 @@ class TonalRepair:
         if original.dtype.kind != "f":
             raise ValueError("tonal repair requires real floating-point audio")
 
+        if amount <= 1e-6:
+            return original.copy(), {
+                "enabled": False,
+                "stage": "before_wet_dry_mix_and_delivery",
+                "before": {},
+                "after": {},
+                "changed_partials": 0,
+                "coherence_gain": 0.0,
+                "amount": float(amount),
+                "max_shift_cents": float(max_shift_cents),
+            }
+
         field = self.analyze(original, sample_rate)
         output = original.astype(np.float64, copy=True)
 

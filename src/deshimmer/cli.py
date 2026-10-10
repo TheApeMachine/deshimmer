@@ -147,6 +147,29 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--hf-zero-phase", action="store_true")
     ap.add_argument("--no-hf-zero-phase", action="store_true")
 
+    # --- Sound Goodizer: Tonal Balance, Punch, Low-End, Stereo ---
+    ap.add_argument("--tonal-balance", type=float, default=0.0)
+    ap.add_argument("--tb-low-db", type=float, default=0.0)
+    ap.add_argument("--tb-low-mid-db", type=float, default=0.0)
+    ap.add_argument("--tb-mid-db", type=float, default=0.0)
+    ap.add_argument("--tb-presence-db", type=float, default=0.0)
+    ap.add_argument("--tb-air-db", type=float, default=0.0)
+
+    ap.add_argument("--transient-punch", type=float, default=0.0)
+    ap.add_argument("--punch-attack-boost-db", type=float, default=2.0)
+    ap.add_argument("--punch-low", type=float, default=0.5)
+    ap.add_argument("--punch-high", type=float, default=0.5)
+
+    ap.add_argument("--bass-mono", action="store_true")
+    ap.add_argument("--bass-mono-hz", type=float, default=120.0)
+    ap.add_argument("--bass-tighten", type=float, default=0.0)
+
+    ap.add_argument("--stereo-width", type=float, default=1.0)
+    ap.add_argument("--no-stereo-safe-mono", action="store_true")
+
+    ap.add_argument("--harmonic-enhance", type=float, default=0.0)
+    ap.add_argument("--harmonic-start-hz", type=float, default=3500.0)
+
     # --- Delivery mastering ---
     ap.add_argument("--master", action="store_true")
     ap.add_argument("--hp-hz", type=float, default=20.0)
@@ -263,6 +286,23 @@ def main(argv: list[str] | None = None) -> int:
         hf_mix=float(args.hf_mix),
         hf_tilt_lp_hz=float(args.hf_tilt_lp_hz),
         hf_zero_phase=(not bool(args.no_hf_zero_phase)),
+        tonal_balance=float(getattr(args, "tonal_balance", 0.0)),
+        tb_low_db=float(getattr(args, "tb_low_db", 0.0)),
+        tb_low_mid_db=float(getattr(args, "tb_low_mid_db", 0.0)),
+        tb_mid_db=float(getattr(args, "tb_mid_db", 0.0)),
+        tb_presence_db=float(getattr(args, "tb_presence_db", 0.0)),
+        tb_air_db=float(getattr(args, "tb_air_db", 0.0)),
+        transient_punch=float(getattr(args, "transient_punch", 0.0)),
+        punch_attack_boost_db=float(getattr(args, "punch_attack_boost_db", 2.0)),
+        punch_low=float(getattr(args, "punch_low", 0.5)),
+        punch_high=float(getattr(args, "punch_high", 0.5)),
+        bass_mono=bool(getattr(args, "bass_mono", False)),
+        bass_mono_hz=float(getattr(args, "bass_mono_hz", 120.0)),
+        bass_tighten=float(getattr(args, "bass_tighten", 0.0)),
+        stereo_width=float(getattr(args, "stereo_width", 1.0)),
+        stereo_safe_mono=(not bool(getattr(args, "no_stereo_safe_mono", False))),
+        harmonic_enhance=float(getattr(args, "harmonic_enhance", 0.0)),
+        harmonic_start_hz=float(getattr(args, "harmonic_start_hz", 3500.0)),
     )
 
     target_lufs = None if float(args.target_lufs) >= 998.0 else float(args.target_lufs)
